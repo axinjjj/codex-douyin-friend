@@ -18,7 +18,6 @@ import {
   buildBridgeStartupViewExpression,
   buildClassifyLatestIncomingMediaExpression,
   buildEnsureChatTailVisibleExpression,
-  buildReadCompatibleAwemeMediaExpression,
   buildReadIncomingCommentShareExpression,
   buildReadIncomingMediaTextExpression,
   buildReadIncomingTextBatchExpression,
@@ -29,11 +28,11 @@ import {
   generateDouyinReply,
   generateDouyinImageReply,
   generateDouyinVideoReply,
-  planDouyinIncomingQueue,
   preparePersistentBridgeSession,
   sanitizeDouyinMediaDiagnostic,
   sendAndVerifyDouyinReply,
 } from "../src/douyin-bridge-runtime.mjs";
+import { planDouyinIncomingQueue } from "../src/douyin-inbound-planner.mjs";
 import {
   acquireBridgeRunLock,
   computeTextMessageFingerprint,
@@ -47,17 +46,14 @@ import {
   saveBridgeState,
 } from "../src/douyin-bridge-state.mjs";
 import {
-  captureLatestDouyinChatImage,
   cleanupStaleImageAnalysisJobs,
-  prepareDouyinImagePost,
   removeImageAnalysisJob,
 } from "../src/douyin-image-runtime.mjs";
+import { acquireDouyinMedia } from "../src/douyin-media-pipeline.mjs";
 import { likeIncomingDouyinMediaMessage } from "../src/douyin-media-reaction.mjs";
 import {
   cleanupStaleVideoAnalysisJobs,
-  prepareLatestDouyinVideoMedia,
   removeVideoAnalysisJob,
-  resolveDouyinSharedWorkPlayerFallback,
 } from "../src/douyin-video-runtime.mjs";
 import { repairCollapsedDouyinViewport } from "../src/douyin-window-runtime.mjs";
 import {
@@ -563,59 +559,21 @@ try {
           }
         }
         const inboundText = inboundTextParts.join("\n") || null;
-        if (mediaClassification.mediaType === "chat_image") {
-          media = {
-            kind: "chat_image",
-            ...await captureLatestDouyinChatImage({
-              cdp,
+        media = await acquireDouyinMedia({
+          mediaType: mediaClassification.mediaType,
+          cdp,
+          projectRoot,
+          port,
+          mediaMessage: incomingBatch.mediaMessage,
+          expectedChatFingerprint: lockedChat.fingerprint,
+          analyzeAudio: senseVoiceAvailability.enabled
+            ? ({ audioPath, timeoutMs: audioTimeoutMs }) => transcribeSenseVoiceAudio({
+              audioPath,
               projectRoot,
-              mediaMessage: incomingBatch.mediaMessage,
-            }),
-          };
-        } else if (mediaClassification.mediaType === "shared_aweme"
-            || mediaClassification.mediaType === "comment_share") {
-          let sharedManifest = await cdp.evaluate(
-            buildReadCompatibleAwemeMediaExpression(incomingBatch.mediaMessage),
-            15_000,
-          );
-          if (!sharedManifest?.ok) {
-            throw new Error(`The shared Douyin work is unavailable: ${sharedManifest?.reason || "unknown"}.`);
-          }
-          sharedManifest = await resolveDouyinSharedWorkPlayerFallback({
-            cdp,
-            mediaMessage: incomingBatch.mediaMessage,
-            expectedChatFingerprint: lockedChat.fingerprint,
-            initialManifest: sharedManifest,
-          });
-          if (sharedManifest.mediaType === "video") {
-            media = {
-              kind: "video",
-              ...await prepareLatestDouyinVideoMedia({
-                cdp,
-                projectRoot,
-                port,
-                sourceResult: sharedManifest,
-                analyzeAudio: senseVoiceAvailability.enabled
-                  ? ({ audioPath, timeoutMs: audioTimeoutMs }) => transcribeSenseVoiceAudio({
-                    audioPath,
-                    projectRoot,
-                    timeoutMs: audioTimeoutMs,
-                  })
-                  : null,
-              }),
-            };
-          } else if (sharedManifest.mediaType === "image_post"
-              || sharedManifest.mediaType === "shared_cover") {
-            media = await prepareDouyinImagePost({
-              projectRoot,
-              manifest: sharedManifest,
-            });
-          } else {
-            throw new Error("The shared Douyin work type is unsupported.");
-          }
-        } else {
-          throw new Error("The latest Douyin media type is unsupported.");
-        }
+              timeoutMs: audioTimeoutMs,
+            })
+            : null,
+        });
         const currentChatAfterCapture = await cdp.evaluate(buildChatIdentityMetadataExpression());
         if (!currentChatAfterCapture?.found
             || currentChatAfterCapture.fingerprint !== lockedChat.fingerprint) {

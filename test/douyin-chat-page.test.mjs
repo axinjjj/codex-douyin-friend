@@ -172,7 +172,7 @@ test("keeps the rendered chat tail current without reading message text", () => 
   assert.doesNotMatch(expression, /textContent|innerText|document\.cookie|localStorage|sessionStorage/u);
 });
 
-test("opens one exact shared work and reads only a bounded visible HTTPS video source", () => {
+test("opens one exact shared work and distinguishes bounded HTTPS and MSE player evidence", () => {
   const exactMessage = {
     ordinalFromEnd: 2,
     fingerprint: "a".repeat(64),
@@ -192,6 +192,11 @@ test("opens one exact shared work and reads only a bounded visible HTTPS video s
   assert.match(read, /commonModalFullScreenModalFullScreen/u);
   assert.match(read, /currentSrc/u);
   assert.match(read, /slice\(0, 4\)/u);
+  assert.match(read, /transport: 'https'/u);
+  assert.match(read, /transport: 'mse'/u);
+  assert.match(read, /source\.startsWith\('blob:'\)/u);
+  assert.match(read, /video\.muted = true/u);
+  assert.match(read, /video\.volume = 0/u);
   assert.doesNotThrow(() => new Function(`return ${read}`));
   const state = buildReadOpenSharedWorkStateExpression();
   assert.match(state, /commonModalFullScreenModalFullScreen/u);

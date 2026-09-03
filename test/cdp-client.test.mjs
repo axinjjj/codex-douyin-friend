@@ -88,3 +88,23 @@ test("synchronous send failure removes the pending request and disconnects", asy
   assert.equal(client.pendingRequests.size, 0);
   await assert.rejects(client.request("Runtime.evaluate"), /not connected/u);
 });
+
+test("publishes protocol notifications without confusing them with request responses", async () => {
+  const client = new CdpClient("ws://127.0.0.1/test", { WebSocketImpl: FakeWebSocket });
+  const connected = client.connect();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  await connected;
+  const notifications = [];
+  client.on("notification", (message) => notifications.push(message));
+  socket.emit("message", {
+    data: JSON.stringify({
+      method: "Network.responseReceived",
+      params: { type: "Media", response: { mimeType: "video/mp4" } },
+    }),
+  });
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].method, "Network.responseReceived");
+  assert.equal(client.pendingRequests.size, 0);
+  client.close();
+});

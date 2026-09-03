@@ -17,7 +17,6 @@ import {
   isTrustedDouyinMediaUrl,
   prepareLatestDouyinVideoMedia,
   removeVideoAnalysisJob,
-  resolveDouyinSharedWorkPlayerFallback,
   resolveVideoAnalysisRoot,
 } from "../src/douyin-video-runtime.mjs";
 
@@ -40,88 +39,6 @@ test("allows only known HTTPS Douyin media hosts", () => {
   assert.equal(isTrustedDouyinMediaUrl("https://api-play.amemv.com.attacker.invalid/video.mp4"), false);
   assert.equal(isTrustedDouyinMediaUrl("https://zjcdn.com.attacker.invalid/video.mp4"), false);
   assert.equal(isTrustedDouyinMediaUrl("file:///C:/private/video.mp4"), false);
-});
-
-test("upgrades a cover-only share from the bounded visible Douyin player", async () => {
-  const chatFingerprint = "a".repeat(64);
-  const calls = [];
-  let closed = false;
-  let playerReads = 0;
-  const result = await resolveDouyinSharedWorkPlayerFallback({
-    cdp: {
-      async evaluate(expression) {
-        calls.push(expression);
-        if (expression.includes("clickTarget.click()")) {
-          return { ok: true, chatFingerprint };
-        }
-        if (expression.includes("const close = modal.querySelector")) {
-          closed = true;
-          return { ok: true, wasOpen: true, closed: false };
-        }
-        if (closed) return { ok: true, open: false };
-        playerReads += 1;
-        return playerReads === 1
-          ? { ok: false, reason: "open-video-source-not-ready" }
-          : {
-            ok: true,
-            source: "https://v3-dy.zjcdn.com/video.mp4",
-            sources: ["https://v3-dy.zjcdn.com/video.mp4"],
-          };
-      },
-    },
-    mediaMessage: {
-      ordinalFromEnd: 1,
-      fingerprint: "b".repeat(64),
-      kind: "media",
-      side: "left",
-    },
-    expectedChatFingerprint: chatFingerprint,
-    initialManifest: { ok: true, mediaType: "shared_cover", sources: ["https://p3.douyinpic.com/cover"] },
-    sleepFn: async () => {},
-  });
-  assert.equal(result.mediaType, "video");
-  assert.equal(result.selectedCodec, "open-player");
-  assert.equal(result.sources.length, 1);
-  assert.equal(closed, true);
-  assert.ok(calls.some((expression) => expression.includes("commonModalFullScreenclose")));
-});
-
-test("keeps an honest cover boundary when the bounded player has no video", async () => {
-  const chatFingerprint = "a".repeat(64);
-  const initialManifest = {
-    ok: true,
-    mediaType: "shared_cover",
-    sources: ["https://p3.douyinpic.com/cover"],
-  };
-  let closed = false;
-  let reads = 0;
-  const result = await resolveDouyinSharedWorkPlayerFallback({
-    cdp: {
-      async evaluate(expression) {
-        if (expression.includes("clickTarget.click()")) return { ok: true, chatFingerprint };
-        if (expression.includes("const close = modal.querySelector")) {
-          closed = true;
-          return { ok: true, wasOpen: true, closed: false };
-        }
-        if (closed) return { ok: true, open: false };
-        reads += 1;
-        return { ok: false, reason: "open-video-source-not-ready" };
-      },
-    },
-    mediaMessage: {
-      ordinalFromEnd: 1,
-      fingerprint: "b".repeat(64),
-      kind: "media",
-      side: "left",
-    },
-    expectedChatFingerprint: chatFingerprint,
-    initialManifest,
-    attempts: 999,
-    sleepFn: async () => {},
-  });
-  assert.equal(result, initialManifest);
-  assert.equal(reads, 16);
-  assert.equal(closed, true);
 });
 
 test("cleans only stale UUID video jobs and leaves recent or unrelated directories", async () => {
@@ -190,6 +107,10 @@ test("builds sequential in-memory scene scanning and bounded final capture expre
   assert.match(captureExpression, /768 \/ video\.videoWidth/u);
   assert.match(captureExpression, /768 \/ video\.videoHeight/u);
   assert.match(captureExpression, /toDataURL\('image\/png'\)/u);
+  const modalCapture = buildCaptureFrameExpression(5, 768, 2_500, {
+    videoSelector: ".commonModalFullScreenModalFullScreen video",
+  });
+  assert.match(modalCapture, /commonModalFullScreenModalFullScreen video/u);
 });
 
 test("caller options cannot raise the 100 MB Douyin download ceiling", async () => {

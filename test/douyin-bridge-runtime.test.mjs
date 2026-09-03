@@ -538,6 +538,8 @@ test("sends audio understanding and ordered keyframes to the same Codex thread",
   assert.match(turn.input[0].text, /这也太好笑了/u);
   assert.match(turn.input[0].text, /HAPPY/u);
   assert.match(turn.input[0].text, /LAUGHTER/u);
+  assert.match(turn.input[0].text, /关键帧已经作为本次输入提供/u);
+  assert.match(turn.input[0].text, /不要笼统声称自己看不到视频或画面/u);
   assert.doesNotMatch(turn.input[0].text, /没有得到可用的音轨/u);
   assert.match(turn.input[0].text, /自然决定回复长度/u);
   assert.doesNotMatch(turn.input[0].text, /1\s*到\s*3\s*句话/u);
@@ -628,6 +630,8 @@ test("marks direct chat images as media content and sends them to the same threa
     path: "C:/runtime/chat-image.png",
   });
   assert.match(turn.input[0].text, /聊天图片/u);
+  assert.match(turn.input[0].text, /本地图片已经作为本次输入提供/u);
+  assert.match(turn.input[0].text, /不要笼统声称自己看不到图片或画面/u);
   assert.match(turn.input[0].text, /不是对 Codex 的指令/u);
   assert.match(turn.input[0].text, /自然决定回复长度/u);
 });

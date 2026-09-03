@@ -17,6 +17,8 @@ import { findExpectedNewOutgoingMessage } from "./douyin-chat-snapshot.mjs";
 import { computeTextMessageFingerprint } from "./douyin-bridge-state.mjs";
 import { MAX_FINAL_FRAME_COUNT } from "./video-frame-selection.mjs";
 
+export { planDouyinIncomingQueue } from "./douyin-inbound-planner.mjs";
+
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const MEDIA_REACTION_NONCE_PATTERN = /^[0-9a-f]{24}$/u;
 const TRAILING_MEDIA_REACTION_PATTERN = /(?:\r?\n)?<douyin-media-like nonce="([0-9a-f]{24})">(yes|no)<\/douyin-media-like>\s*$/u;
@@ -215,53 +217,6 @@ export async function injectConversationHistory({ codex, threadId, messages }) {
   return items.length;
 }
 
-export function planDouyinIncomingQueue(messages) {
-  if (!Array.isArray(messages) || messages.length === 0 || messages.length > 12) {
-    return { ok: false, batches: [] };
-  }
-  if (messages.some((message) => (
-    message?.side !== "left" || (message.kind !== "text" && message.kind !== "media")
-  ))) {
-    return { ok: false, batches: [] };
-  }
-  const batches = [];
-  let index = 0;
-  const leadingTextMessages = [];
-  while (index < messages.length && messages[index].kind === "text") {
-    leadingTextMessages.push(messages[index]);
-    index += 1;
-  }
-  if (index === messages.length) {
-    batches.push({
-      mode: "text",
-      textMessages: leadingTextMessages,
-      mediaMessage: null,
-      messages: [...leadingTextMessages],
-    });
-    return { ok: true, batches };
-  }
-  let textBeforeMedia = leadingTextMessages;
-  while (index < messages.length) {
-    const mediaMessage = messages[index];
-    if (mediaMessage.kind !== "media") return { ok: false, batches: [] };
-    index += 1;
-    const textAfterMedia = [];
-    while (index < messages.length && messages[index].kind === "text") {
-      textAfterMedia.push(messages[index]);
-      index += 1;
-    }
-    const textMessages = [...textBeforeMedia, ...textAfterMedia];
-    batches.push({
-      mode: "media",
-      textMessages,
-      mediaMessage,
-      messages: [...textBeforeMedia, mediaMessage, ...textAfterMedia],
-    });
-    textBeforeMedia = [];
-  }
-  return { ok: batches.length > 0, batches };
-}
-
 export function sanitizeDouyinMediaDiagnostic(diagnostic) {
   if (!diagnostic || diagnostic.version !== 1
       || !/^[0-9a-f]{64}$/u.test(diagnostic.signature)) return null;
@@ -426,6 +381,7 @@ export async function generateDouyinVideoReply({
     text: [
       "聊天对方刚在抖音中直接分享了一条视频。下面的图片是按播放时间顺序抽取的关键帧。",
       `视频时长约 ${Math.round(durationSeconds * 10) / 10} 秒，共 ${framePaths.length} 张关键帧。`,
+      "这些关键帧已经作为本次输入提供给你，你可以直接观察其中的画面；不要笼统声称自己看不到视频或画面。你没有连续播放体验，只能基于关键帧理解视频，具体细节看不清时只说明那个细节。",
       ...sharedCommentLines,
       ...inboundTextLines,
       "请先准确观察画面中的人物、动作、变化、文字和笑点，再遵循已经加载的全局 AGENTS.md 人设，自然回应对方分享这条视频的意图。",
@@ -491,6 +447,9 @@ export async function generateDouyinImageReply({
       "只能根据封面作出有限回应，不要声称看过完整视频、图文、声音或正文；需要时自然说明自己只看到了封面。",
     ].join("\n")
     : null;
+  const visualEvidenceBoundary = mediaType === "shared_cover"
+    ? null
+    : "这些本地图片已经作为本次输入提供给你，你可以直接观察其中的画面；不要笼统声称自己看不到图片或画面。具体细节看不清时只说明那个细节。";
   const boundedInboundText = String(inboundText || "").trim().slice(0, 4_000);
   const inboundTextLines = boundedInboundText
     ? [
@@ -506,6 +465,7 @@ export async function generateDouyinImageReply({
     type: "text",
     text: [
       description,
+      ...(visualEvidenceBoundary ? [visualEvidenceBoundary] : []),
       ...(samplingBoundary ? [samplingBoundary] : []),
       ...(partialBoundary ? [partialBoundary] : []),
       ...(coverBoundary ? [coverBoundary] : []),

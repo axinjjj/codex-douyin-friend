@@ -862,20 +862,49 @@ export function buildReadOpenSharedWorkVideoExpression() {
         const rightRect = right.getBoundingClientRect();
         return rightRect.width * rightRect.height - leftRect.width * leftRect.height;
       });
-    const sources = [...new Set(videos
-      .map((video) => video.currentSrc || video.getAttribute('src') || '')
-      .filter((source) => source.startsWith('https://')))].slice(0, 4);
-    if (sources.length === 0) return { ok: false, reason: 'open-video-source-not-ready' };
-    const duration = videos
-      .map((video) => video.duration)
-      .find((value) => Number.isFinite(value) && value > 0) || null;
-    return {
-      ok: true,
-      mediaType: 'video',
-      source: sources[0],
-      sources,
-      selectedCodec: 'open-player',
+    const video = videos[0];
+    if (!video) return { ok: false, reason: 'open-video-not-ready' };
+    video.muted = true;
+    video.volume = 0;
+    const rawSources = [...new Set(videos
+      .map((candidate) => candidate.currentSrc || candidate.getAttribute('src') || '')
+      .filter(Boolean))];
+    const sources = rawSources.filter((source) => source.startsWith('https://')).slice(0, 4);
+    const duration = Number.isFinite(video.duration) && video.duration > 0
+      ? video.duration
+      : null;
+    const base = {
       duration,
+      videoWidth: video.videoWidth || null,
+      videoHeight: video.videoHeight || null,
+      readyState: video.readyState,
+    };
+    if (sources.length > 0) {
+      return {
+        ok: true,
+        mediaType: 'video',
+        transport: 'https',
+        source: sources[0],
+        sources,
+        selectedCodec: 'open-player',
+        ...base,
+      };
+    }
+    if (rawSources.some((source) => source.startsWith('blob:')) &&
+        video.readyState >= 2 && duration) {
+      return {
+        ok: true,
+        mediaType: 'video',
+        transport: 'mse',
+        sources: [],
+        selectedCodec: 'open-player-mse',
+        ...base,
+      };
+    }
+    return {
+      ok: false,
+      reason: 'open-video-source-not-ready',
+      ...base,
     };
   })()`;
 }

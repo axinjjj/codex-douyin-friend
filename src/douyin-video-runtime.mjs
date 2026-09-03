@@ -6,11 +6,7 @@ import { createServer } from "node:http";
 import path from "node:path";
 import { CdpClient } from "./cdp-client.mjs";
 import {
-  buildCloseOpenSharedWorkExpression,
-  buildOpenIncomingSharedWorkExpression,
   buildReadCompatibleAwemeSourceExpression,
-  buildReadOpenSharedWorkStateExpression,
-  buildReadOpenSharedWorkVideoExpression,
 } from "./douyin-chat-page.mjs";
 import {
   buildAdaptiveScanTimes,
@@ -53,9 +49,6 @@ const VIDEO_RANGE_CONCURRENCY = 3;
 const MAX_VIDEO_SOURCE_CANDIDATES = 4;
 const MAX_VIDEO_SOURCE_REDIRECTS = 2;
 const VIDEO_JOB_NAME_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
-const CHAT_FINGERPRINT_PATTERN = /^[0-9a-f]{64}$/u;
-const OPEN_PLAYER_ATTEMPTS = 16;
-const OPEN_PLAYER_INTERVAL_MS = 250;
 
 function boundedLimit(value, fallback, hardMaximum, minimum = 1) {
   const normalized = Number.isFinite(value) ? Math.trunc(value) : fallback;
@@ -81,73 +74,6 @@ export function isTrustedDouyinMediaUrl(value) {
     );
   } catch {
     return false;
-  }
-}
-
-export async function resolveDouyinSharedWorkPlayerFallback({
-  cdp,
-  mediaMessage,
-  expectedChatFingerprint,
-  initialManifest,
-  sleepFn = sleep,
-  attempts = OPEN_PLAYER_ATTEMPTS,
-  intervalMs = OPEN_PLAYER_INTERVAL_MS,
-} = {}) {
-  if (initialManifest?.mediaType !== "shared_cover") return initialManifest;
-  if (!cdp || typeof cdp.evaluate !== "function") {
-    throw new Error("A connected CDP client is required for shared-work player fallback.");
-  }
-  if (!CHAT_FINGERPRINT_PATTERN.test(expectedChatFingerprint || "")) {
-    throw new Error("A locked Douyin chat fingerprint is required for player fallback.");
-  }
-  if (typeof sleepFn !== "function") throw new Error("A player-fallback sleep function is required.");
-  const boundedAttempts = Math.max(1, Math.min(OPEN_PLAYER_ATTEMPTS, Number.parseInt(attempts, 10) || 1));
-  const boundedIntervalMs = Math.max(25, Math.min(
-    OPEN_PLAYER_INTERVAL_MS,
-    Number.parseInt(intervalMs, 10) || OPEN_PLAYER_INTERVAL_MS,
-  ));
-
-  const opened = await cdp.evaluate(buildOpenIncomingSharedWorkExpression(
-    mediaMessage,
-    expectedChatFingerprint,
-  ));
-  if (!opened?.ok || opened.chatFingerprint !== expectedChatFingerprint) return initialManifest;
-  let closeRequired = true;
-  try {
-    for (let attempt = 0; attempt < boundedAttempts; attempt += 1) {
-      if (attempt > 0) await sleepFn(boundedIntervalMs);
-      const player = await cdp.evaluate(buildReadOpenSharedWorkVideoExpression());
-      if (!player?.ok) continue;
-      const sources = [...new Set([
-        ...(Array.isArray(player.sources) ? player.sources : []),
-        player.source,
-      ])].filter(isTrustedDouyinMediaUrl).slice(0, MAX_VIDEO_SOURCE_CANDIDATES);
-      if (sources.length === 0) continue;
-      return {
-        ok: true,
-        mediaType: "video",
-        source: sources[0],
-        sources,
-        selectedCodec: "open-player",
-      };
-    }
-    return initialManifest;
-  } finally {
-    const closeResult = await cdp.evaluate(buildCloseOpenSharedWorkExpression());
-    if (!closeResult?.ok) {
-      throw new Error("The Douyin shared-work viewer could not be closed safely.");
-    }
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      await sleepFn(100);
-      const playerState = await cdp.evaluate(buildReadOpenSharedWorkStateExpression());
-      if (playerState?.ok && playerState.open === false) {
-        closeRequired = false;
-        break;
-      }
-    }
-    if (closeRequired) {
-      throw new Error("The Douyin shared-work viewer remained open after bounded cleanup.");
-    }
   }
 }
 
@@ -946,6 +872,7 @@ export function buildScanFrameSignaturesExpression(times, {
   signatureHeight = 10,
   seekTimeoutMs = 2_500,
   maxWallTimeMs = DEFAULT_MAX_SCAN_WALL_TIME_MS,
+  videoSelector = "video",
 } = {}) {
   const sortedTimes = (Array.isArray(times) ? times : [])
     .filter((time) => Number.isFinite(time))
@@ -964,8 +891,11 @@ export function buildScanFrameSignaturesExpression(times, {
     DEFAULT_MAX_SCAN_WALL_TIME_MS,
     1_000,
   );
+  const safeVideoSelector = typeof videoSelector === "string" && videoSelector.length <= 200
+    ? videoSelector
+    : "video";
   return `(async () => {
-    const video = document.querySelector('video');
+    const video = document.querySelector(${JSON.stringify(safeVideoSelector)});
     if (!video || !Number.isFinite(video.duration) || video.duration <= 0) {
       return { ok: false, reason: 'video-not-ready', samples: [] };
     }
@@ -1057,11 +987,19 @@ export function buildScanFrameSignaturesExpression(times, {
   })()`;
 }
 
-export function buildCaptureFrameExpression(timeSeconds, maxDimension, seekTimeoutMs = 2_500) {
+export function buildCaptureFrameExpression(
+  timeSeconds,
+  maxDimension,
+  seekTimeoutMs = 2_500,
+  { videoSelector = "video" } = {},
+) {
   const safeMaxDimension = boundedLimit(maxDimension, 768, 768, 128);
   const safeSeekTimeoutMs = Math.max(250, Math.min(5_000, Math.trunc(seekTimeoutMs) || 2_500));
+  const safeVideoSelector = typeof videoSelector === "string" && videoSelector.length <= 200
+    ? videoSelector
+    : "video";
   return `(async () => {
-    const video = document.querySelector('video');
+    const video = document.querySelector(${JSON.stringify(safeVideoSelector)});
     if (!video || !Number.isFinite(video.duration) || video.duration <= 0) {
       return { ok: false, reason: 'video-not-ready' };
     }

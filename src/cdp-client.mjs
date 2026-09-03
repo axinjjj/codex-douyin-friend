@@ -1,5 +1,8 @@
-export class CdpClient {
+import { EventEmitter } from "node:events";
+
+export class CdpClient extends EventEmitter {
   constructor(webSocketUrl, { WebSocketImpl = globalThis.WebSocket } = {}) {
+    super();
     if (typeof WebSocketImpl !== "function") {
       throw new Error("A WebSocket implementation is required.");
     }
@@ -143,7 +146,10 @@ export class CdpClient {
       return;
     }
 
-    if (message.id === undefined) return;
+    if (message.id === undefined) {
+      this.emit("notification", message);
+      return;
+    }
     const pending = this.pendingRequests.get(message.id);
     if (!pending) return;
     this.pendingRequests.delete(message.id);
