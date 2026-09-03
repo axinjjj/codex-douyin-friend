@@ -3,7 +3,11 @@ import {
   CodexAppServerRequestError,
   instructionSourcesContain,
 } from "./codex-app-server-client.mjs";
-import { buildChatMessageMetadataExpression, normalizeOutboundText } from "./douyin-chat-page.mjs";
+import {
+  buildChatMessageMetadataExpression,
+  buildEnsureChatTailVisibleExpression,
+  normalizeOutboundText,
+} from "./douyin-chat-page.mjs";
 import {
   focusAndClearChatEditor,
   replaceChatEditorText,
@@ -33,6 +37,11 @@ function canSafelyReplacePersistedThread(error) {
   if (!(error instanceof CodexAppServerRequestError)) return false;
   return error.code === -32601
     || (error.code === -32600 && /^no rollout found for thread id /u.test(error.message));
+}
+
+async function archiveUncommittedThread(codex, threadId) {
+  if (!threadId || typeof codex?.request !== "function") return;
+  await codex.request("thread/archive", { threadId }).catch(() => {});
 }
 
 export async function startVerifiedPersonaThread({
@@ -95,11 +104,16 @@ export async function startVerifiedPersonaThread({
   const threadResult = await codex.startThread({ cwd, model, ephemeral });
   const startedThreadId = threadResult?.thread?.id;
   if (!startedThreadId) throw new Error("thread/start did not return a thread id.");
-  if (threadResult.thread.ephemeral !== ephemeral || threadResult.model !== model) {
-    throw new Error("thread/start did not create the requested Codex thread.");
-  }
-  if (!instructionSourcesContain(threadResult.instructionSources, expectedPersonaPath)) {
-    throw new Error("The private global AGENTS.md was not loaded; refusing to reply.");
+  try {
+    if (threadResult.thread.ephemeral !== ephemeral || threadResult.model !== model) {
+      throw new Error("thread/start did not create the requested Codex thread.");
+    }
+    if (!instructionSourcesContain(threadResult.instructionSources, expectedPersonaPath)) {
+      throw new Error("The private global AGENTS.md was not loaded; refusing to reply.");
+    }
+  } catch (error) {
+    await archiveUncommittedThread(codex, startedThreadId);
+    throw error;
   }
   return {
     threadId: startedThreadId,
@@ -144,13 +158,19 @@ export async function preparePersistentBridgeSession({
   const seedMessages = !runtime.resumed && reliableState
     ? excludePendingIncomingTextsFromSeed(visibleMessages, pendingMessages)
     : visibleMessages;
-  const seededMessageCount = runtime.resumed
-    ? 0
-    : await injectConversationHistory({
-      codex,
-      threadId: runtime.threadId,
-      messages: seedMessages,
-    });
+  let seededMessageCount;
+  try {
+    seededMessageCount = runtime.resumed
+      ? 0
+      : await injectConversationHistory({
+        codex,
+        threadId: runtime.threadId,
+        messages: seedMessages,
+      });
+  } catch (error) {
+    if (!runtime.resumed) await archiveUncommittedThread(codex, runtime.threadId);
+    throw error;
+  }
   return {
     runtime,
     seededMessageCount,
@@ -571,6 +591,8 @@ export async function sendAndVerifyDouyinReply({
   let outgoing = null;
   for (let attempt = 0; attempt < 10 && !outgoing; attempt += 1) {
     await sleep(500);
+    const tail = await cdp.evaluate(buildEnsureChatTailVisibleExpression());
+    if (!tail?.ok) throw new Error("The Douyin message tail is unavailable after sending.");
     afterSend = await cdp.evaluate(buildChatMessageMetadataExpression());
     outgoing = findExpectedNewOutgoingMessage(
       beforeSend,

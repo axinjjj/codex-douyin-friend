@@ -218,9 +218,50 @@ function normalizeExactIncomingMediaMessage(message) {
   };
 }
 
+const STABLE_MEDIA_FINGERPRINT_SOURCE = `
+    const resolveStableMediaFingerprintSource = (mediaMessage) => {
+      const sharedCard = mediaMessage.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)});
+      if (sharedCard) {
+        const fiberKey = Object.keys(sharedCard).find((key) => key.startsWith('__reactFiber$'));
+        let fiber = fiberKey ? sharedCard[fiberKey] : null;
+        let parsedContent = null;
+        for (let depth = 0; fiber && depth < 20 && !parsedContent; depth += 1, fiber = fiber.return) {
+          const candidate = fiber.memoizedProps?.message?.parsedContent;
+          if (candidate && typeof candidate === 'object') parsedContent = candidate;
+        }
+        const awemeInfo = parsedContent?.aweme_info || parsedContent?.awemeInfo;
+        const dynamicPatch = parsedContent?.im_dynamic_patch || parsedContent?.imDynamicPatch;
+        const camelKey = ['item', 'Id'].join('');
+        const identity = parsedContent?.[camelKey] || parsedContent?.item_id ||
+          awemeInfo?.[camelKey] || awemeInfo?.item_id || parsedContent?.schema ||
+          dynamicPatch?.schema || null;
+        if ((typeof identity === 'string' || typeof identity === 'number')
+            && String(identity).length > 0 && String(identity).length <= 2_048) {
+          const variant = sharedCard.matches(${JSON.stringify(DOUYIN_COMMENT_SHARE_SELECTOR)})
+            ? 'comment-share'
+            : sharedCard.matches('.BulletBulletVideocontainer') ? 'bullet-video' : 'legacy-aweme';
+          return ['shared-work-v2', variant, String(identity)].join('|');
+        }
+      }
+      const directImages = mediaMessage.querySelectorAll(
+        '.MessageItemImageImage, .MessageItemImageImageBox img'
+      ).length;
+      if (directImages > 0) {
+        return ['chat-image-v2', directImages].join('|');
+      }
+      return [
+        'media-shape-v2',
+        mediaMessage.querySelectorAll('img').length,
+        mediaMessage.querySelectorAll('video').length,
+        mediaMessage.querySelectorAll('canvas').length,
+      ].join('|');
+    };
+`;
+
 function buildExactIncomingMediaLookupSource(expected) {
   if (!expected) {
     return `
+      ${STABLE_MEDIA_FINGERPRINT_SOURCE}
       const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
       if (!list) return { ok: false, reason: 'message-list-not-found' };
       const recent = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
@@ -243,6 +284,7 @@ function buildExactIncomingMediaLookupSource(expected) {
     `;
   }
   return `
+    ${STABLE_MEDIA_FINGERPRINT_SOURCE}
     const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
     if (!list) return { ok: false, reason: 'message-list-not-found' };
     const expected = ${JSON.stringify(expected)};
@@ -263,7 +305,12 @@ function buildExactIncomingMediaLookupSource(expected) {
     const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
     const source = (bubble?.textContent || stableContent?.textContent || '').trim();
     const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
-    const fingerprint = hasMedia ? await digest(['media', side, source].join('|')) : null;
+    const mediaFingerprintSource = hasMedia
+      ? resolveStableMediaFingerprintSource(message, bubble, stableContent)
+      : null;
+    const fingerprint = hasMedia
+      ? await digest(['media', side, mediaFingerprintSource].join('|'))
+      : null;
     if (side !== 'left' || !hasMedia || fingerprint !== expected.fingerprint) {
       return { ok: false, reason: 'incoming-media-identity-changed' };
     }
@@ -402,6 +449,7 @@ export function buildChatStructureExpression() {
 export function buildChatMessageMetadataExpression() {
   return `(async () => {
     ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    ${STABLE_MEDIA_FINGERPRINT_SOURCE}
     const listSelector = ${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)};
     const messageSelector = ${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)};
     const textBubbleSelector = ${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)};
@@ -429,8 +477,11 @@ export function buildChatMessageMetadataExpression() {
       const source = (textBubble?.textContent || stableContent?.textContent || '').trim();
       const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
       const kind = hasMedia ? 'media' : textBubble ? 'text' : centered ? 'system' : 'unknown';
+      const fingerprintSource = kind === 'media'
+        ? resolveStableMediaFingerprintSource(message, textBubble, stableContent)
+        : source;
       const structuralKey = kind === 'media' || kind === 'text'
-        ? [kind, side, source].join('|')
+        ? [kind, side, fingerprintSource].join('|')
         : [kind, side, source, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|');
       return { kind, side, textLength: source.length, structuralKey };
     });
@@ -455,10 +506,38 @@ export function buildChatMessageMetadataExpression() {
   })()`;
 }
 
+export function buildEnsureChatTailVisibleExpression() {
+  return `(() => {
+    const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
+    if (!list) return { ok: false, reason: 'message-list-not-found' };
+    const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
+      .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top);
+    const latest = messages.at(-1);
+    if (!latest) return { ok: true, messageFound: false, scrolled: false };
+    let scroller = list;
+    for (let depth = 0, candidate = list; candidate && depth < 7; depth += 1, candidate = candidate.parentElement) {
+      if (candidate.scrollHeight > candidate.clientHeight + 8) {
+        scroller = candidate;
+        break;
+      }
+    }
+    const before = scroller.scrollTop;
+    scroller.scrollTop = scroller.scrollHeight;
+    latest.scrollIntoView({ block: 'end', inline: 'nearest' });
+    return {
+      ok: true,
+      messageFound: true,
+      scrolled: Math.abs(scroller.scrollTop - before) > 1,
+      atBottom: scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop <= 2,
+    };
+  })()`;
+}
+
 export function buildBridgeStartupViewExpression(limit = 12) {
   const safeLimit = Math.max(1, Math.min(Number.parseInt(limit, 10) || 12, 30));
   return `(async () => {
     ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    ${STABLE_MEDIA_FINGERPRINT_SOURCE}
     const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
     if (!list) return {
       ok: false,
@@ -480,8 +559,11 @@ export function buildBridgeStartupViewExpression(limit = 12) {
         const source = (bubble?.textContent || stableContent?.textContent || '').trim();
         const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
         const kind = hasMedia ? 'media' : bubble ? 'text' : centered ? 'system' : 'unknown';
+        const fingerprintSource = kind === 'media'
+          ? resolveStableMediaFingerprintSource(message, bubble, stableContent)
+          : source;
         const structuralKey = kind === 'media' || kind === 'text'
-          ? [kind, side, source].join('|')
+          ? [kind, side, fingerprintSource].join('|')
           : [kind, side, source, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|');
         return {
           source,
@@ -728,6 +810,91 @@ export function buildLocateLatestIncomingAwemeExpression() {
     }
 
     return { ok: false, reason: 'incoming-aweme-card-not-found' };
+  })()`;
+}
+
+export function buildOpenIncomingSharedWorkExpression(mediaMessage, expectedChatFingerprint) {
+  const expected = normalizeExactIncomingMediaMessage(mediaMessage);
+  if (!expected) throw new Error("Exact incoming shared-work metadata is required.");
+  if (!/^[0-9a-f]{64}$/u.test(expectedChatFingerprint || "")) {
+    throw new Error("A locked Douyin chat fingerprint is required to open shared work.");
+  }
+  return `(async () => {
+    ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    ${buildExactIncomingMediaLookupSource(expected)}
+    const chatFingerprint = opaqueId
+      ? await digest(['douyin-opponent-v1', opaqueId].join('|'))
+      : null;
+    if (chatFingerprint !== ${JSON.stringify(expectedChatFingerprint)}) {
+      return { ok: false, reason: 'chat-changed-before-shared-work-open' };
+    }
+    const card = message.querySelector(${JSON.stringify(DOUYIN_SHARED_CARD_SELECTOR)});
+    if (!card) return { ok: false, reason: 'incoming-shared-work-card-not-found' };
+    const boundedCardNodes = [card, ...Array.from(card.querySelectorAll('*')).slice(0, 63)];
+    const reactClickTarget = boundedCardNodes.find((node) => {
+      const propsKey = Object.keys(node).find((key) => key.startsWith('__reactProps$'));
+      return Boolean(propsKey && typeof node[propsKey]?.onClick === 'function');
+    });
+    const clickTarget = card.querySelector('.BulletBulletVideoplayIcon') || reactClickTarget || card;
+    clickTarget.scrollIntoView({ block: 'center', inline: 'center' });
+    clickTarget.click();
+    return {
+      ok: true,
+      chatFingerprint,
+    };
+  })()`;
+}
+
+export function buildReadOpenSharedWorkVideoExpression() {
+  return `(() => {
+    const modal = document.querySelector('.commonModalFullScreenModalFullScreen');
+    if (!modal) return { ok: false, reason: 'shared-work-viewer-not-open' };
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width >= 64 && rect.height >= 64 && style.display !== 'none' &&
+        style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+    };
+    const videos = Array.from(modal.querySelectorAll('video'))
+      .filter(visible)
+      .sort((left, right) => {
+        const leftRect = left.getBoundingClientRect();
+        const rightRect = right.getBoundingClientRect();
+        return rightRect.width * rightRect.height - leftRect.width * leftRect.height;
+      });
+    const sources = [...new Set(videos
+      .map((video) => video.currentSrc || video.getAttribute('src') || '')
+      .filter((source) => source.startsWith('https://')))].slice(0, 4);
+    if (sources.length === 0) return { ok: false, reason: 'open-video-source-not-ready' };
+    const duration = videos
+      .map((video) => video.duration)
+      .find((value) => Number.isFinite(value) && value > 0) || null;
+    return {
+      ok: true,
+      mediaType: 'video',
+      source: sources[0],
+      sources,
+      selectedCodec: 'open-player',
+      duration,
+    };
+  })()`;
+}
+
+export function buildReadOpenSharedWorkStateExpression() {
+  return `(() => ({
+    ok: true,
+    open: Boolean(document.querySelector('.commonModalFullScreenModalFullScreen')),
+  }))()`;
+}
+
+export function buildCloseOpenSharedWorkExpression() {
+  return `(() => {
+    const modal = document.querySelector('.commonModalFullScreenModalFullScreen');
+    if (!modal) return { ok: true, wasOpen: false, closed: true };
+    const close = modal.querySelector('.commonModalFullScreenclose');
+    if (!close) return { ok: false, reason: 'shared-work-viewer-close-not-found' };
+    close.click();
+    return { ok: true, wasOpen: true, closed: !document.contains(modal) };
   })()`;
 }
 
@@ -999,6 +1166,7 @@ export function buildReadCompatibleAwemeMediaExpression(message = null) {
     fingerprint: message.fingerprint,
   };
   return `(async () => {
+    ${STABLE_MEDIA_FINGERPRINT_SOURCE}
     const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
     if (!list) return { ok: false, reason: 'message-list-not-found' };
     const expected = ${JSON.stringify(expected)};
@@ -1019,7 +1187,12 @@ export function buildReadCompatibleAwemeMediaExpression(message = null) {
       const content = message.querySelector('.messageMessageBoxcontentBox');
       const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
       const source = (bubble?.textContent || stableContent?.textContent || '').trim();
-      const fingerprint = await digest(['media', side, source].join('|'));
+      const mediaFingerprintSource = resolveStableMediaFingerprintSource(
+        message,
+        bubble,
+        stableContent
+      );
+      const fingerprint = await digest(['media', side, mediaFingerprintSource].join('|'));
       if (side !== 'left' || fingerprint !== expected.fingerprint) {
         return { ok: false, reason: 'incoming-shared-work-identity-changed' };
       }
@@ -1090,6 +1263,7 @@ export function buildReadIncomingMediaTextExpression(message) {
   };
   return `(async () => {
     ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    ${STABLE_MEDIA_FINGERPRINT_SOURCE}
     const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
     if (!list) return { ok: false, reason: 'message-list-not-found', text: null };
     const expected = ${JSON.stringify(expected)};
@@ -1112,7 +1286,12 @@ export function buildReadIncomingMediaTextExpression(message) {
     const content = message.querySelector('.messageMessageBoxcontentBox');
     const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
     const source = (bubble?.textContent || stableContent?.textContent || '').trim();
-    const fingerprint = await digest(['media', side, source].join('|'));
+    const mediaFingerprintSource = resolveStableMediaFingerprintSource(
+      message,
+      bubble,
+      stableContent
+    );
+    const fingerprint = await digest(['media', side, mediaFingerprintSource].join('|'));
     if (fingerprint !== expected.fingerprint) {
       return { ok: false, reason: 'incoming-media-fingerprint-changed', text: null };
     }
@@ -1138,6 +1317,7 @@ export function buildLocateIncomingMediaReactionTargetExpression(message, ordina
   };
   return `(async () => {
     ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    ${STABLE_MEDIA_FINGERPRINT_SOURCE}
     const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
     if (!list) return { ok: false, reason: 'message-list-not-found' };
     const expected = ${JSON.stringify(expected)};
@@ -1156,7 +1336,12 @@ export function buildLocateIncomingMediaReactionTargetExpression(message, ordina
     const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
     const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
     const source = (bubble?.textContent || stableContent?.textContent || '').trim();
-    const fingerprint = await digest(['media', side, source].join('|'));
+    const mediaFingerprintSource = resolveStableMediaFingerprintSource(
+      message,
+      bubble,
+      stableContent
+    );
+    const fingerprint = await digest(['media', side, mediaFingerprintSource].join('|'));
     if (side !== 'left' || !hasMedia || fingerprint !== expected.fingerprint) {
       return { ok: false, reason: 'incoming-media-reaction-target-changed' };
     }
@@ -1213,6 +1398,7 @@ export function buildReadIncomingCommentShareExpression(message) {
   };
   return `(async () => {
     ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    ${STABLE_MEDIA_FINGERPRINT_SOURCE}
     const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
     if (!list) return { ok: false, reason: 'message-list-not-found' };
     const expected = ${JSON.stringify(expected)};
@@ -1232,7 +1418,12 @@ export function buildReadIncomingCommentShareExpression(message) {
     const content = message.querySelector('.messageMessageBoxcontentBox');
     const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
     const source = (bubble?.textContent || stableContent?.textContent || '').trim();
-    const fingerprint = await digest(['media', side, source].join('|'));
+    const mediaFingerprintSource = resolveStableMediaFingerprintSource(
+      message,
+      bubble,
+      stableContent
+    );
+    const fingerprint = await digest(['media', side, mediaFingerprintSource].join('|'));
     if (side !== 'left' || !card || fingerprint !== expected.fingerprint) {
       return { ok: false, reason: 'incoming-comment-share-identity-changed' };
     }

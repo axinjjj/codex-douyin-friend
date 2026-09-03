@@ -5,17 +5,22 @@ import {
   buildClassifyLatestIncomingMediaExpression,
   buildChatMessageMetadataExpression,
   buildChatIdentityMetadataExpression,
+  buildCloseOpenSharedWorkExpression,
+  buildEnsureChatTailVisibleExpression,
   buildLatestIncomingMediaStructureExpression,
   buildLocateLatestIncomingChatImageExpression,
   buildLocateIncomingMediaReactionTargetExpression,
   buildInspectOpenMediaLikeMenuExpression,
   buildReadLatestIncomingChatImageSourceExpression,
   buildLocateLatestIncomingAwemeExpression,
+  buildOpenIncomingSharedWorkExpression,
   buildReadIncomingTextBatchExpression,
   buildReadIncomingCommentShareExpression,
   buildReadIncomingMediaTextExpression,
   buildReadCompatibleAwemeMediaExpression,
   buildReadLatestIncomingTextExpression,
+  buildReadOpenSharedWorkStateExpression,
+  buildReadOpenSharedWorkVideoExpression,
   buildReadXgPlayerSourceExpression,
   buildReadCompatibleAwemeSourceExpression,
   buildRecentDouyinResourcePathsExpression,
@@ -156,6 +161,46 @@ test("video-card operations stay scoped to the visible page DOM", () => {
   for (const expression of [openExpression, viewerExpression, playerExpression]) {
     assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/);
     assert.doesNotMatch(expression, /\.href\b|\.src\b|getAttribute\(['"](?:href|src)/);
+  }
+});
+
+test("keeps the rendered chat tail current without reading message text", () => {
+  const expression = buildEnsureChatTailVisibleExpression();
+  assert.match(expression, /scrollTop = scroller\.scrollHeight/u);
+  assert.match(expression, /scrollIntoView\(\{ block: 'end'/u);
+  assert.match(expression, /atBottom/u);
+  assert.doesNotMatch(expression, /textContent|innerText|document\.cookie|localStorage|sessionStorage/u);
+});
+
+test("opens one exact shared work and reads only a bounded visible HTTPS video source", () => {
+  const exactMessage = {
+    ordinalFromEnd: 2,
+    fingerprint: "a".repeat(64),
+    kind: "media",
+    side: "left",
+  };
+  const open = buildOpenIncomingSharedWorkExpression(exactMessage, "c".repeat(64));
+  const read = buildReadOpenSharedWorkVideoExpression();
+  const close = buildCloseOpenSharedWorkExpression();
+  assert.match(open, /ordinalFromEnd":2/u);
+  assert.match(open, /incoming-media-identity-changed/u);
+  assert.match(open, /chat-changed-before-shared-work-open/u);
+  assert.match(open, /BulletBulletVideoplayIcon/u);
+  assert.match(open, /slice\(0, 63\)/u);
+  assert.match(open, /__reactProps\$/u);
+  assert.match(open, /clickTarget\.click\(\)/u);
+  assert.match(read, /commonModalFullScreenModalFullScreen/u);
+  assert.match(read, /currentSrc/u);
+  assert.match(read, /slice\(0, 4\)/u);
+  assert.doesNotThrow(() => new Function(`return ${read}`));
+  const state = buildReadOpenSharedWorkStateExpression();
+  assert.match(state, /commonModalFullScreenModalFullScreen/u);
+  assert.doesNotMatch(state, /currentSrc|getAttribute\('src'\)|textContent|innerText/u);
+  assert.doesNotThrow(() => new Function(`return ${state}`));
+  assert.match(close, /commonModalFullScreenclose/u);
+  assert.match(close, /close\.click\(\)/u);
+  for (const expression of [open, read, state, close]) {
+    assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
   }
 });
 
@@ -375,6 +420,9 @@ test("message metadata gives media priority and preserves attached-text identity
     assert.match(expression, /hasMedia \? 'media' : (?:textBubble|bubble) \? 'text'/u);
     assert.match(expression, /MessageItemCommentSharecontainer/u);
     assert.match(expression, /messageMessageBoxcontentBox/u);
+    assert.match(expression, /shared-work-v2/u);
+    assert.match(expression, /item_id/u);
+    assert.match(expression, /parsedContent\?\.schema/u);
   }
   const expression = buildReadIncomingMediaTextExpression({
     ordinalFromEnd: 1,

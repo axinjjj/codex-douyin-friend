@@ -17,6 +17,7 @@ import {
   buildChatMessageMetadataExpression,
   buildBridgeStartupViewExpression,
   buildClassifyLatestIncomingMediaExpression,
+  buildEnsureChatTailVisibleExpression,
   buildReadCompatibleAwemeMediaExpression,
   buildReadIncomingCommentShareExpression,
   buildReadIncomingMediaTextExpression,
@@ -56,6 +57,7 @@ import {
   cleanupStaleVideoAnalysisJobs,
   prepareLatestDouyinVideoMedia,
   removeVideoAnalysisJob,
+  resolveDouyinSharedWorkPlayerFallback,
 } from "../src/douyin-video-runtime.mjs";
 import { repairCollapsedDouyinViewport } from "../src/douyin-window-runtime.mjs";
 import {
@@ -104,6 +106,7 @@ let pendingManualCompactionRequestId = null;
 let currentPhase = "starting";
 let phaseBeforeCompaction = null;
 let lastLatencyMs = null;
+let uncommittedStartupThreadId = null;
 const emitBridgeEvent = (event) => writeBridgeEvent(process.stdout, event);
 const emitBridgeStatus = (requestId = null) => emitBridgeEvent({
   ok: true,
@@ -169,6 +172,9 @@ codex.on("stderr", () => {
 try {
   await cdp.connect();
   await repairCollapsedDouyinViewport({ cdp, targetId: target.id });
+  const startupTail = await cdp.evaluate(buildEnsureChatTailVisibleExpression());
+  if (!startupTail?.ok) throw new Error("The Douyin message tail is unavailable.");
+  await sleep(150);
   const lockedChat = await cdp.evaluate(buildChatIdentityMetadataExpression());
   if (!lockedChat?.found) throw new Error("The current Douyin chat could not be locked.");
   bridgeLock = await acquireBridgeRunLock(projectRoot, lockedChat.fingerprint);
@@ -221,6 +227,7 @@ try {
     pendingMessages: startupPendingMessages,
   });
   const runtime = session.runtime;
+  if (!runtime.resumed) uncommittedStartupThreadId = runtime.threadId;
   contextManager = new CodexContextCompactionManager({
     codex,
     threadId: runtime.threadId,
@@ -263,6 +270,11 @@ try {
       outboundFingerprint: storedState?.checkpoint.outboundFingerprint ?? null,
     });
   await saveBridgeState(projectRoot, activeState);
+  uncommittedStartupThreadId = null;
+  if (session.replacedStoredThread && storedState?.threadId
+      && storedState.threadId !== runtime.threadId) {
+    await codex.request("thread/archive", { threadId: storedState.threadId }).catch(() => {});
+  }
   console.log(JSON.stringify({
     ok: true,
     event: "bridge-ready",
@@ -309,6 +321,8 @@ try {
       if (stopRequested) break;
     }
     await repairCollapsedDouyinViewport({ cdp, targetId: target.id });
+    const tail = await cdp.evaluate(buildEnsureChatTailVisibleExpression());
+    if (!tail?.ok) throw new Error("The Douyin message tail is unavailable.");
     let currentMetadata = await cdp.evaluate(buildChatMessageMetadataExpression());
     if (currentMetadata.chatFingerprint !== lockedChat.fingerprint) {
       setBridgePhase("blocked");
@@ -327,6 +341,8 @@ try {
       let chatChangedDuringSettle = false;
       for (let settleRound = 0; settleRound < 3 && !stopRequested; settleRound += 1) {
         await sleep(750);
+        const settledTail = await cdp.evaluate(buildEnsureChatTailVisibleExpression());
+        if (!settledTail?.ok) throw new Error("The Douyin message tail is unavailable during settle.");
         const settledMetadata = await cdp.evaluate(buildChatMessageMetadataExpression());
         if (settledMetadata.chatFingerprint !== lockedChat.fingerprint) {
           setBridgePhase("blocked");
@@ -558,13 +574,19 @@ try {
           };
         } else if (mediaClassification.mediaType === "shared_aweme"
             || mediaClassification.mediaType === "comment_share") {
-          const sharedManifest = await cdp.evaluate(
+          let sharedManifest = await cdp.evaluate(
             buildReadCompatibleAwemeMediaExpression(incomingBatch.mediaMessage),
             15_000,
           );
           if (!sharedManifest?.ok) {
             throw new Error(`The shared Douyin work is unavailable: ${sharedManifest?.reason || "unknown"}.`);
           }
+          sharedManifest = await resolveDouyinSharedWorkPlayerFallback({
+            cdp,
+            mediaMessage: incomingBatch.mediaMessage,
+            expectedChatFingerprint: lockedChat.fingerprint,
+            initialManifest: sharedManifest,
+          });
           if (sharedManifest.mediaType === "video") {
             media = {
               kind: "video",
@@ -866,6 +888,12 @@ try {
     console.log(JSON.stringify({ ok: true, event: "bridge-stop-requested" }));
   }
   setBridgePhase("stopped");
+} catch (error) {
+  if (uncommittedStartupThreadId) {
+    await codex.request("thread/archive", { threadId: uncommittedStartupThreadId }).catch(() => {});
+    uncommittedStartupThreadId = null;
+  }
+  throw error;
 } finally {
   controlChannel?.close();
   contextManager?.close();

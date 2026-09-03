@@ -220,6 +220,80 @@ test("pins an available model and reasoning effort", async () => {
   assert.equal(calls[0].ephemeral, false);
 });
 
+test("archives a newly created task when persona verification fails", async () => {
+  const archived = [];
+  await assert.rejects(
+    startVerifiedPersonaThread({
+      codex: {
+        async start() {},
+        async request(method, params) {
+          if (method === "thread/archive") {
+            archived.push(params.threadId);
+            return {};
+          }
+          return {
+            data: [{
+              id: "gpt-5.6-sol",
+              supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+            }],
+          };
+        },
+        async startThread() {
+          return {
+            thread: { id: "thread-orphan", ephemeral: false },
+            model: "gpt-5.6-sol",
+            instructionSources: [],
+          };
+        },
+      },
+      cwd: "C:/project",
+      expectedPersonaPath: "C:/persona/AGENTS.md",
+      ephemeral: false,
+    }),
+    /AGENTS\.md was not loaded/u,
+  );
+  assert.deepEqual(archived, ["thread-orphan"]);
+});
+
+test("archives a newly created task when initial history injection fails", async () => {
+  const archived = [];
+  await assert.rejects(
+    preparePersistentBridgeSession({
+      codex: {
+        async start() {},
+        async request(method, params) {
+          if (method === "thread/archive") {
+            archived.push(params.threadId);
+            return {};
+          }
+          return {
+            data: [{
+              id: "gpt-5.6-sol",
+              supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+            }],
+          };
+        },
+        async startThread() {
+          return {
+            thread: { id: "thread-orphan", ephemeral: false },
+            model: "gpt-5.6-sol",
+            instructionSources: [{ path: "C:/persona/AGENTS.md" }],
+          };
+        },
+        async injectItems() {
+          throw new Error("fixture injection failure");
+        },
+      },
+      cwd: "C:/project",
+      expectedPersonaPath: "C:/persona/AGENTS.md",
+      currentSnapshot: snapshot,
+      visibleMessages: [{ role: "user", text: "fixture" }],
+    }),
+    /fixture injection failure/u,
+  );
+  assert.deepEqual(archived, ["thread-orphan"]);
+});
+
 test("resumes a compatible persistent thread without reinjecting visible history", async () => {
   let injected = false;
   const session = await preparePersistentBridgeSession({
