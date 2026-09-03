@@ -230,6 +230,32 @@ test("video download retries an incomplete range without writing duplicate bytes
   }
 });
 
+test("video download failure diagnostics stay content-free", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "codex-douyin-video-failure-"));
+  const destination = path.join(projectRoot, "video.mp4");
+  try {
+    await assert.rejects(downloadDouyinVideo({
+      source: "https://v5-dy.zjcdn.com/private-media-name.mp4",
+      destination,
+      requestFn: createRequestFn((_source, options) => options.headers.Range === "bytes=0-0"
+        ? Object.assign(Readable.from([Buffer.from([1])]), {
+          statusCode: 206,
+          headers: { "content-type": "video/mp4", "content-range": "bytes 0-0/3" },
+        })
+        : Object.assign(Readable.from([Buffer.from([1])]), {
+          statusCode: 206,
+          headers: { "content-type": "video/mp4", "content-range": "bytes 0-2/3" },
+        })),
+    }), (error) => {
+      assert.match(error.message, /range 1\/1 failed after bounded retries \(incomplete-range\)/u);
+      assert.doesNotMatch(error.message, /private-media-name|zjcdn/u);
+      return true;
+    });
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("tries bounded trusted video source candidates in order", async () => {
   const calls = [];
   const result = await downloadCompatibleDouyinVideo({
@@ -263,6 +289,21 @@ test("tries bounded trusted video source candidates in order", async () => {
       downloadFn: async () => ({ byteCount: 0 }),
     }),
     /no trusted compatible source candidate/u,
+  );
+
+  await assert.rejects(
+    () => downloadCompatibleDouyinVideo({
+      sourceResult: { source: "https://v1-dy.zjcdn.com/private-media-name.mp4" },
+      destination: path.resolve("C:/bounded/video.mp4"),
+      downloadFn: async () => {
+        throw new Error("Douyin media range 2/4 failed after bounded retries (incomplete-range).");
+      },
+    }),
+    (error) => {
+      assert.match(error.message, /failed \(range-2-of-4-incomplete-range\)/u);
+      assert.doesNotMatch(error.message, /private-media-name|zjcdn/u);
+      return true;
+    },
   );
 });
 

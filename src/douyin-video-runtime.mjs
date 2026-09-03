@@ -113,6 +113,34 @@ function parseDouyinContentRange(value) {
   return { start, end, total };
 }
 
+function classifyVideoDownloadFailure(error) {
+  const message = String(error?.message || "").toLowerCase();
+  const code = String(error?.code || "").toUpperCase();
+  const rangeFailure = /range (\d+)\/(\d+).*\(([a-z0-9-]+)\)/u.exec(message);
+  if (rangeFailure) {
+    return `range-${rangeFailure[1]}-of-${rangeFailure[2]}-${rangeFailure[3]}`;
+  }
+  if (message.includes("wall-time")) return "wall-time";
+  if (message.includes("inactive") || code === "ETIMEDOUT") return "inactive";
+  if (message.includes("incomplete byte range") || message.includes("premature close")) {
+    return "incomplete-range";
+  }
+  if (message.includes("unexpected byte range")) return "unexpected-range";
+  if (message.includes("oversized byte range")) return "oversized-range";
+  if (message.includes("bounded range probe") || message.includes("invalid range probe")) {
+    return "invalid-probe";
+  }
+  if (message.includes("was not a video")) return "invalid-media-type";
+  if (message.includes("exceeds the local size limit")) return "size-limit";
+  if (message.includes("redirect")) return "redirect";
+  const status = /http (\d{3})/u.exec(message)?.[1];
+  if (status) return `http-${status}`;
+  if (["ECONNRESET", "ECONNREFUSED", "EPIPE", "ENETUNREACH", "EAI_AGAIN"].includes(code)) {
+    return code.toLowerCase();
+  }
+  return "transport-or-validation";
+}
+
 export function resolveVideoAnalysisRoot(projectRoot) {
   return path.resolve(projectRoot, ".runtime", "video-analysis");
 }
@@ -243,6 +271,7 @@ export async function downloadDouyinVideo({
       const end = Math.min(probeRange.total - 1, start + VIDEO_RANGE_CHUNK_BYTES - 1);
       const expectedBytes = end - start + 1;
       let completedRange = null;
+      let lastRangeFailure = "transport-or-validation";
       for (let attempt = 0; attempt < VIDEO_RANGE_ATTEMPTS && !completedRange; attempt += 1) {
         if (wallTimeExpired || Date.now() >= deadline) break;
         try {
@@ -279,13 +308,18 @@ export async function downloadDouyinVideo({
           }
           completedRange = Buffer.concat(chunks, receivedBytes);
           currentSource = opened.finalSource;
-        } catch {
+        } catch (error) {
+          lastRangeFailure = classifyVideoDownloadFailure(error);
           response?.destroy();
           request?.destroy();
         }
       }
       if (!completedRange) {
-        throw new Error("Douyin media range failed after bounded retries.");
+        const rangeNumber = Math.floor(start / VIDEO_RANGE_CHUNK_BYTES) + 1;
+        const rangeCount = Math.ceil(probeRange.total / VIDEO_RANGE_CHUNK_BYTES);
+        throw new Error(
+          `Douyin media range ${rangeNumber}/${rangeCount} failed after bounded retries (${lastRangeFailure}).`,
+        );
       }
       byteCount += completedRange.byteLength;
       if (byteCount > boundedMaxBytes) throw new Error("Douyin video exceeds the local size limit.");
@@ -328,6 +362,7 @@ export async function downloadCompatibleDouyinVideo({
     throw new Error("The Douyin video has no trusted compatible source candidate.");
   }
   const deadline = Date.now() + DEFAULT_DOWNLOAD_WALL_TIME_MS;
+  const failures = [];
   for (const source of candidates) {
     const remainingWallTimeMs = deadline - Date.now();
     if (remainingWallTimeMs < 1_000) break;
@@ -338,9 +373,13 @@ export async function downloadCompatibleDouyinVideo({
         timeoutMs: VIDEO_SOURCE_ATTEMPT_TIMEOUT_MS,
         maxWallTimeMs: remainingWallTimeMs,
       });
-    } catch {}
+    } catch (error) {
+      failures.push(classifyVideoDownloadFailure(error));
+    }
   }
-  throw new Error("Every compatible Douyin video source failed.");
+  throw new Error(
+    `Every compatible Douyin video source failed (${failures.join(",") || "wall-time"}).`,
+  );
 }
 
 export async function prepareLatestDouyinVideoMedia({
