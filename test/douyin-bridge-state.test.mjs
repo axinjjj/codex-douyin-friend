@@ -423,6 +423,27 @@ test("fresh-thread recovery preserves an exact paused queue", () => {
   assert.deepEqual(recovered.queuedPending, [{ ...pendingMedia, ordinalFromEnd: 2 }]);
 });
 
+test("fresh-thread recovery rebinds interrupted later media before a verified reply", () => {
+  const firstMedia = message("first-media", "left", "media");
+  const pendingMedia = message("pending-media", "left", "media");
+  const verifiedReply = message("verified-reply", "right");
+  const current = snapshot(3, [firstMedia, pendingMedia, verifiedReply]);
+  const processing = createBridgeState({
+    chatKey,
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
+    snapshot: current,
+    phase: "processing",
+    pending: [pendingMedia],
+  });
+  const recovered = recoverBridgeStateForFreshThread(processing, current);
+  assert.equal(recovered.state.checkpoint.phase, "queued");
+  assert.equal(recovered.recoveredPendingCount, 1);
+  assert.deepEqual(recovered.queuedPending, [{ ...pendingMedia, ordinalFromEnd: 2 }]);
+  assert.deepEqual(recovered.state.checkpoint.snapshot, current);
+});
+
 test("fresh-thread recovery refuses changed chats and sending checkpoints", () => {
   const pending = message("pending");
   const processing = createBridgeState({

@@ -494,7 +494,20 @@ export function recoverBridgeStateForFreshThread(state, currentSnapshot) {
   }
   const pendingBoundary = checkpoint.messages.slice(-pending.length);
   if (!pending.every((message, index) => sameMessage(message, pendingBoundary[index]))) {
-    throw new Error("The interrupted pending batch no longer matches the checkpoint boundary.");
+    const queuedPending = rebindPendingMessages(current, pending);
+    return {
+      state: createBridgeState({
+        chatKey: normalized.chatKey,
+        threadId: normalized.threadId,
+        model: normalized.model,
+        effort: normalized.effort,
+        snapshot: current,
+        phase: "queued",
+        pending: queuedPending,
+      }),
+      recoveredPendingCount: queuedPending.length,
+      queuedPending,
+    };
   }
   const baselineSnapshot = {
     messageCount: checkpoint.messageCount - pending.length,
