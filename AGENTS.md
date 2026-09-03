@@ -36,7 +36,7 @@ Build a private, local-only bridge between one Douyin friend account and Codex A
 - One native shared-video card completed an inbound/outbound live round trip using local H.264 keyframes as Codex `localImage` inputs.
 - The live bridge derives a full SHA-256 chat key from the selected opponent's opaque account id, locks that chat, orders reverse-DOM messages by visual position, and refuses startup when stable identity is unavailable.
 - Incoming/outgoing direction is derived from Douyin's stable `isFromMe` DOM marker rather than live horizontal geometry, so background, minimized, or narrow Edge layouts do not collapse every message to the center.
-- Message fingerprints use the stable message content box and exclude the dynamic time label, so day-boundary label changes do not invalidate a persisted append boundary.
+- Message fingerprints use the stable active content area and exclude both the dynamic time label and the bottom reaction panel, so day-boundary label changes or media likes do not invalidate a persisted append boundary.
 - Each chat key maps to one persistent Codex App Server thread. Restart uses `thread/resume` without reinjecting history; a confirmed missing or incompatible thread starts fresh and seeds visible history once while retaining a reliable message checkpoint.
 - Bridge state is allowlisted metadata under ignored `.runtime/douyin-bridge-state/v1/`, written as atomic primary and recovery snapshots. Neither copy contains chat text, names, account ids, tokens, persona text, or media URLs.
 - A Windows named-pipe run lock prevents two bridge processes from owning the same chat and is released automatically when a process terminates.

@@ -59,6 +59,8 @@ test("message metadata hashes content without returning it", () => {
   assert.match(expression, /chatFingerprint/u);
   assert.match(expression, /const captured =/u);
   assert.match(expression, /fingerprint/);
+  assert.match(expression, /stableContent/u);
+  assert.match(expression, /MessageBoxContentactiveClickArea/u);
   assert.doesNotMatch(expression, /slice\(0, 16\)/u);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/);
   assert.doesNotMatch(expression, /messages\.push\(\{[\s\S]*?\bsource,?\s*\}/);

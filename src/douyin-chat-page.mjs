@@ -148,7 +148,8 @@ export function buildChatMessageMetadataExpression() {
       const textBubble = message.querySelector(textBubbleSelector);
       ${MESSAGE_SIDE_CAPTURE_SOURCE}
       const content = message.querySelector('.messageMessageBoxcontentBox');
-      const source = (textBubble?.textContent || content?.textContent || '').trim();
+      const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
+      const source = (textBubble?.textContent || stableContent?.textContent || '').trim();
       const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
       const kind = hasMedia ? 'media' : textBubble ? 'text' : centered ? 'system' : 'unknown';
       const structuralKey = kind === 'media' || kind === 'text'
@@ -198,7 +199,8 @@ export function buildBridgeStartupViewExpression(limit = 12) {
         const bubble = message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)});
         ${MESSAGE_SIDE_CAPTURE_SOURCE}
         const content = message.querySelector('.messageMessageBoxcontentBox');
-        const source = (bubble?.textContent || content?.textContent || '').trim();
+        const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
+        const source = (bubble?.textContent || stableContent?.textContent || '').trim();
         const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
         const kind = hasMedia ? 'media' : bubble ? 'text' : centered ? 'system' : 'unknown';
         const structuralKey = kind === 'media' || kind === 'text'
@@ -731,7 +733,8 @@ export function buildReadCompatibleAwemeMediaExpression(message = null) {
       const bubble = message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)});
       ${MESSAGE_SIDE_CAPTURE_SOURCE}
       const content = message.querySelector('.messageMessageBoxcontentBox');
-      const source = (bubble?.textContent || content?.textContent || '').trim();
+      const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
+      const source = (bubble?.textContent || stableContent?.textContent || '').trim();
       const fingerprint = await digest(['media', side, source].join('|'));
       if (side !== 'left' || fingerprint !== expected.fingerprint) {
         return { ok: false, reason: 'incoming-shared-work-identity-changed' };
@@ -873,7 +876,8 @@ export function buildReadIncomingMediaTextExpression(message) {
       return { ok: false, reason: 'incoming-media-identity-changed', text: null };
     }
     const content = message.querySelector('.messageMessageBoxcontentBox');
-    const source = (bubble?.textContent || content?.textContent || '').trim();
+    const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
+    const source = (bubble?.textContent || stableContent?.textContent || '').trim();
     const fingerprint = await digest(['media', side, source].join('|'));
     if (fingerprint !== expected.fingerprint) {
       return { ok: false, reason: 'incoming-media-fingerprint-changed', text: null };
@@ -915,7 +919,8 @@ export function buildLocateIncomingMediaReactionTargetExpression(message, ordina
     ${MESSAGE_SIDE_CAPTURE_SOURCE}
     const content = message.querySelector('.messageMessageBoxcontentBox');
     const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
-    const source = (bubble?.textContent || content?.textContent || '').trim();
+    const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
+    const source = (bubble?.textContent || stableContent?.textContent || '').trim();
     const fingerprint = await digest(['media', side, source].join('|'));
     if (side !== 'left' || !hasMedia || fingerprint !== expected.fingerprint) {
       return { ok: false, reason: 'incoming-media-reaction-target-changed' };
@@ -990,7 +995,8 @@ export function buildReadIncomingCommentShareExpression(message) {
     ${MESSAGE_SIDE_CAPTURE_SOURCE}
     const card = message.querySelector(${JSON.stringify(DOUYIN_COMMENT_SHARE_SELECTOR)});
     const content = message.querySelector('.messageMessageBoxcontentBox');
-    const source = (bubble?.textContent || content?.textContent || '').trim();
+    const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
+    const source = (bubble?.textContent || stableContent?.textContent || '').trim();
     const fingerprint = await digest(['media', side, source].join('|'));
     if (side !== 'left' || !card || fingerprint !== expected.fingerprint) {
       return { ok: false, reason: 'incoming-comment-share-identity-changed' };
