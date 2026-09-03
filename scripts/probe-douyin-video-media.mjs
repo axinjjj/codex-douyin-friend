@@ -2,13 +2,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CdpClient } from "../src/cdp-client.mjs";
 import {
-  buildReadCompatibleAwemeSourceExpression,
+  buildReadCompatibleAwemeMediaExpression,
   isDouyinChatTarget,
 } from "../src/douyin-chat-page.mjs";
 import {
   cleanupStaleVideoAnalysisJobs,
   createVideoAnalysisJob,
-  downloadDouyinVideo,
+  downloadCompatibleDouyinVideo,
   extractVideoMedia,
   removeVideoAnalysisJob,
 } from "../src/douyin-video-runtime.mjs";
@@ -27,18 +27,19 @@ if (!target) throw new Error("No debuggable Douyin chat page was found.");
 
 const cdp = new CdpClient(target.webSocketDebuggerUrl);
 await cdp.connect();
-let source;
+let sourceResult;
 try {
-  const sourceResult = await cdp.evaluate(buildReadCompatibleAwemeSourceExpression());
-  if (!sourceResult?.ok) throw new Error("The latest Douyin video card has no compatible source.");
-  source = sourceResult.source;
+  sourceResult = await cdp.evaluate(buildReadCompatibleAwemeMediaExpression(), 15_000);
+  if (!sourceResult?.ok || sourceResult.mediaType !== "video") {
+    throw new Error("The latest Douyin video card has no compatible source.");
+  }
 } finally {
   cdp.close();
 }
 
 const job = await createVideoAnalysisJob(projectRoot);
 try {
-  const download = await downloadDouyinVideo({ source, destination: job.videoPath });
+  const download = await downloadCompatibleDouyinVideo({ sourceResult, destination: job.videoPath });
   const media = await extractVideoMedia({
     port,
     videoPath: job.videoPath,

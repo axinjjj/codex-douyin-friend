@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, open, readdir, rm, stat, writeFile } from "node:fs/promises";
+import https from "node:https";
 import { createServer } from "node:http";
 import path from "node:path";
 import { CdpClient } from "./cdp-client.mjs";
@@ -24,6 +25,10 @@ const TRUSTED_MEDIA_SUFFIXES = [
   ".bytedance.net",
   ".snssdk.com",
 ];
+const TRUSTED_MEDIA_HOSTS = new Set([
+  "api-play.amemv.com",
+  "api-play-hj.amemv.com",
+]);
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const DEFAULT_MAX_VIDEO_BYTES = 100 * 1024 * 1024;
@@ -33,6 +38,12 @@ const DEFAULT_MAX_FRAME_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_FRAME_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_SCAN_WALL_TIME_MS = 45_000;
 const DEFAULT_MAX_CAPTURE_WALL_TIME_MS = 45_000;
+const DEFAULT_DOWNLOAD_TIMEOUT_MS = 120_000;
+const DEFAULT_DOWNLOAD_WALL_TIME_MS = 6 * 60_000;
+const VIDEO_SOURCE_ATTEMPT_TIMEOUT_MS = 30_000;
+const VIDEO_RANGE_CHUNK_BYTES = 1024 * 1024;
+const MAX_VIDEO_SOURCE_CANDIDATES = 4;
+const MAX_VIDEO_SOURCE_REDIRECTS = 2;
 const VIDEO_JOB_NAME_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 function boundedLimit(value, fallback, hardMaximum, minimum = 1) {
@@ -43,12 +54,62 @@ function boundedLimit(value, fallback, hardMaximum, minimum = 1) {
 export function isTrustedDouyinMediaUrl(value) {
   try {
     const url = new URL(value);
-    return url.protocol === "https:" && TRUSTED_MEDIA_SUFFIXES.some(
-      (suffix) => url.hostname === suffix.slice(1) || url.hostname.endsWith(suffix),
+    return url.protocol === "https:" && (
+      TRUSTED_MEDIA_HOSTS.has(url.hostname)
+      || TRUSTED_MEDIA_SUFFIXES.some(
+        (suffix) => url.hostname === suffix.slice(1) || url.hostname.endsWith(suffix),
+      )
     );
   } catch {
     return false;
   }
+}
+
+async function openDouyinVideoResponse({ source, timeoutMs, requestFn }) {
+  let currentSource = source;
+  for (let redirectCount = 0; redirectCount <= MAX_VIDEO_SOURCE_REDIRECTS; redirectCount += 1) {
+    const { request, response } = await new Promise((resolve, reject) => {
+      const pendingRequest = requestFn(currentSource, {
+        headers: {
+          "Accept-Encoding": "identity",
+          Referer: "https://www.douyin.com/",
+        },
+        timeout: timeoutMs,
+      }, (incomingResponse) => resolve({ request: pendingRequest, response: incomingResponse }));
+      pendingRequest.once("timeout", () => {
+        pendingRequest.destroy(new Error("Douyin media download became inactive."));
+      });
+      pendingRequest.once("error", reject);
+    });
+    const location = response.headers.location;
+    if (response.statusCode >= 300 && response.statusCode < 400 && location) {
+      let nextSource;
+      try {
+        nextSource = new URL(location, currentSource).href;
+      } catch {
+        response.destroy();
+        request.destroy();
+        throw new Error("Douyin media redirected to an invalid URL.");
+      }
+      response.destroy();
+      request.destroy();
+      if (!isTrustedDouyinMediaUrl(nextSource)) {
+        throw new Error("Douyin media redirected to an untrusted URL.");
+      }
+      currentSource = nextSource;
+      continue;
+    }
+    return { request, response, finalSource: currentSource };
+  }
+  throw new Error("Douyin media exceeded its redirect limit.");
+}
+
+function parseDouyinContentRange(value) {
+  const match = /^bytes (\d+)-(\d+)\/(\d+)$/u.exec(String(value || ""));
+  if (!match) return null;
+  const [, start, end, total] = match.map(Number);
+  if (![start, end, total].every(Number.isSafeInteger) || start > end || end >= total) return null;
+  return { start, end, total };
 }
 
 export function resolveVideoAnalysisRoot(projectRoot) {
@@ -109,45 +170,157 @@ export async function downloadDouyinVideo({
   source,
   destination,
   maxBytes = DEFAULT_MAX_VIDEO_BYTES,
+  timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS,
+  maxWallTimeMs = DEFAULT_DOWNLOAD_WALL_TIME_MS,
+  requestFn = https.get,
 }) {
   const boundedMaxBytes = boundedLimit(maxBytes, DEFAULT_MAX_VIDEO_BYTES, DEFAULT_MAX_VIDEO_BYTES);
+  const boundedTimeoutMs = boundedLimit(
+    timeoutMs,
+    DEFAULT_DOWNLOAD_TIMEOUT_MS,
+    DEFAULT_DOWNLOAD_TIMEOUT_MS,
+    1_000,
+  );
+  const boundedWallTimeMs = boundedLimit(
+    maxWallTimeMs,
+    DEFAULT_DOWNLOAD_WALL_TIME_MS,
+    DEFAULT_DOWNLOAD_WALL_TIME_MS,
+    1_000,
+  );
   if (!isTrustedDouyinMediaUrl(source)) {
     throw new Error("Refusing an untrusted Douyin media URL.");
   }
-  const response = await fetch(source, {
-    headers: { Referer: "https://www.douyin.com/" },
-    redirect: "error",
-    signal: AbortSignal.timeout(120_000),
-  });
-  if (!response.ok || !response.body) {
-    throw new Error(`Douyin media download failed with HTTP ${response.status}.`);
-  }
-  const contentType = response.headers.get("content-type") || "";
-  if (!contentType.startsWith("video/") && contentType !== "application/octet-stream") {
-    throw new Error("Douyin media response was not a video.");
-  }
-  const declaredLength = Number.parseInt(response.headers.get("content-length") || "0", 10);
-  if (declaredLength > boundedMaxBytes) throw new Error("Douyin video exceeds the local size limit.");
-
-  const reader = response.body.getReader();
-  const handle = await open(destination, "wx");
+  let request;
+  let response;
+  let handle;
+  let createdDestination = false;
   let byteCount = 0;
+  let wallTimer;
+  let wallTimeExpired = false;
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      byteCount += value.byteLength;
-      if (byteCount > boundedMaxBytes) throw new Error("Douyin video exceeds the local size limit.");
-      await handle.write(value);
+    const deadline = Date.now() + boundedWallTimeMs;
+    wallTimer = setTimeout(() => {
+      wallTimeExpired = true;
+      const error = new Error("Douyin media download exceeded its wall-time limit.");
+      response?.destroy(error);
+      request?.destroy(error);
+    }, boundedWallTimeMs);
+
+    let currentSource = source;
+    ({ request, response, finalSource: currentSource } = await openDouyinVideoResponse({
+      source,
+      timeoutMs: boundedTimeoutMs,
+      requestFn: (rangeSource, options, callback) => requestFn(rangeSource, {
+        ...options,
+        headers: { ...options.headers, Range: "bytes=0-0" },
+      }, callback),
+    }));
+    if (response.statusCode !== 206) {
+      throw new Error(`Douyin media download failed with HTTP ${response.statusCode}.`);
     }
-  } catch (error) {
-    await reader.cancel().catch(() => {});
+    const contentType = String(response.headers["content-type"] || "");
+    if (!contentType.startsWith("video/") && contentType !== "application/octet-stream") {
+      throw new Error("Douyin media response was not a video.");
+    }
+    const probeRange = parseDouyinContentRange(response.headers["content-range"]);
+    if (!probeRange || probeRange.start !== 0 || probeRange.end !== 0) {
+      throw new Error("Douyin media did not honor the bounded range probe.");
+    }
+    if (probeRange.total > boundedMaxBytes) {
+      throw new Error("Douyin video exceeds the local size limit.");
+    }
+    let probeBytes = 0;
+    for await (const value of response) probeBytes += value.byteLength;
+    if (probeBytes !== 1) throw new Error("Douyin media returned an invalid range probe.");
+
+    handle = await open(destination, "wx");
+    createdDestination = true;
+    for (let start = 0; start < probeRange.total; start += VIDEO_RANGE_CHUNK_BYTES) {
+      if (wallTimeExpired || Date.now() >= deadline) {
+        throw new Error("Douyin media download exceeded its wall-time limit.");
+      }
+      const end = Math.min(probeRange.total - 1, start + VIDEO_RANGE_CHUNK_BYTES - 1);
+      ({ request, response, finalSource: currentSource } = await openDouyinVideoResponse({
+        source: currentSource,
+        timeoutMs: Math.min(boundedTimeoutMs, Math.max(1_000, deadline - Date.now())),
+        requestFn: (rangeSource, options, callback) => requestFn(rangeSource, {
+          ...options,
+          headers: { ...options.headers, Range: `bytes=${start}-${end}` },
+        }, callback),
+      }));
+      if (response.statusCode !== 206) {
+        throw new Error(`Douyin media range download failed with HTTP ${response.statusCode}.`);
+      }
+      const returnedRange = parseDouyinContentRange(response.headers["content-range"]);
+      if (!returnedRange || returnedRange.start !== start || returnedRange.end !== end
+          || returnedRange.total !== probeRange.total) {
+        throw new Error("Douyin media returned an unexpected byte range.");
+      }
+      const expectedBytes = end - start + 1;
+      let receivedBytes = 0;
+      for await (const value of response) {
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        receivedBytes += chunk.byteLength;
+        byteCount += chunk.byteLength;
+        if (receivedBytes > expectedBytes || byteCount > boundedMaxBytes) {
+          throw new Error("Douyin video exceeds the local size limit.");
+        }
+        await handle.write(chunk);
+      }
+      if (receivedBytes !== expectedBytes) {
+        throw new Error("Douyin media returned an incomplete byte range.");
+      }
+    }
+    if (byteCount !== probeRange.total) throw new Error("Douyin video download was incomplete.");
     await handle.close();
-    await rm(destination, { force: true });
+    handle = null;
+    return { byteCount, contentType };
+  } catch (error) {
+    response?.destroy();
+    request?.destroy();
+    await handle?.close().catch(() => {});
+    if (createdDestination) await rm(destination, { force: true });
     throw error;
+  } finally {
+    clearTimeout(wallTimer);
   }
-  await handle.close();
-  return { byteCount, contentType };
+}
+
+export async function downloadCompatibleDouyinVideo({
+  sourceResult,
+  destination,
+  downloadFn = downloadDouyinVideo,
+}) {
+  const candidates = [...new Set([
+    ...(Array.isArray(sourceResult?.sources) ? sourceResult.sources : []),
+    sourceResult?.source,
+  ])]
+    .filter(isTrustedDouyinMediaUrl)
+    .map((source, originalIndex) => ({
+      source,
+      originalIndex,
+      priority: TRUSTED_MEDIA_HOSTS.has(new URL(source).hostname) ? 0 : 1,
+    }))
+    .sort((left, right) => left.priority - right.priority || left.originalIndex - right.originalIndex)
+    .map((candidate) => candidate.source)
+    .slice(0, MAX_VIDEO_SOURCE_CANDIDATES);
+  if (candidates.length === 0) {
+    throw new Error("The Douyin video has no trusted compatible source candidate.");
+  }
+  const deadline = Date.now() + DEFAULT_DOWNLOAD_WALL_TIME_MS;
+  for (const source of candidates) {
+    const remainingWallTimeMs = deadline - Date.now();
+    if (remainingWallTimeMs < 1_000) break;
+    try {
+      return await downloadFn({
+        source,
+        destination,
+        timeoutMs: VIDEO_SOURCE_ATTEMPT_TIMEOUT_MS,
+        maxWallTimeMs: remainingWallTimeMs,
+      });
+    } catch {}
+  }
+  throw new Error("Every compatible Douyin video source failed.");
 }
 
 export async function prepareLatestDouyinVideoMedia({
@@ -158,13 +331,13 @@ export async function prepareLatestDouyinVideoMedia({
   sourceResult = null,
 }) {
   const resolvedSource = sourceResult ?? await cdp.evaluate(buildReadCompatibleAwemeSourceExpression());
-  if (!resolvedSource?.ok || !isTrustedDouyinMediaUrl(resolvedSource.source)) {
+  if (!resolvedSource?.ok) {
     throw new Error(`The latest Douyin video has no trusted compatible source: ${resolvedSource?.reason}.`);
   }
   const job = await createVideoAnalysisJob(projectRoot);
   try {
-    const download = await downloadDouyinVideo({
-      source: resolvedSource.source,
+    const download = await downloadCompatibleDouyinVideo({
+      sourceResult: resolvedSource,
       destination: job.videoPath,
     });
     const media = await extractVideoMedia({

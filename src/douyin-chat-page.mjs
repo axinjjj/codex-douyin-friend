@@ -843,9 +843,12 @@ export function buildReadCompatibleAwemeMediaExpression(message = null) {
         .flatMap((entry) => Array.isArray(entry?.play_addr?.url_list) ? entry.play_addr.url_list : [])
       : [];
     const defaultUrls = video?.play_addr?.url_list;
-    const videoSource = (Array.isArray(h264Urls) && h264Urls.find(Boolean)) ||
-      compatibleBitRateUrls.find(Boolean) ||
-      (Array.isArray(defaultUrls) && defaultUrls.find(Boolean)) || '';
+    const videoSources = [...new Set([
+      ...(Array.isArray(h264Urls) ? h264Urls : []),
+      ...compatibleBitRateUrls,
+      ...(Array.isArray(defaultUrls) ? defaultUrls : []),
+    ].filter((value) => typeof value === 'string' && value.length > 0))].slice(0, 6);
+    const videoSource = videoSources[0] || '';
     if (videoSource) {
       const selectedCodec = Array.isArray(h264Urls) && h264Urls.some(Boolean)
         ? 'h264'
@@ -854,6 +857,7 @@ export function buildReadCompatibleAwemeMediaExpression(message = null) {
         ok: true,
         mediaType: 'video',
         source: videoSource,
+        sources: videoSources,
         selectedCodec,
       };
     }

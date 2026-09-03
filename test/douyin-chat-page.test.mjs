@@ -256,6 +256,8 @@ test("shared-work inspection distinguishes videos from ordered image posts", () 
   assert.match(expression, /new AbortController\(\)/u);
   assert.match(expression, /controller\.abort\(\), 2000/u);
   assert.match(expression, /video\?\.bit_rate/u);
+  assert.match(expression, /videoSources/u);
+  assert.match(expression, /slice\(0, 6\)/u);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
   assert.doesNotMatch(expression, /return \{[^}]*itemId/u);
 

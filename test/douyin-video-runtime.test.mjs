@@ -1,22 +1,39 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import {
   assertVideoAnalysisJobPath,
   buildCaptureFrameExpression,
   buildExtractAudioExpression,
   buildScanFrameSignaturesExpression,
   cleanupStaleVideoAnalysisJobs,
+  downloadCompatibleDouyinVideo,
   downloadDouyinVideo,
   isTrustedDouyinMediaUrl,
   resolveVideoAnalysisRoot,
 } from "../src/douyin-video-runtime.mjs";
 
+function createRequestFn(responseFactory, inspectOptions = () => {}) {
+  return (source, options, callback) => {
+    inspectOptions(options);
+    const request = new EventEmitter();
+    request.destroy = (error) => {
+      if (error) queueMicrotask(() => request.emit("error", error));
+    };
+    queueMicrotask(() => callback(responseFactory(source, options)));
+    return request;
+  };
+}
+
 test("allows only known HTTPS Douyin media hosts", () => {
   assert.equal(isTrustedDouyinMediaUrl("https://v5-dy.zjcdn.com/video.mp4"), true);
+  assert.equal(isTrustedDouyinMediaUrl("https://api-play.amemv.com/aweme/v1/play/"), true);
   assert.equal(isTrustedDouyinMediaUrl("http://v5-dy.zjcdn.com/video.mp4"), false);
+  assert.equal(isTrustedDouyinMediaUrl("https://api-play.amemv.com.attacker.invalid/video.mp4"), false);
   assert.equal(isTrustedDouyinMediaUrl("https://zjcdn.com.attacker.invalid/video.mp4"), false);
   assert.equal(isTrustedDouyinMediaUrl("file:///C:/private/video.mp4"), false);
 });
@@ -90,25 +107,132 @@ test("builds sequential in-memory scene scanning and bounded final capture expre
 });
 
 test("caller options cannot raise the 100 MB Douyin download ceiling", async () => {
-  const originalFetch = globalThis.fetch;
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "codex-douyin-video-limit-"));
   try {
-    globalThis.fetch = async () => new Response(new Uint8Array(), {
-      status: 200,
-      headers: {
-        "Content-Type": "video/mp4",
-        "Content-Length": String(101 * 1024 * 1024),
-      },
-    });
     await assert.rejects(downloadDouyinVideo({
       source: "https://v5-dy.zjcdn.com/video.mp4",
       destination: path.join(projectRoot, "video.mp4"),
       maxBytes: 500 * 1024 * 1024,
+      requestFn: createRequestFn(() => Object.assign(Readable.from([]), {
+        statusCode: 206,
+        headers: {
+          "content-type": "video/mp4",
+          "content-range": `bytes 0-0/${101 * 1024 * 1024}`,
+        },
+      })),
     }), /exceeds the local size limit/u);
   } finally {
-    globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
   }
+});
+
+test("video download timeout measures inactivity instead of total transfer time", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "codex-douyin-video-stream-"));
+  const destination = path.join(projectRoot, "video.mp4");
+  try {
+    const requestFn = createRequestFn(
+      (_source, options) => options.headers.Range === "bytes=0-0"
+        ? Object.assign(Readable.from([Buffer.from([1])]), {
+          statusCode: 206,
+          headers: { "content-type": "video/mp4", "content-range": "bytes 0-0/3" },
+        })
+        : Object.assign(Readable.from((async function* streamChunks() {
+          for (let chunk = 1; chunk <= 3; chunk += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 400));
+            yield Buffer.from([chunk]);
+          }
+        }())), {
+          statusCode: 206,
+          headers: { "content-type": "video/mp4", "content-range": "bytes 0-2/3" },
+        }),
+      (options) => {
+        assert.equal(options.headers["Accept-Encoding"], "identity");
+        assert.equal(options.timeout, 1_000);
+      },
+    );
+    const result = await downloadDouyinVideo({
+      source: "https://v5-dy.zjcdn.com/video.mp4",
+      destination,
+      timeoutMs: 1_000,
+      requestFn,
+    });
+    assert.equal(result.byteCount, 3);
+    assert.deepEqual(await readFile(destination), Buffer.from([1, 2, 3]));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("video download follows only bounded trusted redirects", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "codex-douyin-video-redirect-"));
+  const destination = path.join(projectRoot, "video.mp4");
+  const requests = [];
+  try {
+    const result = await downloadDouyinVideo({
+      source: "https://api-play.amemv.com/aweme/v1/play/",
+      destination,
+      requestFn: createRequestFn((source) => {
+        requests.push(source);
+        if (requests.length === 1) {
+          return Object.assign(Readable.from([]), {
+            statusCode: 302,
+            headers: { location: "https://v5-dy.zjcdn.com/fresh-video.mp4" },
+          });
+        }
+        if (requests.length === 2) {
+          return Object.assign(Readable.from([Buffer.from([1])]), {
+            statusCode: 206,
+            headers: { "content-type": "video/mp4", "content-range": "bytes 0-0/3" },
+          });
+        }
+        return Object.assign(Readable.from([Buffer.from([1, 2, 3])]), {
+          statusCode: 206,
+          headers: { "content-type": "video/mp4", "content-range": "bytes 0-2/3" },
+        });
+      }),
+    });
+    assert.equal(requests.length, 3);
+    assert.equal(result.byteCount, 3);
+    assert.deepEqual(await readFile(destination), Buffer.from([1, 2, 3]));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("tries bounded trusted video source candidates in order", async () => {
+  const calls = [];
+  const result = await downloadCompatibleDouyinVideo({
+    sourceResult: {
+      source: "https://v1-dy.zjcdn.com/first.mp4",
+      sources: [
+        "https://v1-dy.zjcdn.com/first.mp4",
+        "https://example.com/untrusted.mp4",
+        "https://api-play.amemv.com/aweme/v1/play/",
+        "https://v2-dy.zjcdn.com/second.mp4",
+        "https://v2-dy.zjcdn.com/second.mp4",
+      ],
+    },
+    destination: path.resolve("C:/bounded/video.mp4"),
+    async downloadFn(options) {
+      calls.push(options);
+      if (calls.length === 1) throw new Error("candidate failed");
+      return { byteCount: 123, contentType: "video/mp4" };
+    },
+  });
+  assert.deepEqual(result, { byteCount: 123, contentType: "video/mp4" });
+  assert.deepEqual(calls.map((call) => ({ source: call.source, timeoutMs: call.timeoutMs })), [
+    { source: "https://api-play.amemv.com/aweme/v1/play/", timeoutMs: 30_000 },
+    { source: "https://v1-dy.zjcdn.com/first.mp4", timeoutMs: 30_000 },
+  ]);
+
+  await assert.rejects(
+    () => downloadCompatibleDouyinVideo({
+      sourceResult: { source: "https://example.com/private.mp4" },
+      destination: path.resolve("C:/bounded/video.mp4"),
+      downloadFn: async () => ({ byteCount: 0 }),
+    }),
+    /no trusted compatible source candidate/u,
+  );
 });
 
 test("video cleanup paths must be children of the dedicated runtime root", () => {
