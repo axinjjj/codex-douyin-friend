@@ -230,6 +230,55 @@ test("video download retries an incomplete range without writing duplicate bytes
   }
 });
 
+test("video download fetches at most three verified ranges concurrently and writes them in order", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "codex-douyin-video-concurrent-"));
+  const destination = path.join(projectRoot, "video.mp4");
+  const chunkBytes = 1024 * 1024;
+  const totalBytes = (chunkBytes * 3) + 7;
+  let activeRanges = 0;
+  let peakActiveRanges = 0;
+  try {
+    const result = await downloadDouyinVideo({
+      source: "https://v5-dy.zjcdn.com/video.mp4",
+      destination,
+      requestFn: createRequestFn((_source, options) => {
+        if (options.headers.Range === "bytes=0-0") {
+          return Object.assign(Readable.from([Buffer.from([1])]), {
+            statusCode: 206,
+            headers: { "content-type": "video/mp4", "content-range": `bytes 0-0/${totalBytes}` },
+          });
+        }
+        const [, startText, endText] = /^bytes=(\d+)-(\d+)$/u.exec(options.headers.Range);
+        const start = Number(startText);
+        const end = Number(endText);
+        const fill = Math.floor(start / chunkBytes) + 1;
+        return Object.assign(Readable.from((async function* streamRange() {
+          activeRanges += 1;
+          peakActiveRanges = Math.max(peakActiveRanges, activeRanges);
+          try {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            yield Buffer.alloc(end - start + 1, fill);
+          } finally {
+            activeRanges -= 1;
+          }
+        }())), {
+          statusCode: 206,
+          headers: { "content-type": "video/mp4", "content-range": `bytes ${start}-${end}/${totalBytes}` },
+        });
+      }),
+    });
+    const bytes = await readFile(destination);
+    assert.equal(result.byteCount, totalBytes);
+    assert.equal(peakActiveRanges, 3);
+    assert.equal(bytes[0], 1);
+    assert.equal(bytes[chunkBytes], 2);
+    assert.equal(bytes[chunkBytes * 2], 3);
+    assert.equal(bytes[chunkBytes * 3], 4);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("video download failure diagnostics stay content-free", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "codex-douyin-video-failure-"));
   const destination = path.join(projectRoot, "video.mp4");

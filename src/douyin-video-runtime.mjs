@@ -43,6 +43,7 @@ const DEFAULT_DOWNLOAD_WALL_TIME_MS = 6 * 60_000;
 const VIDEO_SOURCE_ATTEMPT_TIMEOUT_MS = 30_000;
 const VIDEO_RANGE_CHUNK_BYTES = 1024 * 1024;
 const VIDEO_RANGE_ATTEMPTS = 3;
+const VIDEO_RANGE_CONCURRENCY = 3;
 const MAX_VIDEO_SOURCE_CANDIDATES = 4;
 const MAX_VIDEO_SOURCE_REDIRECTS = 2;
 const VIDEO_JOB_NAME_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -219,39 +220,40 @@ export async function downloadDouyinVideo({
   if (!isTrustedDouyinMediaUrl(source)) {
     throw new Error("Refusing an untrusted Douyin media URL.");
   }
-  let request;
-  let response;
   let handle;
   let createdDestination = false;
   let byteCount = 0;
   let wallTimer;
   let wallTimeExpired = false;
+  const activeRequests = new Set();
+  const activeResponses = new Set();
   try {
     const deadline = Date.now() + boundedWallTimeMs;
     wallTimer = setTimeout(() => {
       wallTimeExpired = true;
       const error = new Error("Douyin media download exceeded its wall-time limit.");
-      response?.destroy(error);
-      request?.destroy(error);
+      for (const activeResponse of activeResponses) activeResponse.destroy(error);
+      for (const activeRequest of activeRequests) activeRequest.destroy(error);
     }, boundedWallTimeMs);
 
-    let currentSource = source;
-    ({ request, response, finalSource: currentSource } = await openDouyinVideoResponse({
+    const probe = await openDouyinVideoResponse({
       source,
       timeoutMs: boundedTimeoutMs,
       requestFn: (rangeSource, options, callback) => requestFn(rangeSource, {
         ...options,
         headers: { ...options.headers, Range: "bytes=0-0" },
       }, callback),
-    }));
-    if (response.statusCode !== 206) {
-      throw new Error(`Douyin media download failed with HTTP ${response.statusCode}.`);
+    });
+    activeRequests.add(probe.request);
+    activeResponses.add(probe.response);
+    if (probe.response.statusCode !== 206) {
+      throw new Error(`Douyin media download failed with HTTP ${probe.response.statusCode}.`);
     }
-    const contentType = String(response.headers["content-type"] || "");
+    const contentType = String(probe.response.headers["content-type"] || "");
     if (!contentType.startsWith("video/") && contentType !== "application/octet-stream") {
       throw new Error("Douyin media response was not a video.");
     }
-    const probeRange = parseDouyinContentRange(response.headers["content-range"]);
+    const probeRange = parseDouyinContentRange(probe.response.headers["content-range"]);
     if (!probeRange || probeRange.start !== 0 || probeRange.end !== 0) {
       throw new Error("Douyin media did not honor the bounded range probe.");
     }
@@ -259,43 +261,51 @@ export async function downloadDouyinVideo({
       throw new Error("Douyin video exceeds the local size limit.");
     }
     let probeBytes = 0;
-    for await (const value of response) probeBytes += value.byteLength;
+    for await (const value of probe.response) probeBytes += value.byteLength;
+    activeResponses.delete(probe.response);
+    activeRequests.delete(probe.request);
     if (probeBytes !== 1) throw new Error("Douyin media returned an invalid range probe.");
 
     handle = await open(destination, "wx");
     createdDestination = true;
+    const ranges = [];
     for (let start = 0; start < probeRange.total; start += VIDEO_RANGE_CHUNK_BYTES) {
-      if (wallTimeExpired || Date.now() >= deadline) {
-        throw new Error("Douyin media download exceeded its wall-time limit.");
-      }
       const end = Math.min(probeRange.total - 1, start + VIDEO_RANGE_CHUNK_BYTES - 1);
-      const expectedBytes = end - start + 1;
+      ranges.push({ start, end });
+    }
+    const preferredSource = probe.finalSource;
+    const downloadRange = async ({ start, end }) => {
       let completedRange = null;
       let lastRangeFailure = "transport-or-validation";
       for (let attempt = 0; attempt < VIDEO_RANGE_ATTEMPTS && !completedRange; attempt += 1) {
         if (wallTimeExpired || Date.now() >= deadline) break;
+        let rangeRequest;
+        let rangeResponse;
         try {
           const opened = await openDouyinVideoResponse({
-            source: attempt === 0 ? currentSource : source,
+            source: attempt === 0 ? preferredSource : source,
             timeoutMs: Math.min(boundedTimeoutMs, Math.max(1_000, deadline - Date.now())),
             requestFn: (rangeSource, options, callback) => requestFn(rangeSource, {
               ...options,
               headers: { ...options.headers, Range: `bytes=${start}-${end}` },
             }, callback),
           });
-          request = opened.request;
-          response = opened.response;
-          if (response.statusCode !== 206) {
-            throw new Error(`Douyin media range download failed with HTTP ${response.statusCode}.`);
+          rangeRequest = opened.request;
+          rangeResponse = opened.response;
+          activeRequests.add(rangeRequest);
+          activeResponses.add(rangeResponse);
+          if (rangeResponse.statusCode !== 206) {
+            throw new Error(`Douyin media range download failed with HTTP ${rangeResponse.statusCode}.`);
           }
-          const returnedRange = parseDouyinContentRange(response.headers["content-range"]);
+          const returnedRange = parseDouyinContentRange(rangeResponse.headers["content-range"]);
           if (!returnedRange || returnedRange.start !== start || returnedRange.end !== end
               || returnedRange.total !== probeRange.total) {
             throw new Error("Douyin media returned an unexpected byte range.");
           }
           const chunks = [];
           let receivedBytes = 0;
-          for await (const value of response) {
+          const expectedBytes = end - start + 1;
+          for await (const value of rangeResponse) {
             const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
             receivedBytes += chunk.byteLength;
             if (receivedBytes > expectedBytes) {
@@ -307,11 +317,13 @@ export async function downloadDouyinVideo({
             throw new Error("Douyin media returned an incomplete byte range.");
           }
           completedRange = Buffer.concat(chunks, receivedBytes);
-          currentSource = opened.finalSource;
         } catch (error) {
           lastRangeFailure = classifyVideoDownloadFailure(error);
-          response?.destroy();
-          request?.destroy();
+          rangeResponse?.destroy();
+          rangeRequest?.destroy();
+        } finally {
+          if (rangeResponse) activeResponses.delete(rangeResponse);
+          if (rangeRequest) activeRequests.delete(rangeRequest);
         }
       }
       if (!completedRange) {
@@ -321,17 +333,30 @@ export async function downloadDouyinVideo({
           `Douyin media range ${rangeNumber}/${rangeCount} failed after bounded retries (${lastRangeFailure}).`,
         );
       }
-      byteCount += completedRange.byteLength;
-      if (byteCount > boundedMaxBytes) throw new Error("Douyin video exceeds the local size limit.");
-      await handle.write(completedRange);
+      return completedRange;
+    };
+    for (let index = 0; index < ranges.length; index += VIDEO_RANGE_CONCURRENCY) {
+      if (wallTimeExpired || Date.now() >= deadline) {
+        throw new Error("Douyin media download exceeded its wall-time limit.");
+      }
+      const batch = ranges.slice(index, index + VIDEO_RANGE_CONCURRENCY);
+      const settled = await Promise.allSettled(batch.map(downloadRange));
+      const failure = settled.find((result) => result.status === "rejected");
+      if (failure) throw failure.reason;
+      for (const result of settled) {
+        const completedRange = result.value;
+        byteCount += completedRange.byteLength;
+        if (byteCount > boundedMaxBytes) throw new Error("Douyin video exceeds the local size limit.");
+        await handle.write(completedRange);
+      }
     }
     if (byteCount !== probeRange.total) throw new Error("Douyin video download was incomplete.");
     await handle.close();
     handle = null;
     return { byteCount, contentType };
   } catch (error) {
-    response?.destroy();
-    request?.destroy();
+    for (const activeResponse of activeResponses) activeResponse.destroy();
+    for (const activeRequest of activeRequests) activeRequest.destroy();
     await handle?.close().catch(() => {});
     if (createdDestination) await rm(destination, { force: true });
     throw error;
