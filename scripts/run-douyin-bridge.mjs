@@ -545,6 +545,7 @@ try {
             || mediaClassification.mediaType === "comment_share") {
           const sharedManifest = await cdp.evaluate(
             buildReadCompatibleAwemeMediaExpression(incomingBatch.mediaMessage),
+            15_000,
           );
           if (!sharedManifest?.ok) {
             throw new Error(`The shared Douyin work is unavailable: ${sharedManifest?.reason || "unknown"}.`);
