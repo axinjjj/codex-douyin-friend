@@ -12,6 +12,7 @@ import {
   createBridgeState,
   findAppendedMessages,
   loadBridgeState,
+  rebindPendingMessages,
   recoverBridgeStateForFreshThread,
   recoverBridgeStateForStartup,
   resolveBridgeRecoveryStatePath,
@@ -281,12 +282,86 @@ test("recovers a sending checkpoint only when the expected outbound appears afte
   const recovered = recoverBridgeStateForStartup(sending, afterSend);
   assert.equal(recovered.recoveredVerifiedSend, true);
   assert.equal(recovered.state.checkpoint.phase, "ready");
-  assert.equal(recovered.state.checkpoint.outboundFingerprint, outboundFingerprint);
-  assert.deepEqual(recovered.state.checkpoint.snapshot, beforeSend);
+  assert.equal(recovered.state.checkpoint.outboundFingerprint, null);
+  assert.deepEqual(recovered.state.checkpoint.snapshot, afterSend);
+  assert.deepEqual(recovered.queuedPending, []);
 
   assert.throws(
     () => recoverBridgeStateForStartup(sending, beforeSend),
     /cannot be verified/u,
+  );
+});
+
+test("recovers only the unfinished tail after a verified queued send", () => {
+  const attachedText = message("attached-text");
+  const firstMedia = message("first-media", "left", "media");
+  const secondMedia = message("second-media", "left", "media");
+  const beforeSend = snapshot(3, [attachedText, firstMedia, secondMedia]);
+  const outboundFingerprint = computeTextMessageFingerprint("first reply");
+  const sending = createBridgeState({
+    chatKey,
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
+    snapshot: beforeSend,
+    phase: "sending",
+    pending: [attachedText, firstMedia, secondMedia],
+    outboundFingerprint,
+  });
+  const newlyArrived = message("newly-arrived");
+  const afterSend = snapshot(5, [
+    attachedText,
+    firstMedia,
+    secondMedia,
+    { fingerprint: outboundFingerprint, kind: "text", side: "right" },
+    newlyArrived,
+  ]);
+
+  const recovered = recoverBridgeStateForStartup(sending, afterSend);
+  assert.equal(recovered.state.checkpoint.phase, "queued");
+  assert.deepEqual(recovered.state.checkpoint.snapshot, afterSend);
+  assert.deepEqual(recovered.queuedPending, [
+    { ...secondMedia, ordinalFromEnd: 3 },
+    { ...newlyArrived, ordinalFromEnd: 1 },
+  ]);
+});
+
+test("rebinds a paused queue by occurrence and appends newly visible input", () => {
+  const repeated = message("same", "left", "media");
+  const reply = message("reply", "right");
+  const before = snapshot(3, [repeated, repeated, reply]);
+  const queued = createBridgeState({
+    chatKey,
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
+    snapshot: before,
+    phase: "queued",
+    pending: [repeated],
+  });
+  const newlyArrived = message("new");
+  const current = snapshot(4, [repeated, repeated, reply, newlyArrived]);
+  const recovered = recoverBridgeStateForStartup(queued, current);
+  assert.equal(recovered.state.checkpoint.phase, "queued");
+  assert.deepEqual(recovered.queuedPending, [
+    { ...repeated, ordinalFromEnd: 3 },
+    { ...newlyArrived, ordinalFromEnd: 1 },
+  ]);
+  assert.deepEqual(rebindPendingMessages(before, [repeated, repeated]), [
+    { ...repeated, ordinalFromEnd: 3 },
+    { ...repeated, ordinalFromEnd: 2 },
+  ]);
+  assert.throws(
+    () => createBridgeState({
+      chatKey,
+      threadId: "thread-1",
+      model: "gpt-5.6-sol",
+      effort: "xhigh",
+      snapshot: before,
+      phase: "queued",
+      pending: [message("wrong-side", "right")],
+    }),
+    /queued bridge checkpoint is inconsistent/u,
   );
 });
 
@@ -327,6 +402,25 @@ test("fresh-thread recovery rewinds an exact interrupted pending boundary", () =
     findAppendedMessages(recovered.state.checkpoint.snapshot, interruptedSnapshot),
     [{ ...pending, ordinalFromEnd: 1 }],
   );
+});
+
+test("fresh-thread recovery preserves an exact paused queue", () => {
+  const pendingMedia = message("pending-media", "left", "media");
+  const replied = message("already-replied", "right");
+  const current = snapshot(2, [pendingMedia, replied]);
+  const queued = createBridgeState({
+    chatKey,
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
+    snapshot: current,
+    phase: "queued",
+    pending: [pendingMedia],
+  });
+  const recovered = recoverBridgeStateForFreshThread(queued, current);
+  assert.equal(recovered.state.checkpoint.phase, "queued");
+  assert.equal(recovered.recoveredPendingCount, 1);
+  assert.deepEqual(recovered.queuedPending, [{ ...pendingMedia, ordinalFromEnd: 2 }]);
 });
 
 test("fresh-thread recovery refuses changed chats and sending checkpoints", () => {

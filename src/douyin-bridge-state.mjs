@@ -12,7 +12,7 @@ const MODEL_PATTERN = /^[A-Za-z0-9._:-]{1,100}$/u;
 const EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const SIDES = new Set(["left", "right", "center"]);
 const KINDS = new Set(["text", "media", "system", "unknown"]);
-const PHASES = new Set(["ready", "processing", "reply-ready", "sending", "blocked"]);
+const PHASES = new Set(["ready", "queued", "processing", "reply-ready", "sending", "blocked"]);
 const BLOCKED_REASON_PATTERN = /^[a-z0-9-]{1,80}$/u;
 
 function isPlainObject(value) {
@@ -135,6 +135,12 @@ export function validateBridgeState(value, expectedChatKey = null) {
 
   if (phase === "ready" && (pending.length !== 0 || blockedReason !== null)) {
     throw new Error("A ready bridge checkpoint cannot contain pending work.");
+  }
+  if (phase === "queued" && (pending.length === 0 || outboundFingerprint !== null || blockedReason !== null
+      || pending.some((message) => (
+        message.side !== "left" || (message.kind !== "text" && message.kind !== "media")
+      )))) {
+    throw new Error("A queued bridge checkpoint is inconsistent.");
   }
   if (phase === "processing" && (pending.length === 0 || outboundFingerprint !== null || blockedReason !== null)) {
     throw new Error("A processing bridge checkpoint is inconsistent.");
@@ -276,6 +282,43 @@ function sameMessage(left, right) {
     && left.side === right.side;
 }
 
+export function rebindPendingMessages(snapshot, pendingMessages) {
+  const current = normalizeBridgeSnapshot(snapshot);
+  if (!Array.isArray(pendingMessages) || pendingMessages.length === 0
+      || pendingMessages.length > MAX_VISIBLE_MESSAGES) {
+    throw new Error("A bounded pending-message queue is required.");
+  }
+  const pending = pendingMessages.map((message) => normalizeMessageMetadata({
+    fingerprint: message?.fingerprint,
+    kind: message?.kind,
+    side: message?.side,
+  }));
+  const rebound = new Array(pending.length);
+  let currentIndex = current.messages.length - 1;
+  for (let pendingIndex = pending.length - 1; pendingIndex >= 0; pendingIndex -= 1) {
+    while (currentIndex >= 0 && !sameMessage(pending[pendingIndex], current.messages[currentIndex])) {
+      currentIndex -= 1;
+    }
+    if (currentIndex < 0) {
+      throw new Error("A queued Douyin message is no longer visible at its checkpoint.");
+    }
+    rebound[pendingIndex] = {
+      ...pending[pendingIndex],
+      ordinalFromEnd: current.messages.length - currentIndex,
+    };
+    currentIndex -= 1;
+  }
+  return rebound;
+}
+
+function firstPendingBatchLength(pending) {
+  let length = 0;
+  while (length < pending.length && pending[length].kind === "text") length += 1;
+  if (length < pending.length && pending[length].kind === "media") return length + 1;
+  if (length === pending.length) return length;
+  throw new Error("The persisted Douyin queue contains an unsupported message kind.");
+}
+
 export function findAppendedMessages(previousSnapshot, currentSnapshot) {
   const previous = normalizeBridgeSnapshot(previousSnapshot);
   const current = normalizeBridgeSnapshot(currentSnapshot);
@@ -335,19 +378,67 @@ export function recoverBridgeStateForStartup(state, currentSnapshot) {
   if (normalized.checkpoint.phase === "ready") {
     return { state: normalized, recoveredVerifiedSend: false };
   }
+  if (normalized.checkpoint.phase === "queued") {
+    const current = normalizeBridgeSnapshot(currentSnapshot);
+    const appended = findAppendedMessages(normalized.checkpoint.snapshot, current);
+    if (appended.some((message) => message.side === "right")) {
+      throw new Error("Unexpected outgoing activity appeared while a media queue was paused.");
+    }
+    const unsupportedIncoming = appended.filter((message) => (
+      message.side === "left" && message.kind !== "text" && message.kind !== "media"
+    ));
+    if (unsupportedIncoming.length > 0) {
+      throw new Error("Unsupported incoming activity appeared while a media queue was paused.");
+    }
+    const queuedPending = rebindPendingMessages(current, [
+      ...normalized.checkpoint.pending,
+      ...appended.filter((message) => (
+        message.side === "left" && (message.kind === "text" || message.kind === "media")
+      )),
+    ]);
+    return {
+      state: createBridgeState({
+        chatKey: normalized.chatKey,
+        threadId: normalized.threadId,
+        model: normalized.model,
+        effort: normalized.effort,
+        snapshot: current,
+        phase: "queued",
+        pending: queuedPending,
+      }),
+      recoveredVerifiedSend: false,
+      queuedPending,
+    };
+  }
   if (normalized.checkpoint.phase !== "sending") {
     throw new Error("The persisted bridge checkpoint is incomplete; refusing automatic recovery.");
   }
 
-  const appended = findAppendedMessages(normalized.checkpoint.snapshot, currentSnapshot);
-  const sent = appended.some((message) => (
-    message.side === "right"
-    && message.kind === "text"
-    && message.fingerprint === normalized.checkpoint.outboundFingerprint
-  ));
+  const current = normalizeBridgeSnapshot(currentSnapshot);
+  const appended = findAppendedMessages(normalized.checkpoint.snapshot, current);
+  const outgoing = appended.filter((message) => message.side === "right");
+  const sent = outgoing.length === 1
+    && outgoing[0].kind === "text"
+    && outgoing[0].fingerprint === normalized.checkpoint.outboundFingerprint;
   if (!sent) {
     throw new Error("The previous Douyin send cannot be verified; refusing to resend.");
   }
+  const unsupportedIncoming = appended.filter((message) => (
+    message.side === "left" && message.kind !== "text" && message.kind !== "media"
+  ));
+  if (unsupportedIncoming.length > 0) {
+    throw new Error("Unsupported incoming activity appeared while a verified send was recovering.");
+  }
+  const completedBatchLength = firstPendingBatchLength(normalized.checkpoint.pending);
+  const queuedMessages = [
+    ...normalized.checkpoint.pending.slice(completedBatchLength),
+    ...appended.filter((message) => (
+      message.side === "left" && (message.kind === "text" || message.kind === "media")
+    )),
+  ];
+  const queuedPending = queuedMessages.length > 0
+    ? rebindPendingMessages(current, queuedMessages)
+    : [];
 
   return {
     state: createBridgeState({
@@ -355,10 +446,12 @@ export function recoverBridgeStateForStartup(state, currentSnapshot) {
       threadId: normalized.threadId,
       model: normalized.model,
       effort: normalized.effort,
-      snapshot: normalized.checkpoint.snapshot,
-      outboundFingerprint: normalized.checkpoint.outboundFingerprint,
+      snapshot: current,
+      phase: queuedPending.length > 0 ? "queued" : "ready",
+      pending: queuedPending,
     }),
     recoveredVerifiedSend: true,
+    queuedPending,
   };
 }
 
@@ -367,6 +460,7 @@ export function recoverBridgeStateForFreshThread(state, currentSnapshot) {
   const phase = normalized.checkpoint.phase;
   const explicitlyRecoverable = phase === "processing"
     || phase === "reply-ready"
+    || phase === "queued"
     || (phase === "blocked" && normalized.checkpoint.blockedReason === "context-recovery-failed");
   if (!explicitlyRecoverable || normalized.checkpoint.pending.length === 0) {
     throw new Error("The persisted bridge checkpoint cannot be moved to a fresh thread safely.");
@@ -377,6 +471,22 @@ export function recoverBridgeStateForFreshThread(state, currentSnapshot) {
       || current.messages.length !== checkpoint.messages.length
       || !current.messages.every((message, index) => sameMessage(message, checkpoint.messages[index]))) {
     throw new Error("The Douyin chat changed after interrupted work; refusing fresh-thread recovery.");
+  }
+  if (phase === "queued") {
+    const queuedPending = rebindPendingMessages(current, normalized.checkpoint.pending);
+    return {
+      state: createBridgeState({
+        chatKey: normalized.chatKey,
+        threadId: normalized.threadId,
+        model: normalized.model,
+        effort: normalized.effort,
+        snapshot: current,
+        phase: "queued",
+        pending: queuedPending,
+      }),
+      recoveredPendingCount: queuedPending.length,
+      queuedPending,
+    };
   }
   const pending = normalized.checkpoint.pending;
   if (pending.length > checkpoint.messages.length) {

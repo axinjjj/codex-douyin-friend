@@ -119,7 +119,10 @@ export async function preparePersistentBridgeSession({
   visibleMessages = [],
   pendingMessages = [],
 }) {
-  const reliableState = storedState?.checkpoint?.phase === "ready" ? storedState : null;
+  const reliableState = (storedState?.checkpoint?.phase === "ready"
+      || storedState?.checkpoint?.phase === "queued")
+    ? storedState
+    : null;
   const resumeState = allowStoredThreadResume
     && reliableState?.model === model
     && reliableState?.effort === effort
@@ -188,19 +191,39 @@ export async function injectConversationHistory({ codex, threadId, messages }) {
   return items.length;
 }
 
-export function classifyDouyinIncomingBatch(messages) {
+export function planDouyinIncomingQueue(messages) {
   if (!Array.isArray(messages) || messages.length === 0 || messages.length > 12) {
-    return { mode: "ambiguous", textMessages: [], mediaMessage: null };
+    return { ok: false, batches: [] };
   }
-  const textMessages = messages.filter((message) => message?.kind === "text");
-  const mediaMessages = messages.filter((message) => message?.kind === "media");
-  if (textMessages.length === messages.length) {
-    return { mode: "text", textMessages, mediaMessage: null };
+  if (messages.some((message) => (
+    message?.side !== "left" || (message.kind !== "text" && message.kind !== "media")
+  ))) {
+    return { ok: false, batches: [] };
   }
-  if (mediaMessages.length === 1 && textMessages.length + 1 === messages.length) {
-    return { mode: "media", textMessages, mediaMessage: mediaMessages[0] };
+  const batches = [];
+  let textMessages = [];
+  for (const message of messages) {
+    if (message.kind === "text") {
+      textMessages.push(message);
+      continue;
+    }
+    batches.push({
+      mode: "media",
+      textMessages,
+      mediaMessage: message,
+      messages: [...textMessages, message],
+    });
+    textMessages = [];
   }
-  return { mode: "ambiguous", textMessages, mediaMessage: null };
+  if (textMessages.length > 0) {
+    batches.push({
+      mode: "text",
+      textMessages,
+      mediaMessage: null,
+      messages: [...textMessages],
+    });
+  }
+  return { ok: batches.length > 0, batches };
 }
 
 export async function generateDouyinReply({

@@ -9,6 +9,71 @@ const DOUYIN_SHARED_WORK_SELECTOR =
 const DOUYIN_MEDIA_CONTENT_SELECTOR =
   `${DOUYIN_SHARED_WORK_SELECTOR}, .MessageItemImageImageBox, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]`;
 
+function normalizeExactIncomingMediaMessage(message) {
+  if (message === null || message === undefined) return null;
+  if (!Number.isSafeInteger(message?.ordinalFromEnd) || message.ordinalFromEnd < 1
+      || message.ordinalFromEnd > 12 || !/^[0-9a-f]{64}$/u.test(message?.fingerprint)
+      || message.kind !== "media" || message.side !== "left") {
+    throw new Error("Exact incoming media metadata is invalid.");
+  }
+  return {
+    ordinalFromEnd: message.ordinalFromEnd,
+    fingerprint: message.fingerprint,
+  };
+}
+
+function buildExactIncomingMediaLookupSource(expected) {
+  if (!expected) {
+    return `
+      const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
+      if (!list) return { ok: false, reason: 'message-list-not-found' };
+      const recent = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
+        .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top)
+        .slice(-12);
+      let message = null;
+      for (const candidate of [...recent].reverse()) {
+        const inspectedMessage = candidate;
+        const centered = inspectedMessage.classList.contains('messageMessageBoxisFullRowCenterMessage');
+        const fromMe = Boolean(inspectedMessage.querySelector(
+          '.messageMessageBoxisFromMe, .MessageBoxContentisFromMe, .MessageItemTextisFromMe'
+        ));
+        const side = centered ? 'center' : fromMe ? 'right' : 'left';
+        const hasMedia = Boolean(inspectedMessage.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
+        if (side !== 'left' || !hasMedia) continue;
+        message = inspectedMessage;
+        break;
+      }
+      if (!message) return { ok: false, reason: 'incoming-media-not-found' };
+    `;
+  }
+  return `
+    const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
+    if (!list) return { ok: false, reason: 'message-list-not-found' };
+    const expected = ${JSON.stringify(expected)};
+    const digest = async (value) => {
+      const bytes = new TextEncoder().encode(value);
+      const hash = await crypto.subtle.digest('SHA-256', bytes);
+      return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    };
+    const recent = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
+      .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top)
+      .slice(-12);
+    const candidate = recent[recent.length - expected.ordinalFromEnd];
+    if (!candidate) return { ok: false, reason: 'incoming-media-not-visible' };
+    const message = candidate;
+    ${MESSAGE_SIDE_CAPTURE_SOURCE}
+    const bubble = message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)});
+    const content = message.querySelector('.messageMessageBoxcontentBox');
+    const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
+    const source = (bubble?.textContent || stableContent?.textContent || '').trim();
+    const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
+    const fingerprint = hasMedia ? await digest(['media', side, source].join('|')) : null;
+    if (side !== 'left' || !hasMedia || fingerprint !== expected.fingerprint) {
+      return { ok: false, reason: 'incoming-media-identity-changed' };
+    }
+  `;
+}
+
 const STRUCTURE_HINT =
   /(chat|message|conversation|right|panel|scroll|content|item|list|editor|input|bubble|card|video|streak)/i;
 
@@ -311,119 +376,87 @@ export function buildLatestIncomingMediaStructureExpression() {
   })()`;
 }
 
-export function buildClassifyLatestIncomingMediaExpression() {
-  return `(() => {
-    const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
-    if (!list) return { ok: false, reason: 'message-list-not-found' };
-    const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
-      .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
-    for (const message of messages) {
-      ${MESSAGE_SIDE_CAPTURE_SOURCE}
-      if (side !== 'left') continue;
-      const content = message.querySelector('.MessageBoxContentactiveClickArea') ||
-        message.querySelector('.messageMessageBoxcontentBox');
-      if (!content) continue;
-      if (message.querySelector(${JSON.stringify(DOUYIN_COMMENT_SHARE_SELECTOR)})) {
-        return { ok: true, mediaType: 'comment_share' };
-      }
-      if (message.querySelector('.MessageItemShareAwemecontainer')) {
-        return { ok: true, mediaType: 'shared_aweme' };
-      }
-      const visibleImage = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
-        .find((image) => {
-          const imageRect = image.getBoundingClientRect();
-          const style = getComputedStyle(image);
-          return imageRect.width >= 32 && imageRect.height >= 32 &&
-            style.display !== 'none' && style.visibility !== 'hidden';
-        });
-      if (visibleImage) return { ok: true, mediaType: 'chat_image' };
-      if (message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)})) continue;
-      return { ok: false, reason: 'unsupported-media-type' };
-    }
-    return { ok: false, reason: 'incoming-media-not-found' };
-  })()`;
-}
-
-export function buildLocateLatestIncomingChatImageExpression() {
+export function buildClassifyLatestIncomingMediaExpression(mediaMessage = null) {
+  const expected = normalizeExactIncomingMediaMessage(mediaMessage);
   return `(async () => {
-    const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
-    if (!list) return { ok: false, reason: 'message-list-not-found' };
-    const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
-      .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
-    for (const message of messages) {
-      ${MESSAGE_SIDE_CAPTURE_SOURCE}
-      if (side !== 'left') continue;
-      const content = message.querySelector('.MessageBoxContentactiveClickArea') ||
-        message.querySelector('.messageMessageBoxcontentBox');
-      if (!content) continue;
-      if (message.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)})) {
-        return { ok: false, reason: 'latest-media-is-shared-aweme' };
-      }
-      const image = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
-        .find((candidate) => {
-          const rect = candidate.getBoundingClientRect();
-          const style = getComputedStyle(candidate);
-          return rect.width >= 32 && rect.height >= 32 &&
-            style.display !== 'none' && style.visibility !== 'hidden';
-        });
-      if (!image) {
-        if (message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)})) continue;
-        return { ok: false, reason: 'chat-image-not-found' };
-      }
-      image.scrollIntoView({ block: 'center', inline: 'center' });
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      const rect = image.getBoundingClientRect();
-      const x = Math.max(0, rect.left + window.scrollX);
-      const y = Math.max(0, rect.top + window.scrollY);
-      const width = Math.min(rect.width, window.innerWidth - Math.max(0, rect.left));
-      const height = Math.min(rect.height, window.innerHeight - Math.max(0, rect.top));
-      if (width < 16 || height < 16 || width > 2048 || height > 2048) {
-        return { ok: false, reason: 'chat-image-clip-invalid' };
-      }
-      return {
-        ok: true,
-        clip: {
-          x: Math.round(x * 100) / 100,
-          y: Math.round(y * 100) / 100,
-          width: Math.round(width * 100) / 100,
-          height: Math.round(height * 100) / 100,
-          scale: 1,
-        },
-      };
+    ${buildExactIncomingMediaLookupSource(expected)}
+    if (message.querySelector(${JSON.stringify(DOUYIN_COMMENT_SHARE_SELECTOR)})) {
+      return { ok: true, mediaType: 'comment_share' };
     }
-    return { ok: false, reason: 'incoming-media-not-found' };
+    if (message.querySelector('.MessageItemShareAwemecontainer')) {
+      return { ok: true, mediaType: 'shared_aweme' };
+    }
+    const visibleImage = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
+      .find((image) => {
+        const imageRect = image.getBoundingClientRect();
+        const style = getComputedStyle(image);
+        return imageRect.width >= 32 && imageRect.height >= 32 &&
+          style.display !== 'none' && style.visibility !== 'hidden';
+      });
+    if (visibleImage) return { ok: true, mediaType: 'chat_image' };
+    return { ok: false, reason: 'unsupported-media-type' };
   })()`;
 }
 
-export function buildReadLatestIncomingChatImageSourceExpression() {
-  return `(() => {
-    const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
-    if (!list) return { ok: false, reason: 'message-list-not-found' };
-    const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
-      .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
-    for (const message of messages) {
-      ${MESSAGE_SIDE_CAPTURE_SOURCE}
-      if (side !== 'left') continue;
-      const content = message.querySelector('.MessageBoxContentactiveClickArea') ||
-        message.querySelector('.messageMessageBoxcontentBox');
-      if (!content) continue;
-      if (message.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)})) continue;
-      const image = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
-        .find((candidate) => {
-          const imageRect = candidate.getBoundingClientRect();
-          const style = getComputedStyle(candidate);
-          return imageRect.width >= 32 && imageRect.height >= 32 &&
-            style.display !== 'none' && style.visibility !== 'hidden';
-        });
-      if (!image) continue;
-      const source = image.currentSrc || image.src || '';
-      if (!source) return { ok: false, reason: 'chat-image-source-not-found' };
-      if (/^data:image\\/webp;base64,/u.test(source)) {
-        return { ok: false, reason: 'chat-image-webp-requires-screenshot' };
-      }
-      return { ok: true, source };
+export function buildLocateLatestIncomingChatImageExpression(mediaMessage = null) {
+  const expected = normalizeExactIncomingMediaMessage(mediaMessage);
+  return `(async () => {
+    ${buildExactIncomingMediaLookupSource(expected)}
+    if (message.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)})) {
+      return { ok: false, reason: 'selected-media-is-shared-aweme' };
     }
-    return { ok: false, reason: 'incoming-chat-image-not-found' };
+    const image = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
+      .find((candidate) => {
+        const rect = candidate.getBoundingClientRect();
+        const style = getComputedStyle(candidate);
+        return rect.width >= 32 && rect.height >= 32 &&
+          style.display !== 'none' && style.visibility !== 'hidden';
+      });
+    if (!image) return { ok: false, reason: 'chat-image-not-found' };
+    image.scrollIntoView({ block: 'center', inline: 'center' });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const rect = image.getBoundingClientRect();
+    const x = Math.max(0, rect.left + window.scrollX);
+    const y = Math.max(0, rect.top + window.scrollY);
+    const width = Math.min(rect.width, window.innerWidth - Math.max(0, rect.left));
+    const height = Math.min(rect.height, window.innerHeight - Math.max(0, rect.top));
+    if (width < 16 || height < 16 || width > 2048 || height > 2048) {
+      return { ok: false, reason: 'chat-image-clip-invalid' };
+    }
+    return {
+      ok: true,
+      clip: {
+        x: Math.round(x * 100) / 100,
+        y: Math.round(y * 100) / 100,
+        width: Math.round(width * 100) / 100,
+        height: Math.round(height * 100) / 100,
+        scale: 1,
+      },
+    };
+  })()`;
+}
+
+export function buildReadLatestIncomingChatImageSourceExpression(mediaMessage = null) {
+  const expected = normalizeExactIncomingMediaMessage(mediaMessage);
+  return `(async () => {
+    ${buildExactIncomingMediaLookupSource(expected)}
+    if (message.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)})) {
+      return { ok: false, reason: 'selected-media-is-shared-aweme' };
+    }
+    const image = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
+      .find((candidate) => {
+        const imageRect = candidate.getBoundingClientRect();
+        const style = getComputedStyle(candidate);
+        return imageRect.width >= 32 && imageRect.height >= 32 &&
+          style.display !== 'none' && style.visibility !== 'hidden';
+      });
+    if (!image) return { ok: false, reason: 'chat-image-not-found' };
+    const source = image.currentSrc || image.src || '';
+    if (!source) return { ok: false, reason: 'chat-image-source-not-found' };
+    if (/^data:image\\/webp;base64,/u.test(source)) {
+      return { ok: false, reason: 'chat-image-webp-requires-screenshot' };
+    }
+    return { ok: true, source };
   })()`;
 }
 
@@ -761,29 +794,67 @@ export function buildReadCompatibleAwemeMediaExpression(message = null) {
     const itemId = parsedContent?.itemId || null;
     let detail = null;
     if (itemId) {
-      try {
-        const response = await fetch('/aweme/v1/web/aweme/detail/?aweme_id=' + encodeURIComponent(itemId), {
-          credentials: 'include',
-        });
-        if (response.ok) {
-          const payload = await response.json();
-          detail = payload?.aweme_detail || null;
+      const containsUsableMedia = (candidate) => {
+        const candidateVideo = candidate?.video;
+        const videoLists = [
+          candidateVideo?.play_addr_h264?.url_list,
+          candidateVideo?.play_addr?.url_list,
+          ...(Array.isArray(candidateVideo?.bit_rate)
+            ? candidateVideo.bit_rate.map((entry) => entry?.play_addr?.url_list)
+            : []),
+        ];
+        if (videoLists.some((urls) => Array.isArray(urls) && urls.some(Boolean))) return true;
+        return [
+          candidate?.images,
+          candidate?.image_post_info?.images,
+          candidate?.image_post_info?.image_list,
+        ].some((images) => Array.isArray(images) && images.length > 0);
+      };
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        let requestTimer = null;
+        try {
+          const controller = new AbortController();
+          requestTimer = setTimeout(() => controller.abort(), 2000);
+          const response = await fetch('/aweme/v1/web/aweme/detail/?aweme_id=' + encodeURIComponent(itemId), {
+            credentials: 'include',
+            signal: controller.signal,
+          });
+          if (response.ok) {
+            const payload = await response.json();
+            detail = payload?.aweme_detail || detail;
+            if (containsUsableMedia(detail)) break;
+          }
+        } catch {
+          // A later bounded attempt may still recover this transient page request.
+        } finally {
+          if (requestTimer !== null) clearTimeout(requestTimer);
         }
-      } catch {
-        detail = null;
+        if (attempt < 2) {
+          await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 250 : 500));
+        }
       }
     }
     const video = detail?.video;
     const h264Urls = video?.play_addr_h264?.url_list;
+    const compatibleBitRateUrls = Array.isArray(video?.bit_rate)
+      ? video.bit_rate
+        .filter((entry) => entry?.is_h265 !== 1 && entry?.is_bytevc1 !== 1
+          && !/h265|hevc|bytevc1/iu.test(String(entry?.codec_type || entry?.format || '')))
+        .flatMap((entry) => Array.isArray(entry?.play_addr?.url_list) ? entry.play_addr.url_list : [])
+      : [];
     const defaultUrls = video?.play_addr?.url_list;
     const videoSource = (Array.isArray(h264Urls) && h264Urls.find(Boolean)) ||
+      compatibleBitRateUrls.find(Boolean) ||
       (Array.isArray(defaultUrls) && defaultUrls.find(Boolean)) || '';
     if (videoSource) {
+      const selectedCodec = Array.isArray(h264Urls) && h264Urls.some(Boolean)
+        ? 'h264'
+        : compatibleBitRateUrls.some(Boolean) ? 'bit-rate-compatible' : 'default';
       return {
         ok: true,
         mediaType: 'video',
         source: videoSource,
-        selectedCodec: Array.isArray(h264Urls) && h264Urls.length ? 'h264' : 'default',
+        selectedCodec,
       };
     }
     const imageCandidates = [
@@ -894,7 +965,8 @@ export function buildLocateIncomingMediaReactionTargetExpression(message, ordina
   if (!Number.isSafeInteger(message?.ordinalFromEnd) || message.ordinalFromEnd < 1 || message.ordinalFromEnd > 12
       || !/^[0-9a-f]{64}$/u.test(message?.fingerprint)
       || message?.kind !== "media" || message?.side !== "left"
-      || !Number.isSafeInteger(ordinalShift) || ordinalShift < 0 || ordinalShift > 2) {
+      || !Number.isSafeInteger(ordinalShift) || ordinalShift < 0 || ordinalShift > 12
+      || message.ordinalFromEnd + ordinalShift > 24) {
     throw new Error("Incoming media reaction metadata is invalid.");
   }
   const expected = {

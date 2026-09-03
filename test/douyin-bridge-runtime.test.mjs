@@ -3,26 +3,44 @@ import assert from "node:assert/strict";
 import { CodexAppServerRequestError } from "../src/codex-app-server-client.mjs";
 import {
   DouyinSendAbortedError,
-  classifyDouyinIncomingBatch,
   generateDouyinImageReply,
   generateDouyinReply,
   generateDouyinVideoReply,
   injectConversationHistory,
   parseDouyinMediaReply,
+  planDouyinIncomingQueue,
   preparePersistentBridgeSession,
   sendAndVerifyDouyinReply,
   startVerifiedPersonaThread,
 } from "../src/douyin-bridge-runtime.mjs";
 
-test("combines text plus exactly one media item into one incoming media batch", () => {
-  const text = { kind: "text", fingerprint: "a".repeat(64) };
-  const media = { kind: "media", fingerprint: "b".repeat(64) };
-  const combined = classifyDouyinIncomingBatch([text, media]);
+test("plans incoming text and media into chronological reply batches", () => {
+  const text = { kind: "text", side: "left", fingerprint: "a".repeat(64) };
+  const media = { kind: "media", side: "left", fingerprint: "b".repeat(64) };
+  const combined = planDouyinIncomingQueue([text, media]).batches[0];
   assert.equal(combined.mode, "media");
   assert.deepEqual(combined.textMessages, [text]);
   assert.equal(combined.mediaMessage, media);
-  assert.equal(classifyDouyinIncomingBatch([media, { ...media }]).mode, "ambiguous");
-  assert.equal(classifyDouyinIncomingBatch([text, { ...text }]).mode, "text");
+  assert.equal(planDouyinIncomingQueue([media, { ...media }]).batches.length, 2);
+  assert.equal(planDouyinIncomingQueue([text, { ...text }]).batches[0].mode, "text");
+
+  const secondText = { kind: "text", side: "left", fingerprint: "c".repeat(64) };
+  const secondMedia = { kind: "media", side: "left", fingerprint: "d".repeat(64) };
+  const trailingText = { kind: "text", side: "left", fingerprint: "e".repeat(64) };
+  const plan = planDouyinIncomingQueue([
+    text,
+    media,
+    secondText,
+    secondMedia,
+    trailingText,
+  ]);
+  assert.equal(plan.ok, true);
+  assert.deepEqual(plan.batches.map((batch) => batch.messages), [
+    [text, media],
+    [secondText, secondMedia],
+    [trailingText],
+  ]);
+  assert.equal(planDouyinIncomingQueue([{ ...text, side: "right" }]).ok, false);
 });
 
 test("lets text replies choose a natural length", async () => {

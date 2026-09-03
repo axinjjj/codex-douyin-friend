@@ -25,10 +25,10 @@ import {
 } from "../src/douyin-chat-page.mjs";
 import {
   DouyinSendAbortedError,
-  classifyDouyinIncomingBatch,
   generateDouyinReply,
   generateDouyinImageReply,
   generateDouyinVideoReply,
+  planDouyinIncomingQueue,
   preparePersistentBridgeSession,
   sendAndVerifyDouyinReply,
 } from "../src/douyin-bridge-runtime.mjs";
@@ -39,6 +39,7 @@ import {
   findAppendedMessages,
   loadBridgeState,
   normalizeBridgeSnapshot,
+  rebindPendingMessages,
   recoverBridgeStateForFreshThread,
   recoverBridgeStateForStartup,
   saveBridgeState,
@@ -183,6 +184,7 @@ try {
   let storedState = loadedState.state;
   let recoveredVerifiedSend = false;
   let recoveredForFreshThread = false;
+  let startupQueuedPending = null;
   if (storedState) {
     const canAttemptFreshRecovery = forceFreshThread
       && storedState.checkpoint.phase !== "ready"
@@ -193,13 +195,16 @@ try {
     storedState = recovery.state;
     recoveredVerifiedSend = recovery.recoveredVerifiedSend;
     recoveredForFreshThread = canAttemptFreshRecovery;
-    if (recoveredVerifiedSend || recoveredForFreshThread) {
+    startupQueuedPending = recovery.queuedPending?.length > 0
+      ? recovery.queuedPending
+      : null;
+    if (recoveredVerifiedSend || recoveredForFreshThread || startupQueuedPending) {
       await saveBridgeState(projectRoot, storedState);
     }
   }
-  const startupPendingMessages = storedState
+  const startupPendingMessages = startupQueuedPending ?? (storedState
     ? findAppendedMessages(storedState.checkpoint.snapshot, startupSnapshot)
-    : [];
+    : []);
 
   const session = await preparePersistentBridgeSession({
     codex,
@@ -228,14 +233,25 @@ try {
     },
   });
   let previous = normalizeBridgeSnapshot(session.baselineSnapshot);
-  let activeState = createBridgeState({
-    chatKey: lockedChat.fingerprint,
-    threadId: runtime.threadId,
-    model: runtime.model,
-    effort: runtime.effort,
-    snapshot: previous,
-    outboundFingerprint: storedState?.checkpoint.outboundFingerprint ?? null,
-  });
+  let queuedIncoming = startupQueuedPending;
+  let activeState = queuedIncoming
+    ? createBridgeState({
+      chatKey: lockedChat.fingerprint,
+      threadId: runtime.threadId,
+      model: runtime.model,
+      effort: runtime.effort,
+      snapshot: previous,
+      phase: "queued",
+      pending: queuedIncoming,
+    })
+    : createBridgeState({
+      chatKey: lockedChat.fingerprint,
+      threadId: runtime.threadId,
+      model: runtime.model,
+      effort: runtime.effort,
+      snapshot: previous,
+      outboundFingerprint: storedState?.checkpoint.outboundFingerprint ?? null,
+    });
   await saveBridgeState(projectRoot, activeState);
   console.log(JSON.stringify({
     ok: true,
@@ -279,8 +295,11 @@ try {
       setBridgePhase("listening");
       continue;
     }
-    await sleep(750);
-    if (stopRequested) break;
+    const continuingQueue = Array.isArray(queuedIncoming) && queuedIncoming.length > 0;
+    if (!continuingQueue) {
+      await sleep(750);
+      if (stopRequested) break;
+    }
     await repairCollapsedDouyinViewport({ cdp, targetId: target.id });
     let currentMetadata = await cdp.evaluate(buildChatMessageMetadataExpression());
     if (currentMetadata.chatFingerprint !== lockedChat.fingerprint) {
@@ -295,8 +314,8 @@ try {
       messages: currentMetadata.messages,
     });
     let appended = findAppendedMessages(previous, current);
-    if (appended.length === 0) continue;
-    if (appended.some((message) => message.side === "left")) {
+    if (appended.length === 0 && !continuingQueue) continue;
+    if (!continuingQueue && appended.some((message) => message.side === "left")) {
       let chatChangedDuringSettle = false;
       for (let settleRound = 0; settleRound < 3 && !stopRequested; settleRound += 1) {
         await sleep(750);
@@ -323,13 +342,17 @@ try {
       }
       appended = findAppendedMessages(previous, current);
     }
-    const incoming = appended.filter((message) => (
+    const newlyIncoming = appended.filter((message) => (
       message.side === "left" && (message.kind === "text" || message.kind === "media")
     ));
     const unsupportedIncoming = appended.filter((message) => (
       message.side === "left" && message.kind !== "text" && message.kind !== "media"
     ));
     const outgoing = appended.filter((message) => message.side === "right");
+    const incoming = continuingQueue
+      ? rebindPendingMessages(current, [...queuedIncoming, ...newlyIncoming])
+      : newlyIncoming;
+    queuedIncoming = null;
 
     if (!sendEnabled) {
       previous = current;
@@ -396,8 +419,8 @@ try {
       continue;
     }
 
-    const incomingBatch = classifyDouyinIncomingBatch(incoming);
-    if (incomingBatch.mode === "ambiguous" || unsupportedIncoming.length > 0) {
+    const queuePlan = planDouyinIncomingQueue(incoming);
+    if (!queuePlan.ok || unsupportedIncoming.length > 0) {
       setBridgePhase("blocked");
       activeState = createBridgeState({
         chatKey: lockedChat.fingerprint,
@@ -419,6 +442,8 @@ try {
       process.exitCode = 5;
       break;
     }
+    const incomingBatch = queuePlan.batches[0];
+    const remainingAfterBatch = incoming.slice(incomingBatch.messages.length);
 
     activeState = createBridgeState({
       chatKey: lockedChat.fingerprint,
@@ -480,7 +505,9 @@ try {
           }
           inboundTextParts.push(...inbound.texts);
         }
-        const mediaClassification = await cdp.evaluate(buildClassifyLatestIncomingMediaExpression());
+        const mediaClassification = await cdp.evaluate(
+          buildClassifyLatestIncomingMediaExpression(incomingBatch.mediaMessage),
+        );
         if (!mediaClassification?.ok) {
           throw new Error(`The latest Douyin media type is unsupported: ${mediaClassification?.reason || "unknown"}.`);
         }
@@ -508,7 +535,11 @@ try {
         if (mediaClassification.mediaType === "chat_image") {
           media = {
             kind: "chat_image",
-            ...await captureLatestDouyinChatImage({ cdp, projectRoot }),
+            ...await captureLatestDouyinChatImage({
+              cdp,
+              projectRoot,
+              mediaMessage: incomingBatch.mediaMessage,
+            }),
           };
         } else if (mediaClassification.mediaType === "shared_aweme"
             || mediaClassification.mediaType === "comment_share") {
@@ -689,13 +720,59 @@ try {
         process.exitCode = 3;
         break;
       }
+      if (afterSend.chatFingerprint !== lockedChat.fingerprint) {
+        throw new Error("The Douyin chat changed while verifying a sent reply.");
+      }
+      const afterSendSnapshot = normalizeBridgeSnapshot({
+        messageCount: afterSend.messageCount,
+        messages: afterSend.messages,
+      });
+      const appendedDuringSend = findAppendedMessages(current, afterSendSnapshot);
+      const outgoingDuringSend = appendedDuringSend.filter((message) => message.side === "right");
+      const unexpectedOutgoing = outgoingDuringSend.filter((message) => (
+        message.kind !== "text" || message.fingerprint !== outboundFingerprint
+      ));
+      const incomingDuringSend = appendedDuringSend.filter((message) => (
+        message.side === "left" && (message.kind === "text" || message.kind === "media")
+      ));
+      const unsupportedDuringSend = appendedDuringSend.filter((message) => (
+        message.side === "left" && message.kind !== "text" && message.kind !== "media"
+      ));
+      const remainingMessages = [...remainingAfterBatch, ...incomingDuringSend];
+      const reboundRemaining = remainingMessages.length > 0
+        ? rebindPendingMessages(afterSendSnapshot, remainingMessages)
+        : [];
+      if (outgoingDuringSend.length !== 1 || unexpectedOutgoing.length > 0
+          || unsupportedDuringSend.length > 0) {
+        setBridgePhase("blocked");
+        activeState = createBridgeState({
+          chatKey: lockedChat.fingerprint,
+          threadId: runtime.threadId,
+          model: runtime.model,
+          effort: runtime.effort,
+          snapshot: afterSendSnapshot,
+          phase: "blocked",
+          pending: reboundRemaining,
+          blockedReason: unsupportedDuringSend.length > 0
+            ? "unsupported-incoming-batch"
+            : "concurrent-outgoing-ambiguous",
+        });
+        await saveBridgeState(projectRoot, activeState);
+        console.log(JSON.stringify({
+          ok: false,
+          event: "activity-during-send-ambiguous-bridge-stopped",
+        }));
+        process.exitCode = 6;
+        break;
+      }
       activeState = createBridgeState({
         chatKey: lockedChat.fingerprint,
         threadId: runtime.threadId,
         model: runtime.model,
         effort: runtime.effort,
-        snapshot: current,
-        outboundFingerprint,
+        snapshot: afterSendSnapshot,
+        phase: reboundRemaining.length > 0 ? "queued" : "ready",
+        pending: reboundRemaining,
       });
       await saveBridgeState(projectRoot, activeState);
       if (mediaReactionEnabled && mediaShouldLike && incomingBatch.mediaMessage) {
@@ -704,7 +781,7 @@ try {
             cdp,
             message: incomingBatch.mediaMessage,
             expectedChatFingerprint: lockedChat.fingerprint,
-            ordinalShift: 1,
+            ordinalShift: appendedDuringSend.length,
           });
           console.log(JSON.stringify({
             ok: true,
@@ -719,8 +796,9 @@ try {
           }));
         }
       }
-      previous = current;
-      setBridgePhase("listening");
+      queuedIncoming = reboundRemaining.length > 0 ? reboundRemaining : null;
+      previous = afterSendSnapshot;
+      setBridgePhase(queuedIncoming ? "queued" : "listening");
     } catch (error) {
       if (!(error instanceof CodexContextRecoveryError)) throw error;
       contextRecoveryFailed = true;

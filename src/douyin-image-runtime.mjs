@@ -105,6 +105,7 @@ function decodeEmbeddedImage(source, maxBytes) {
 export async function captureLatestDouyinChatImage({
   cdp,
   projectRoot,
+  mediaMessage = null,
   maxBytes = DEFAULT_MAX_IMAGE_BYTES,
   fetchFn = fetch,
 }) {
@@ -115,7 +116,9 @@ export async function captureLatestDouyinChatImage({
     DEFAULT_MAX_IMAGE_BYTES,
     Number.isFinite(maxBytes) ? Math.trunc(maxBytes) : DEFAULT_MAX_IMAGE_BYTES,
   ));
-  const sourceResult = await cdp.evaluate(buildReadLatestIncomingChatImageSourceExpression());
+  const sourceResult = await cdp.evaluate(
+    buildReadLatestIncomingChatImageSourceExpression(mediaMessage),
+  );
   let embeddedImage = null;
   let sourceDownloadError = null;
   if (sourceResult?.ok) {
@@ -172,7 +175,7 @@ export async function captureLatestDouyinChatImage({
       await removeImageAnalysisJob(projectRoot, jobDirectory).catch(() => {});
     }
   }
-  const location = await cdp.evaluate(buildLocateLatestIncomingChatImageExpression());
+  const location = await cdp.evaluate(buildLocateLatestIncomingChatImageExpression(mediaMessage));
   if (!location?.ok) {
     throw new Error(`The latest Douyin chat image is unavailable: ${location?.reason || "unknown"}.`);
   }

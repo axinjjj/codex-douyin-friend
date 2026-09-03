@@ -177,6 +177,25 @@ test("direct-image operations classify and capture only visible incoming content
     assert.doesNotMatch(expression, /textContent|innerText|outerHTML|innerHTML/u);
     assert.doesNotMatch(expression, /\.src\b|getAttribute\(['"]src/u);
   }
+
+  const exactMessage = {
+    ordinalFromEnd: 4,
+    fingerprint: "a".repeat(64),
+    kind: "media",
+    side: "left",
+  };
+  for (const expression of [
+    buildClassifyLatestIncomingMediaExpression(exactMessage),
+    buildLocateLatestIncomingChatImageExpression(exactMessage),
+    buildReadLatestIncomingChatImageSourceExpression(exactMessage),
+  ]) {
+    assert.match(expression, /ordinalFromEnd":4/u);
+    assert.match(expression, /incoming-media-identity-changed/u);
+  }
+  assert.throws(
+    () => buildClassifyLatestIncomingMediaExpression({ ...exactMessage, side: "right" }),
+    /metadata is invalid/u,
+  );
 });
 
 test("scopes media reactions to one exact incoming message and one bounded menu action", () => {
@@ -232,6 +251,11 @@ test("shared-work inspection distinguishes videos from ordered image posts", () 
   assert.match(expression, /MessageItemCommentSharecontainer/u);
   assert.match(expression, /selectedIndexes/u);
   assert.match(expression, /maxImages = 12/u);
+  assert.match(expression, /attempt < 3/u);
+  assert.match(expression, /attempt === 0 \? 250 : 500/u);
+  assert.match(expression, /new AbortController\(\)/u);
+  assert.match(expression, /controller\.abort\(\), 2000/u);
+  assert.match(expression, /video\?\.bit_rate/u);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
   assert.doesNotMatch(expression, /return \{[^}]*itemId/u);
 
