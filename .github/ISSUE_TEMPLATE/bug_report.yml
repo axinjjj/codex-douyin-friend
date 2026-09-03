@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a reproducible bridge, media, startup, or control-panel problem.
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve the project. Remove all phone numbers, account names, cookies, tokens, chat text, media URLs, private persona text, and local user paths before posting.
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Windows, Node.js, Codex, Edge, and Douyin web versions when known.
+      placeholder: Windows 11; Node 24; Codex desktop; Edge 140
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Startup or supervisor
+        - Text messages
+        - Video or audio understanding
+        - Chat image or image post
+        - Context or model control
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Give the smallest safe sequence that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Paste only sanitized status or diagnostics. Do not attach private screenshots or raw chat logs.
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed account, conversation, credential, media, persona, and local-path information.
+          required: true

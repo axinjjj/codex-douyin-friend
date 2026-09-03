@@ -1,0 +1,58 @@
+# Project instructions
+
+## Purpose
+
+Build a private, local-only bridge between one Douyin friend account and Codex App Server.
+
+## Run and verify
+
+- Use Node.js 22 or newer; the current verified runtime is Node.js 24.
+- Run `npm test` after changing JavaScript.
+- Run `npm run smoke:codex` after changing the App Server integration.
+- Run `npm run probe:douyin` before any CDP inspection.
+
+## Stack and structure
+
+- `src/` contains dependency-free Node.js clients.
+- `scripts/` contains bounded smoke tests, launchers, and diagnostics.
+- `fixtures/` contains non-sensitive test data only.
+- `private/` is reserved for sensitive local-only material and is excluded from Git.
+- The live bridge loads the existing private persona from `%USERPROFILE%\.codex\AGENTS.md` and never copies it into this repository.
+
+## Safety and privacy
+
+- Never commit or print phone numbers, verification codes, cookies, tokens, chat text, or private persona content.
+- Bind debugging and bridge endpoints to localhost only.
+- Keep outbound Douyin message sending disabled until read-only detection is verified for the intended chat.
+- Do not terminate or restart Douyin automatically; require the user to exit it before debug launch.
+
+## Current state
+
+- Codex App Server startup and `AGENTS.md` loading are verified.
+- Douyin 8.3.0 Electron rejects the safe bootstrap path; Windows UI Automation is also insufficient.
+- The active route is a dedicated Edge profile on localhost CDP port 9229.
+- The dedicated Edge profile is authenticated, and the current chat input/list/message structure is mapped.
+- One controlled text message completed an inbound/outbound live round trip through Codex App Server.
+- One native shared-video card completed an inbound/outbound live round trip using local H.264 keyframes as Codex `localImage` inputs.
+- The live bridge derives a full SHA-256 chat key from the selected opponent's opaque account id, locks that chat, orders reverse-DOM messages by visual position, and refuses startup when stable identity is unavailable.
+- Each chat key maps to one persistent Codex App Server thread. Restart uses `thread/resume` without reinjecting history; a confirmed missing or incompatible thread starts fresh and seeds visible history once while retaining a reliable message checkpoint.
+- Bridge state is allowlisted metadata under ignored `.runtime/douyin-bridge-state/v1/`, written as atomic primary and recovery snapshots. Neither copy contains chat text, names, account ids, tokens, persona text, or media URLs.
+- A Windows named-pipe run lock prevents two bridge processes from owning the same chat and is released automatically when a process terminates.
+- Shared videos now use duration-tiered adaptive sampling: 5 frames for short clips, rising through 8/12/16 to an 18-frame hard cap for long videos.
+- The localhost Edge media page scans at most 72 sequential 16x10 RGB signatures in memory, then preserves temporal coverage and scene changes, removes similar interior frames, and writes only final 768px-bounded PNGs.
+- SenseVoice uses its verified FSMN-VAD SRT protocol for real speech/tag time anchors when supported; unsupported or invalid timing degrades to visual selection without inferred timestamps.
+- New text and native shared-video messages are handled in that same thread; video files, extracted WAV audio, and final frames are deleted after the Codex turn.
+- Stale UUID media-job directories older than two hours are removed on the next bridge or video-tool start; unrelated `.runtime/video-analysis` directories are left alone.
+- Shared-video audio is decoded locally by Edge, then transcribed offline by the pinned SenseVoiceSmall Q8 llama.cpp runtime with language, emotion, and event tags.
+- Media work remains bounded by 100 MB per video, 15 minutes per audio track, 40 MiB per WAV upload, 45 seconds each for scene scanning and final capture, 4 MiB per PNG, and 64 MiB for all final PNGs.
+- SenseVoice binaries and models live only under the ignored `.runtime/tools/sensevoice/` directory and are verified by `npm run setup:sensevoice`.
+- The live model defaults are pinned to `gpt-5.6-sol` with `xhigh` reasoning; startup validates both against `model/list`.
+- Persona instructions are loaded dynamically from `%USERPROFILE%\.codex\AGENTS.md` on every thread start or resume and are never copied into this repository.
+- The bridge persists processing/reply/send phases and verifies the exact expected outbound fingerprint. It stops on chat changes, unknown outgoing activity, ambiguous in-flight recovery, checkpoint gaps, or unverified sends.
+- Read-only mode observes without starting Codex turns or advancing the persisted message checkpoint.
+- The live bridge uses App Server `thread/tokenUsage/updated` values and official `thread/compact/start` for automatic context compaction. It waits for the `contextCompaction` item and its turn to complete, only runs while turn/media/send activity is idle, and applies high/low hysteresis, cooldown, and single-flight protection.
+- A terminal `contextWindowExceeded` gets one conservative compact-and-retry attempt; compaction failures emit content-free structured diagnostics and leave the bridge available for later messages.
+- A localhost-only supervisor and dashboard manage the dedicated Edge window, bridge lifecycle, model/effort selection, context usage, manual compaction, and explicit fresh-thread rotation. New installations default to read-only mode; automatic sending must be enabled after the intended chat is verified. Automatic restart is limited to non-dangerous idle failures; unsafe phases remain blocked.
+- Windows logon autostart uses the fixed scheduled-task name `CodexDouyinFriendSupervisor`, an interactive limited user principal, an exact launcher, bounded Task Scheduler restart, and the supervisor named-pipe singleton.
+- Direct chat images and shared image posts enter the same Codex thread as ordered `localImage` inputs. Their ignored UUID jobs are deleted after each turn and stale jobs older than two hours are cleaned on startup. These paths have local contract coverage but still need one live sample each against the current Douyin web DOM/API.
+- Append recovery is bounded to the latest 12 visible DOM messages. A fixed-size DOM window may slide only when at least two consecutive hashed messages establish the old-suffix/new-prefix boundary; missing boundaries still fail closed. Automatic recovery still refuses ambiguous in-flight checkpoints; explicit fresh-thread rotation can rewind only an exact processing/reply-ready pending boundary or a failed context recovery.

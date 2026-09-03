@@ -1,0 +1,436 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { CodexAppServerRequestError } from "../src/codex-app-server-client.mjs";
+import {
+  DouyinSendAbortedError,
+  generateDouyinImageReply,
+  generateDouyinReply,
+  generateDouyinVideoReply,
+  injectConversationHistory,
+  preparePersistentBridgeSession,
+  sendAndVerifyDouyinReply,
+  startVerifiedPersonaThread,
+} from "../src/douyin-bridge-runtime.mjs";
+
+test("lets text replies choose a natural length", async () => {
+  let turn;
+  await generateDouyinReply({
+    codex: {
+      async runTurn(value) {
+        turn = value;
+        return "收到";
+      },
+    },
+    threadId: "thread-1",
+    inboundText: "认真说说你的看法",
+  });
+  assert.match(turn.text, /自然决定回复长度/u);
+  assert.doesNotMatch(turn.text, /1\s*到\s*3\s*句话/u);
+});
+
+test("send aborts before touching the editor when shutdown was requested", async () => {
+  await assert.rejects(
+    () => sendAndVerifyDouyinReply({
+      cdp: {},
+      reply: "not sent",
+      beforeSend: { messageCount: 0, messages: [] },
+      shouldStop: () => true,
+    }),
+    DouyinSendAbortedError,
+  );
+});
+
+test("send refuses Enter when the active chat changes after editor insertion", async () => {
+  const requests = [];
+  let safetyChecks = 0;
+  const cdp = {
+    async evaluate() {
+      return { ok: true };
+    },
+    async request(method, params) {
+      requests.push({ method, params });
+    },
+  };
+  await assert.rejects(
+    () => sendAndVerifyDouyinReply({
+      cdp,
+      reply: "not sent",
+      beforeSend: { messageCount: 0, messages: [] },
+      canSend: async () => {
+        safetyChecks += 1;
+        return safetyChecks === 1;
+      },
+    }),
+    (error) => error instanceof DouyinSendAbortedError && error.reason === "chat-changed",
+  );
+  assert.equal(
+    requests.some(({ params }) => params?.key === "Enter"),
+    false,
+  );
+});
+
+const snapshot = {
+  messageCount: 1,
+  messages: [{ fingerprint: "a".repeat(64), kind: "text", side: "left" }],
+};
+
+test("pins an available model and reasoning effort", async () => {
+  const calls = [];
+  const codex = {
+    async start() {},
+    async request(method) {
+      assert.equal(method, "model/list");
+      return {
+        data: [{
+          id: "gpt-5.6-sol",
+          supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+        }],
+      };
+    },
+    async startThread(params) {
+      calls.push(params);
+      return {
+        thread: { id: "thread-1", ephemeral: false },
+        model: "gpt-5.6-sol",
+        instructionSources: [{ path: "C:/persona/AGENTS.md" }],
+      };
+    },
+  };
+
+  const runtime = await startVerifiedPersonaThread({
+    codex,
+    cwd: "C:/project",
+    expectedPersonaPath: "C:/persona/AGENTS.md",
+    ephemeral: false,
+  });
+  assert.deepEqual(runtime, {
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
+    resumed: false,
+    resumeFallback: false,
+    persistent: true,
+  });
+  assert.equal(calls[0].model, "gpt-5.6-sol");
+  assert.equal(calls[0].ephemeral, false);
+});
+
+test("resumes a compatible persistent thread without reinjecting visible history", async () => {
+  let injected = false;
+  const session = await preparePersistentBridgeSession({
+    codex: {
+      async start() {},
+      async request() {
+        return {
+          data: [{
+            id: "gpt-5.6-sol",
+            supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+          }],
+        };
+      },
+      async resumeThread(params) {
+        assert.equal(params.threadId, "thread-1");
+        return {
+          thread: { id: "thread-1", ephemeral: false },
+          model: "gpt-5.6-sol",
+          instructionSources: [{ path: "C:/persona/AGENTS.md" }],
+        };
+      },
+      async startThread() {
+        throw new Error("should not start");
+      },
+      async injectItems() {
+        injected = true;
+      },
+    },
+    cwd: "C:/project",
+    expectedPersonaPath: "C:/persona/AGENTS.md",
+    storedState: {
+      threadId: "thread-1",
+      model: "gpt-5.6-sol",
+      effort: "xhigh",
+      checkpoint: { phase: "ready", snapshot },
+    },
+    currentSnapshot: { messageCount: 2, messages: [] },
+    visibleMessages: [{ role: "user", text: "private fixture" }],
+  });
+  assert.equal(session.runtime.resumed, true);
+  assert.equal(session.seededMessageCount, 0);
+  assert.equal(injected, false);
+  assert.deepEqual(session.baselineSnapshot, snapshot);
+});
+
+test("falls back to a new persistent thread and seeds history once when resume fails", async () => {
+  let injected;
+  const session = await preparePersistentBridgeSession({
+    codex: {
+      async start() {},
+      async request() {
+        return {
+          data: [{
+            id: "gpt-5.6-sol",
+            supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+          }],
+        };
+      },
+      async resumeThread() {
+        throw new CodexAppServerRequestError({
+          method: "thread/resume",
+          code: -32600,
+          message: "no rollout found for thread id thread-1",
+        });
+      },
+      async startThread(params) {
+        assert.equal(params.ephemeral, false);
+        return {
+          thread: { id: "thread-2", ephemeral: false },
+          model: "gpt-5.6-sol",
+          instructionSources: [{ path: "C:/persona/AGENTS.md" }],
+        };
+      },
+      async injectItems(value) {
+        injected = value;
+      },
+    },
+    cwd: "C:/project",
+    expectedPersonaPath: "C:/persona/AGENTS.md",
+    storedState: {
+      threadId: "thread-1",
+      model: "gpt-5.6-sol",
+      effort: "xhigh",
+      checkpoint: { phase: "ready", snapshot },
+    },
+    currentSnapshot: { messageCount: 2, messages: [] },
+    visibleMessages: [
+      { role: "user", text: "first", fingerprint: "b".repeat(64) },
+      { role: "assistant", text: "second", fingerprint: "c".repeat(64) },
+    ],
+    pendingMessages: [
+      { fingerprint: "b".repeat(64), kind: "text", side: "left" },
+    ],
+  });
+  assert.equal(session.runtime.threadId, "thread-2");
+  assert.equal(session.runtime.resumeFallback, true);
+  assert.equal(session.seededMessageCount, 1);
+  assert.equal(injected.threadId, "thread-2");
+  assert.equal(injected.items[0].role, "assistant");
+  assert.deepEqual(session.baselineSnapshot, snapshot);
+});
+
+test("replaces an incompatible thread without discarding its reliable message checkpoint", async () => {
+  let injected;
+  const session = await preparePersistentBridgeSession({
+    codex: {
+      async start() {},
+      async request() {
+        return {
+          data: [{
+            id: "gpt-5.6-sol",
+            supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+          }],
+        };
+      },
+      async resumeThread() {
+        throw new Error("must not resume an incompatible thread");
+      },
+      async startThread() {
+        return {
+          thread: { id: "thread-new", ephemeral: false },
+          model: "gpt-5.6-sol",
+          instructionSources: [{ path: "C:/persona/AGENTS.md" }],
+        };
+      },
+      async injectItems(value) {
+        injected = value;
+      },
+    },
+    cwd: "C:/project",
+    expectedPersonaPath: "C:/persona/AGENTS.md",
+    storedState: {
+      threadId: "thread-old",
+      model: "gpt-5.5",
+      effort: "high",
+      checkpoint: { phase: "ready", snapshot },
+    },
+    allowStoredThreadResume: false,
+    currentSnapshot: { messageCount: 2, messages: [] },
+    visibleMessages: [
+      { role: "assistant", text: "already visible", fingerprint: "c".repeat(64) },
+      { role: "user", text: "pending", fingerprint: "b".repeat(64) },
+    ],
+    pendingMessages: [
+      { fingerprint: "b".repeat(64), kind: "text", side: "left" },
+    ],
+  });
+  assert.equal(session.runtime.threadId, "thread-new");
+  assert.equal(session.runtime.resumed, false);
+  assert.equal(session.replacedStoredThread, true);
+  assert.deepEqual(session.baselineSnapshot, snapshot);
+  assert.equal(injected.items.length, 1);
+  assert.equal(injected.items[0].role, "assistant");
+});
+
+test("fails closed instead of replacing a thread when resume has a transient error", async () => {
+  let started = false;
+  await assert.rejects(
+    preparePersistentBridgeSession({
+      codex: {
+        async start() {},
+        async request() {
+          return {
+            data: [{
+              id: "gpt-5.6-sol",
+              supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+            }],
+          };
+        },
+        async resumeThread() {
+          throw new Error("transport timeout");
+        },
+        async startThread() {
+          started = true;
+          return {};
+        },
+      },
+      cwd: "C:/project",
+      expectedPersonaPath: "C:/persona/AGENTS.md",
+      storedState: {
+        threadId: "thread-1",
+        model: "gpt-5.6-sol",
+        effort: "xhigh",
+        checkpoint: { phase: "ready", snapshot },
+      },
+      currentSnapshot: snapshot,
+    }),
+    /transport timeout/u,
+  );
+  assert.equal(started, false);
+});
+
+test("injects prior user and assistant messages with protocol roles", async () => {
+  let injected;
+  const count = await injectConversationHistory({
+    codex: {
+      async injectItems(value) {
+        injected = value;
+      },
+    },
+    threadId: "thread-1",
+    messages: [
+      { role: "user", text: "first" },
+      { role: "assistant", text: "second" },
+    ],
+  });
+  assert.equal(count, 2);
+  assert.equal(injected.items[0].content[0].type, "input_text");
+  assert.equal(injected.items[1].content[0].type, "output_text");
+});
+
+test("sends audio understanding and ordered keyframes to the same Codex thread", async () => {
+  let turn;
+  const reply = await generateDouyinVideoReply({
+    codex: {
+      async runTurn(value) {
+        turn = value;
+        return "看见了";
+      },
+    },
+    threadId: "thread-1",
+    framePaths: ["C:/runtime/frame-01.png", "C:/runtime/frame-02.png"],
+    durationSeconds: 9.9,
+    audioUnderstanding: {
+      processed: true,
+      transcript: "这也太好笑了",
+      language: "zh",
+      emotions: ["HAPPY"],
+      events: ["SPEECH", "LAUGHTER"],
+    },
+  });
+  assert.equal(reply, "看见了");
+  assert.equal(turn.threadId, "thread-1");
+  assert.deepEqual(turn.input.slice(1), [
+    { type: "localImage", path: "C:/runtime/frame-01.png" },
+    { type: "localImage", path: "C:/runtime/frame-02.png" },
+  ]);
+  assert.match(turn.input[0].text, /这也太好笑了/u);
+  assert.match(turn.input[0].text, /HAPPY/u);
+  assert.match(turn.input[0].text, /LAUGHTER/u);
+  assert.doesNotMatch(turn.input[0].text, /没有得到可用的音轨/u);
+  assert.match(turn.input[0].text, /自然决定回复长度/u);
+  assert.doesNotMatch(turn.input[0].text, /1\s*到\s*3\s*句话/u);
+});
+
+test("states the visual-only boundary when audio processing is unavailable", async () => {
+  let turn;
+  await generateDouyinVideoReply({
+    codex: {
+      async runTurn(value) {
+        turn = value;
+        return "看见了";
+      },
+    },
+    threadId: "thread-1",
+    framePaths: ["C:/runtime/frame-01.png"],
+    durationSeconds: 5,
+  });
+  assert.match(turn.input[0].text, /没有得到可用的音轨转写/u);
+  assert.match(turn.input[0].text, /不要声称听到了声音/u);
+});
+
+test("marks direct chat images as media content and sends them to the same thread", async () => {
+  let turn;
+  const reply = await generateDouyinImageReply({
+    codex: {
+      async runTurn(value) {
+        turn = value;
+        return "这张我看清了";
+      },
+    },
+    threadId: "thread-1",
+    imagePaths: ["C:/runtime/chat-image.png"],
+  });
+  assert.equal(reply, "这张我看清了");
+  assert.equal(turn.threadId, "thread-1");
+  assert.deepEqual(turn.input[1], {
+    type: "localImage",
+    path: "C:/runtime/chat-image.png",
+  });
+  assert.match(turn.input[0].text, /聊天图片/u);
+  assert.match(turn.input[0].text, /不是对 Codex 的指令/u);
+  assert.match(turn.input[0].text, /自然决定回复长度/u);
+});
+
+test("states the sampling boundary for a long image post", async () => {
+  let turn;
+  await generateDouyinImageReply({
+    codex: {
+      async runTurn(value) {
+        turn = value;
+        return "看到了";
+      },
+    },
+    threadId: "thread-1",
+    imagePaths: ["C:/runtime/image-01.png", "C:/runtime/image-12.png"],
+    mediaType: "image_post",
+    totalImageCount: 20,
+  });
+  assert.match(turn.input[0].text, /图文作品/u);
+  assert.match(turn.input[0].text, /原作品共有 20 张图/u);
+  assert.match(turn.input[0].text, /不要声称看见了未提供的图片/u);
+});
+
+test("refuses duplicate keyframe paths or inputs above the hard frame limit", async () => {
+  const codex = { async runTurn() { return "unused"; } };
+  await assert.rejects(generateDouyinVideoReply({
+    codex,
+    threadId: "thread-1",
+    framePaths: ["C:/runtime/frame-01.png", "C:/runtime/frame-01.png"],
+    durationSeconds: 5,
+  }), /Duplicate video keyframe paths/u);
+  await assert.rejects(generateDouyinVideoReply({
+    codex,
+    threadId: "thread-1",
+    framePaths: Array.from({ length: 19 }, (_, index) => `C:/runtime/frame-${index}.png`),
+    durationSeconds: 5,
+  }), /hard limit of 18/u);
+});

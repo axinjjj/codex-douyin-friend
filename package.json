@@ -1,0 +1,42 @@
+{
+  "name": "codex-douyin-friend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A local bridge between a Douyin friend account and Codex App Server.",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/axinjjj/codex-douyin-friend.git"
+  },
+  "bugs": {
+    "url": "https://github.com/axinjjj/codex-douyin-friend/issues"
+  },
+  "homepage": "https://github.com/axinjjj/codex-douyin-friend#readme",
+  "scripts": {
+    "test": "node --test",
+    "smoke:codex": "node scripts/smoke-codex.mjs",
+    "setup:sensevoice": "pwsh -NoProfile -File scripts/setup-sensevoice.ps1",
+    "probe:sensevoice": "node scripts/probe-sensevoice.mjs",
+    "launch:douyin": "pwsh -NoProfile -File scripts/launch-douyin-web-debug.ps1",
+    "probe:douyin": "node scripts/probe-douyin.mjs",
+    "inspect:douyin": "node scripts/inspect-douyin.mjs",
+    "discover:douyin-chat": "node scripts/discover-douyin-chat.mjs",
+    "snapshot:douyin-chat": "node scripts/snapshot-douyin-chat.mjs",
+    "watch:douyin-chat": "node scripts/watch-douyin-chat.mjs",
+    "watch:douyin-media": "node scripts/watch-douyin-media-card.mjs",
+    "probe:douyin-video-media": "node scripts/probe-douyin-video-media.mjs",
+    "probe:adaptive-video": "node scripts/probe-adaptive-video-sampling.mjs",
+    "reply-latest:douyin-video": "node scripts/reply-latest-douyin-video.mjs",
+    "inspect:douyin-editor": "node scripts/inspect-douyin-editor.mjs",
+    "test:douyin-editor": "node scripts/probe-douyin-editor-input.mjs",
+    "reply-latest:douyin-chat": "node scripts/reply-latest-douyin-message.mjs",
+    "bridge:douyin-chat": "node scripts/run-douyin-bridge.mjs",
+    "supervisor:douyin": "node scripts/run-douyin-supervisor.mjs",
+    "autostart:install": "pwsh -NoProfile -File scripts/install-douyin-autostart.ps1",
+    "autostart:remove": "pwsh -NoProfile -File scripts/remove-douyin-autostart.ps1"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
