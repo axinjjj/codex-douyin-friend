@@ -92,16 +92,17 @@ export function resolveDouyinSharedWorkManifest({ detail = null, parsedContent =
       }
       if (["images", "image_list", "imageList", "photos", "photo_list", "photoList"].includes(key)
           && Array.isArray(child)) {
-        const group = child.map((entry) => firstUrl(entry)).filter(Boolean);
+        const group = child
+          .map((entry) => [...new Set(collectUrls(entry).filter(Boolean))])
+          .filter((candidates) => candidates.length > 0);
         if (group.length > 0) imageGroups.push(group);
       }
       if (["image", "photo"].includes(key) && child && typeof child === "object") {
-        const source = firstUrl(child);
-        if (source) imageGroups.push([source]);
+        const candidates = [...new Set(collectUrls(child).filter(Boolean))];
+        if (candidates.length > 0) imageGroups.push([candidates]);
       }
       if (["cover_url_v2", "coverUrlV2", "cover_url", "coverUrl", "content_thumb", "contentThumb"].includes(key)) {
-        const source = firstUrl(child);
-        if (source) covers.push(source);
+        covers.push(...collectUrls(child));
       }
       if (["image_count", "imageCount", "pic_count", "picCount", "photo_count", "photoCount"].includes(key)) {
         const count = Number.parseInt(String(parsed[key]), 10);
@@ -155,7 +156,6 @@ export function resolveDouyinSharedWorkManifest({ detail = null, parsedContent =
   }
 
   const bestImageGroup = imageGroups
-    .map((group) => unique(group))
     .sort((left, right) => right.length - left.length)[0] || [];
   const declaredImageCount = imageCountHints.length > 0 ? Math.max(...imageCountHints) : null;
   if (bestImageGroup.length > 0) {
@@ -168,7 +168,8 @@ export function resolveDouyinSharedWorkManifest({ detail = null, parsedContent =
     return {
       ok: true,
       mediaType: "image_post",
-      sources: selectedIndexes.map((index) => bestImageGroup[index]),
+      sources: selectedIndexes.map((index) => bestImageGroup[index][0]),
+      sourceCandidates: selectedIndexes.map((index) => bestImageGroup[index].slice(0, 4)),
       totalImageCount,
       sampled: bestImageGroup.length > MAX_SELECTED_IMAGES,
       sourceEvidence: "image-list",
@@ -176,6 +177,7 @@ export function resolveDouyinSharedWorkManifest({ detail = null, parsedContent =
   }
 
   const coverSource = unique(covers)[0] || null;
+  const coverCandidates = unique(covers).slice(0, 4);
   const isImageWork = workTypeHints.some((value) => IMAGE_WORK_TYPES.has(value))
     || declaredImageCount !== null;
   if (coverSource && isImageWork && (declaredImageCount === null || declaredImageCount === 1)) {
@@ -183,6 +185,7 @@ export function resolveDouyinSharedWorkManifest({ detail = null, parsedContent =
       ok: true,
       mediaType: "image_post",
       sources: [coverSource],
+      sourceCandidates: [coverCandidates],
       totalImageCount: 1,
       sampled: false,
       sourceEvidence: "single-image-react",
@@ -193,6 +196,7 @@ export function resolveDouyinSharedWorkManifest({ detail = null, parsedContent =
       ok: true,
       mediaType: "shared_cover",
       sources: [coverSource],
+      sourceCandidates: [coverCandidates],
       totalImageCount: declaredImageCount || 1,
       sampled: false,
       originalMediaType: isImageWork ? "image_post" : "unknown_work",
@@ -1393,6 +1397,78 @@ export function buildChatIdentityMetadataExpression() {
     const fingerprint = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0'))
       .join('');
     return { found: true, fingerprint };
+  })()`;
+}
+
+export function buildVerifyChatEditorReadyExpression({
+  expectedText,
+  expectedChatFingerprint,
+}) {
+  if (!/^[0-9a-f]{64}$/u.test(expectedChatFingerprint)) {
+    throw new Error("Expected Douyin chat fingerprint is invalid.");
+  }
+  return `(async () => {
+    ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    if (!title || !opaqueId) {
+      return { ok: false, reason: 'chat-identity-unavailable', chatMatches: false, canClear: false };
+    }
+    const bytes = new TextEncoder().encode(['douyin-opponent-v1', opaqueId].join('|'));
+    const hash = await crypto.subtle.digest('SHA-256', bytes);
+    const fingerprint = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+    const chatMatches = fingerprint === ${JSON.stringify(expectedChatFingerprint)};
+    if (!chatMatches) {
+      return { ok: false, reason: 'chat-changed', chatMatches: false, canClear: false };
+    }
+    const visibleEditors = Array.from(document.querySelectorAll(${JSON.stringify(DOUYIN_CHAT_INPUT_SELECTOR)}))
+      .filter((candidate) => {
+        const rectangle = candidate.getBoundingClientRect();
+        const style = getComputedStyle(candidate);
+        return rectangle.width > 0 && rectangle.height > 0
+          && style.display !== 'none' && style.visibility !== 'hidden';
+      });
+    if (visibleEditors.length !== 1) {
+      return {
+        ok: false,
+        reason: 'visible-editor-count',
+        chatMatches: true,
+        canClear: false,
+        visibleEditorCount: visibleEditors.length,
+      };
+    }
+    const editor = visibleEditors[0];
+    const expected = ${JSON.stringify(expectedText)};
+    const actual = (editor.textContent || '').replace(/[\u200B\uFEFF]/gu, '').trim();
+    const ownsInsertedText = actual === expected;
+    if (editor.matches(':disabled') || editor.getAttribute('aria-disabled') === 'true') {
+      return { ok: false, reason: 'editor-disabled', chatMatches: true, canClear: false };
+    }
+    if (document.activeElement !== editor) {
+      return {
+        ok: false,
+        reason: 'editor-focus-lost',
+        chatMatches: true,
+        canClear: ownsInsertedText,
+      };
+    }
+    if (!ownsInsertedText) {
+      return {
+        ok: false,
+        reason: 'editor-text-changed',
+        chatMatches: true,
+        canClear: false,
+        actualLength: actual.length,
+        expectedLength: expected.length,
+      };
+    }
+    return {
+      ok: true,
+      reason: null,
+      chatMatches: true,
+      canClear: true,
+      actualLength: actual.length,
+      expectedLength: expected.length,
+    };
   })()`;
 }
 

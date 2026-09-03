@@ -5,8 +5,26 @@ import {
   assessSenseVoiceOutput,
   parseSenseVoiceCapabilities,
   parseSenseVoiceOutput,
+  resolveOptionalSenseVoiceRuntime,
   resolveSenseVoicePaths,
 } from "../src/sensevoice-runtime.mjs";
+
+test("degrades cleanly when the optional SenseVoice runtime is unavailable", async () => {
+  const unavailable = await resolveOptionalSenseVoiceRuntime({
+    projectRoot: "C:/fixture",
+    verifyFn: async () => { throw new Error("private runtime path"); },
+  });
+  assert.deepEqual(unavailable, {
+    enabled: false,
+    reason: "runtime-unavailable",
+    runtime: null,
+  });
+  const available = await resolveOptionalSenseVoiceRuntime({
+    projectRoot: "C:/fixture",
+    verifyFn: async () => ({ executablePath: "fixture" }),
+  });
+  assert.equal(available.enabled, true);
+});
 
 test("parses SenseVoice language, emotion, event, and transcript tags", () => {
   const parsed = parseSenseVoiceOutput([

@@ -1,5 +1,6 @@
 import {
   DOUYIN_CHAT_INPUT_SELECTOR,
+  buildVerifyChatEditorReadyExpression,
   normalizeOutboundText,
 } from "./douyin-chat-page.mjs";
 
@@ -67,4 +68,16 @@ export async function replaceChatEditorText(client, text) {
   })()`);
 
   return result;
+}
+
+export async function verifyChatEditorReady(client, {
+  expectedText,
+  expectedChatFingerprint,
+}) {
+  const outboundText = normalizeOutboundText(expectedText);
+  if (!outboundText) throw new Error("Expected Douyin editor text is empty.");
+  return client.evaluate(buildVerifyChatEditorReadyExpression({
+    expectedText: outboundText,
+    expectedChatFingerprint,
+  }));
 }

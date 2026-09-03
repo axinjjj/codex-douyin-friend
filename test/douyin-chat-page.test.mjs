@@ -312,6 +312,7 @@ test("resolves single-image, multi-image, video, and cover-only shared works", (
     ok: true,
     mediaType: "image_post",
     sources: ["https://p3.douyinpic.com/single"],
+    sourceCandidates: [["https://p3.douyinpic.com/single"]],
     totalImageCount: 1,
     sampled: false,
     sourceEvidence: "single-image-react",
@@ -333,6 +334,11 @@ test("resolves single-image, multi-image, video, and cover-only shared works", (
     "https://p3.douyinpic.com/first",
     "https://p6.douyinpic.com/second",
     "https://p9.douyinpic.com/third",
+  ]);
+  assert.deepEqual(multiple.sourceCandidates, [
+    ["https://p3.douyinpic.com/first"],
+    ["https://p6.douyinpic.com/second"],
+    ["https://p9.douyinpic.com/third"],
   ]);
   assert.equal(multiple.totalImageCount, 3);
 
@@ -357,6 +363,7 @@ test("resolves single-image, multi-image, video, and cover-only shared works", (
     ok: true,
     mediaType: "shared_cover",
     sources: ["https://p3.douyinpic.com/cover"],
+    sourceCandidates: [["https://p3.douyinpic.com/cover"]],
     totalImageCount: 4,
     sampled: false,
     originalMediaType: "image_post",

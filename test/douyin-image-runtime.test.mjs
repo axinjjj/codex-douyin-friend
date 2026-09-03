@@ -298,3 +298,134 @@ test("refuses image-post downloads from an untrusted host", async (t) => {
     },
   }), /untrusted Douyin image URL/u);
 });
+
+test("falls back per image and returns bounded partial success in original order", async (t) => {
+  const projectRoot = await temporaryRoot(t);
+  const requested = [];
+  const result = await prepareDouyinImagePost({
+    projectRoot,
+    manifest: {
+      ok: true,
+      mediaType: "image_post",
+      sources: [
+        "https://p3.douyinpic.com/first-bad",
+        "https://p6.douyinpic.com/second-bad",
+      ],
+      sourceCandidates: [[
+        "https://p3.douyinpic.com/first-bad",
+        "https://p9.douyinpic.com/first-good",
+      ], [
+        "https://p6.douyinpic.com/second-bad",
+      ]],
+      totalImageCount: 2,
+      sampled: false,
+    },
+    concurrency: 1,
+    async fetchFn(url) {
+      requested.push(url);
+      if (!url.endsWith("first-good")) throw new Error("fixture failure");
+      return new Response(ONE_PIXEL_PNG, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      });
+    },
+  });
+  assert.equal(result.imagePaths.length, 1);
+  assert.equal(result.requestedImageCount, 2);
+  assert.equal(result.failedImageCount, 1);
+  assert.equal(result.partial, true);
+  assert.deepEqual(requested, [
+    "https://p3.douyinpic.com/first-bad",
+    "https://p9.douyinpic.com/first-good",
+    "https://p6.douyinpic.com/second-bad",
+  ]);
+  await removeImageAnalysisJob(projectRoot, result.jobDirectory);
+});
+
+test("caps image-post downloads at three concurrent workers", async (t) => {
+  const projectRoot = await temporaryRoot(t);
+  let active = 0;
+  let peak = 0;
+  const sources = Array.from({ length: 6 }, (_, index) => `https://p3.douyinpic.com/${index}`);
+  const result = await prepareDouyinImagePost({
+    projectRoot,
+    manifest: {
+      ok: true,
+      mediaType: "image_post",
+      sources,
+      totalImageCount: sources.length,
+      sampled: false,
+    },
+    concurrency: 99,
+    async fetchFn() {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setImmediate(resolve));
+      active -= 1;
+      return new Response(ONE_PIXEL_PNG, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      });
+    },
+  });
+  assert.equal(peak, 3);
+  assert.equal(result.partial, false);
+  await removeImageAnalysisJob(projectRoot, result.jobDirectory);
+});
+
+test("fails the whole image post when concurrent successes exceed the total byte limit", async (t) => {
+  const projectRoot = await temporaryRoot(t);
+  const oversizedTogether = Buffer.concat([
+    ONE_PIXEL_PNG,
+    Buffer.alloc(40 * 1024),
+  ]);
+  await assert.rejects(prepareDouyinImagePost({
+    projectRoot,
+    manifest: {
+      ok: true,
+      mediaType: "image_post",
+      sources: [
+        "https://p3.douyinpic.com/first",
+        "https://p6.douyinpic.com/second",
+      ],
+      totalImageCount: 2,
+      sampled: false,
+    },
+    maxImageBytes: 64 * 1024,
+    maxTotalBytes: 64 * 1024,
+    async fetchFn() {
+      return new Response(oversizedTogether, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      });
+    },
+  }), /exceeds the total size limit/u);
+});
+
+test("stops image-post candidate work at the shared wall-clock deadline", async (t) => {
+  const projectRoot = await temporaryRoot(t);
+  let currentTime = 0;
+  let calls = 0;
+  await assert.rejects(prepareDouyinImagePost({
+    projectRoot,
+    manifest: {
+      ok: true,
+      mediaType: "image_post",
+      sources: ["https://p3.douyinpic.com/first"],
+      sourceCandidates: [[
+        "https://p3.douyinpic.com/first",
+        "https://p6.douyinpic.com/second",
+      ]],
+      totalImageCount: 1,
+      sampled: false,
+    },
+    maxWallTimeMs: 100,
+    now: () => currentTime,
+    async fetchFn() {
+      calls += 1;
+      currentTime = 101;
+      throw new Error("fixture failure");
+    },
+  }), /No bounded Douyin image-post source/u);
+  assert.equal(calls, 1);
+});

@@ -59,8 +59,8 @@ import {
 } from "../src/douyin-video-runtime.mjs";
 import { repairCollapsedDouyinViewport } from "../src/douyin-window-runtime.mjs";
 import {
+  resolveOptionalSenseVoiceRuntime,
   transcribeSenseVoiceAudio,
-  verifySenseVoiceRuntime,
 } from "../src/sensevoice-runtime.mjs";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -83,7 +83,7 @@ const requestStop = () => {
 process.once("SIGINT", requestStop);
 process.once("SIGTERM", requestStop);
 
-await verifySenseVoiceRuntime({ projectRoot });
+const senseVoiceAvailability = await resolveOptionalSenseVoiceRuntime({ projectRoot });
 const cleanedStaleVideoJobs = await cleanupStaleVideoAnalysisJobs(projectRoot);
 const cleanedStaleImageJobs = await cleanupStaleImageAnalysisJobs(projectRoot);
 
@@ -102,6 +102,7 @@ let contextManager = null;
 let controlChannel = null;
 let pendingManualCompactionRequestId = null;
 let currentPhase = "starting";
+let phaseBeforeCompaction = null;
 let lastLatencyMs = null;
 const emitBridgeEvent = (event) => writeBridgeEvent(process.stdout, event);
 const emitBridgeStatus = (requestId = null) => emitBridgeEvent({
@@ -225,6 +226,14 @@ try {
     threadId: runtime.threadId,
     ...compactionPolicy,
     onDiagnostic: (diagnostic) => console.log(JSON.stringify(diagnostic)),
+    onOperationStart: () => {
+      phaseBeforeCompaction = currentPhase;
+      setBridgePhase("compacting");
+    },
+    onOperationEnd: () => {
+      if (currentPhase === "compacting") setBridgePhase(phaseBeforeCompaction || "listening");
+      phaseBeforeCompaction = null;
+    },
     onUsage: (usage) => {
       if (supervised) emitBridgeEvent({
         ok: true,
@@ -263,7 +272,7 @@ try {
     mediaReactionEnabled,
     model: runtime.model,
     effort: runtime.effort,
-    audioEnabled: true,
+    audioEnabled: senseVoiceAvailability.enabled,
     cleanedStaleVideoJobs,
     cleanedStaleImageJobs,
     stateLoad: loadedState.status,
@@ -284,7 +293,6 @@ try {
     if (pendingManualCompactionRequestId) {
       const requestId = pendingManualCompactionRequestId;
       pendingManualCompactionRequestId = null;
-      setBridgePhase("compacting");
       const result = await contextManager.compactNow();
       emitBridgeEvent({
         ok: result.ok,
@@ -293,7 +301,6 @@ try {
         command: "compact",
         reason: result.reason ?? null,
       });
-      setBridgePhase("listening");
       continue;
     }
     const continuingQueue = Array.isArray(queuedIncoming) && queuedIncoming.length > 0;
@@ -566,10 +573,13 @@ try {
                 projectRoot,
                 port,
                 sourceResult: sharedManifest,
-                analyzeAudio: ({ audioPath }) => transcribeSenseVoiceAudio({
-                  audioPath,
-                  projectRoot,
-                }),
+                analyzeAudio: senseVoiceAvailability.enabled
+                  ? ({ audioPath, timeoutMs: audioTimeoutMs }) => transcribeSenseVoiceAudio({
+                    audioPath,
+                    projectRoot,
+                    timeoutMs: audioTimeoutMs,
+                  })
+                  : null,
               }),
             };
           } else if (sharedManifest.mediaType === "image_post"
@@ -596,6 +606,8 @@ try {
             imagePaths: media.imagePaths,
             mediaType: media.kind,
             totalImageCount: media.totalImageCount ?? media.imagePaths.length,
+            requestedImageCount: media.requestedImageCount ?? media.imagePaths.length,
+            partial: Boolean(media.partial),
             inboundText,
             sharedComment,
             mediaReactionEnabled,
@@ -676,6 +688,7 @@ try {
           cdp,
           reply,
           beforeSend: currentMetadata,
+          expectedChatFingerprint: lockedChat.fingerprint,
           shouldStop: () => stopRequested,
           canSend: async () => {
             const currentChat = await cdp.evaluate(buildChatIdentityMetadataExpression());
@@ -697,13 +710,17 @@ try {
           outboundFingerprint,
         });
         await saveBridgeState(projectRoot, activeState);
-        if (error.reason === "chat-changed") process.exitCode = 4;
+        if (error.reason === "chat-changed" || error.reason === "editor-authority-lost") {
+          process.exitCode = 4;
+        }
         setBridgePhase(error.reason === "stop" ? "stopping" : "blocked");
         console.log(JSON.stringify({
           ok: error.reason === "stop",
           event: error.reason === "stop"
             ? "bridge-stop-requested-before-send"
-            : "chat-changed-before-send",
+            : error.reason === "editor-authority-lost"
+              ? "editor-authority-lost-before-send"
+              : "chat-changed-before-send",
         }));
         break;
       }

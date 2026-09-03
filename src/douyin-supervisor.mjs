@@ -207,6 +207,7 @@ export class DouyinSupervisor extends EventEmitter {
   }
 
   async pause() {
+    this.#requireAllowed("pause");
     this.desiredRunning = false;
     this.#cancelRestart();
     await this.#stopBridge("pause");
@@ -215,6 +216,7 @@ export class DouyinSupervisor extends EventEmitter {
   }
 
   async stop() {
+    this.#requireAllowed("stop");
     this.desiredRunning = false;
     this.#cancelRestart();
     await this.#stopBridge("stop");

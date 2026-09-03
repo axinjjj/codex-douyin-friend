@@ -1,51 +1,77 @@
 export class CdpClient {
-  constructor(webSocketUrl) {
+  constructor(webSocketUrl, { WebSocketImpl = globalThis.WebSocket } = {}) {
+    if (typeof WebSocketImpl !== "function") {
+      throw new Error("A WebSocket implementation is required.");
+    }
     this.webSocketUrl = webSocketUrl;
+    this.WebSocketImpl = WebSocketImpl;
     this.socket = null;
+    this.connectPromise = null;
     this.nextRequestId = 1;
     this.pendingRequests = new Map();
   }
 
   async connect(timeoutMs = 5_000) {
-    if (this.socket) return;
+    if (this.socket?.readyState === (this.WebSocketImpl.OPEN ?? 1)) return;
+    if (this.connectPromise) return this.connectPromise;
+    this.socket?.close();
+    this.socket = null;
 
-    const socket = new WebSocket(this.webSocketUrl);
+    const socket = new this.WebSocketImpl(this.webSocketUrl);
     this.socket = socket;
-
-    await new Promise((resolve, reject) => {
+    const operation = new Promise((resolve, reject) => {
+      let connected = false;
+      let settled = false;
+      const failConnection = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (this.socket === socket) this.socket = null;
+        try {
+          socket.close();
+        } catch {
+          // The failed transport is already unusable.
+        }
+        reject(error);
+      };
       const timeout = setTimeout(() => {
-        socket.close();
-        reject(new Error("Timed out connecting to the Electron debugger."));
+        failConnection(new Error("Timed out connecting to the CDP debugger."));
       }, timeoutMs);
 
-      socket.addEventListener(
-        "open",
-        () => {
-          clearTimeout(timeout);
-          resolve();
-        },
-        { once: true },
-      );
-      socket.addEventListener(
-        "error",
-        () => {
-          clearTimeout(timeout);
-          reject(new Error("Electron debugger connection failed."));
-        },
-        { once: true },
-      );
+      socket.addEventListener("message", (event) => this.#handleMessage(event.data));
+      socket.addEventListener("close", () => {
+        const error = new Error("CDP debugger connection closed.");
+        if (!connected) {
+          failConnection(error);
+          return;
+        }
+        this.#handleDisconnect(socket, error);
+      }, { once: true });
+      socket.addEventListener("error", () => {
+        const error = new Error("CDP debugger connection failed.");
+        if (!connected) {
+          failConnection(error);
+          return;
+        }
+        this.#handleDisconnect(socket, error);
+      }, { once: true });
+      socket.addEventListener("open", () => {
+        if (settled) return;
+        connected = true;
+        settled = true;
+        clearTimeout(timeout);
+        resolve();
+      }, { once: true });
     });
-
-    socket.addEventListener("message", (event) => this.#handleMessage(event.data));
-    socket.addEventListener("close", () => {
-      const error = new Error("Electron debugger connection closed.");
-      for (const pending of this.pendingRequests.values()) pending.reject(error);
-      this.pendingRequests.clear();
+    const trackedOperation = operation.finally(() => {
+      if (this.connectPromise === trackedOperation) this.connectPromise = null;
     });
+    this.connectPromise = trackedOperation;
+    return trackedOperation;
   }
 
   request(method, params = {}, timeoutMs = 5_000) {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+    if (!this.socket || this.socket.readyState !== (this.WebSocketImpl.OPEN ?? 1)) {
       return Promise.reject(new Error("CDP client is not connected."));
     }
 
@@ -66,7 +92,15 @@ export class CdpClient {
           reject(error);
         },
       });
-      this.socket.send(JSON.stringify({ id, method, params }));
+      const socket = this.socket;
+      try {
+        socket.send(JSON.stringify({ id, method, params }));
+      } catch {
+        const error = new Error("CDP debugger request could not be written.");
+        this.pendingRequests.get(id)?.reject(error);
+        this.pendingRequests.delete(id);
+        this.#handleDisconnect(socket, error);
+      }
     });
   }
 
@@ -84,8 +118,21 @@ export class CdpClient {
   }
 
   close() {
-    this.socket?.close();
+    const socket = this.socket;
     this.socket = null;
+    this.#rejectPending(new Error("CDP client was closed."));
+    socket?.close();
+  }
+
+  #handleDisconnect(socket, error) {
+    if (this.socket !== socket) return;
+    this.socket = null;
+    this.#rejectPending(error);
+  }
+
+  #rejectPending(error) {
+    for (const pending of this.pendingRequests.values()) pending.reject(error);
+    this.pendingRequests.clear();
   }
 
   #handleMessage(rawMessage) {

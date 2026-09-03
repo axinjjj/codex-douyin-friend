@@ -124,6 +124,19 @@ export async function verifySenseVoiceRuntime({ projectRoot, environment = proce
   return paths;
 }
 
+export async function resolveOptionalSenseVoiceRuntime({
+  projectRoot,
+  environment = process.env,
+  verifyFn = verifySenseVoiceRuntime,
+}) {
+  try {
+    const runtime = await verifyFn({ projectRoot, environment });
+    return { enabled: true, reason: null, runtime };
+  } catch {
+    return { enabled: false, reason: "runtime-unavailable", runtime: null };
+  }
+}
+
 export function parseSenseVoiceOutput(stdout) {
   const cleaned = String(stdout ?? "").replace(ANSI_PATTERN, "").trim();
   const segments = parseSrtSegments(cleaned);

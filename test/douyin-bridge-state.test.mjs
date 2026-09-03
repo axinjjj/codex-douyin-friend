@@ -234,6 +234,12 @@ test("derives appends when Douyin replaces the oldest items in a fixed DOM windo
   ]);
 });
 
+test("does not invent an append when an unchanged fixed window has duplicate fingerprints", () => {
+  const duplicate = message("same", "left", "media");
+  const unchanged = snapshot(30, Array.from({ length: 12 }, () => ({ ...duplicate })));
+  assert.deepEqual(findAppendedMessages(unchanged, unchanged), []);
+});
+
 test("refuses a fixed-size DOM replacement without a reliable overlap boundary", () => {
   assert.throws(
     () => findAppendedMessages(

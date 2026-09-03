@@ -127,6 +127,8 @@ export class CodexContextCompactionManager {
     now = Date.now,
     onDiagnostic = () => {},
     onUsage = () => {},
+    onOperationStart = () => {},
+    onOperationEnd = () => {},
   }) {
     if (!codex || typeof codex.on !== "function") {
       throw new Error("A notification-capable Codex client is required.");
@@ -143,6 +145,8 @@ export class CodexContextCompactionManager {
     this.now = now;
     this.onDiagnostic = onDiagnostic;
     this.onUsage = onUsage;
+    this.onOperationStart = onOperationStart;
+    this.onOperationEnd = onOperationEnd;
     this.latestUsage = null;
     this.serverStatus = "unknown";
     this.activityDepth = 0;
@@ -382,8 +386,18 @@ export class CodexContextCompactionManager {
     this.lastCompactionStartedAt = this.now();
     this.armed = false;
     const usageBefore = this.latestUsage ? { ...this.latestUsage } : null;
+    try {
+      this.onOperationStart({ trigger });
+    } catch {
+      // Phase reporting must never interrupt the compaction request.
+    }
     const operation = this.#performCompaction(trigger, usageBefore).finally(() => {
       if (this.compactionPromise === operation) this.compactionPromise = null;
+      try {
+        this.onOperationEnd({ trigger });
+      } catch {
+        // Phase reporting must never replace the compaction result.
+      }
     });
     this.compactionPromise = operation;
     return operation;

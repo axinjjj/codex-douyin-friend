@@ -1,12 +1,49 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import {
   CodexAppServerClient,
   extractAgentText,
   instructionSourcesContain,
 } from "../src/codex-app-server-client.mjs";
 import { summarizeTargets } from "../src/cdp-client.mjs";
+
+class FakeCodexProcess extends EventEmitter {
+  constructor({ initializeError = null, respondToInitialize = true } = {}) {
+    super();
+    this.stdin = new PassThrough();
+    this.stdout = new PassThrough();
+    this.stderr = new PassThrough();
+    this.exited = false;
+    let buffered = "";
+    this.stdin.on("data", (chunk) => {
+      buffered += String(chunk);
+      while (buffered.includes("\n")) {
+        const newline = buffered.indexOf("\n");
+        const line = buffered.slice(0, newline);
+        buffered = buffered.slice(newline + 1);
+        const message = JSON.parse(line);
+        if (message.method !== "initialize" || !respondToInitialize) continue;
+        this.stdout.write(`${JSON.stringify(initializeError
+          ? { id: message.id, error: initializeError }
+          : { id: message.id, result: { userAgent: "fixture" } })}\n`);
+      }
+    });
+    this.stdin.once("finish", () => this.exit(0, null));
+  }
+
+  exit(code, signal) {
+    if (this.exited) return;
+    this.exited = true;
+    this.emit("exit", code, signal);
+  }
+
+  kill() {
+    this.exit(null, "SIGTERM");
+  }
+}
 
 test("extractAgentText reads a completed agent message", () => {
   assert.equal(
@@ -83,4 +120,116 @@ test("summarizeTargets removes titles, URLs, and debugger addresses", () => {
     ]),
     [{ type: "page", hasDebuggerEndpoint: true, hasUrl: true }],
   );
+});
+
+test("clears an exited App Server process and starts a new child", async () => {
+  const children = [];
+  const client = new CodexAppServerClient({
+    spawnProcess() {
+      const child = new FakeCodexProcess();
+      children.push(child);
+      return child;
+    },
+  });
+  await client.start();
+  children[0].exit(1, null);
+  assert.equal(client.process, null);
+  await client.start();
+  assert.equal(children.length, 2);
+  await client.close();
+});
+
+test("coalesces concurrent starts until initialization has completed", async () => {
+  const child = new FakeCodexProcess({ respondToInitialize: false });
+  let spawnCount = 0;
+  const client = new CodexAppServerClient({
+    spawnProcess() {
+      spawnCount += 1;
+      return child;
+    },
+  });
+  const firstStart = client.start();
+  let secondSettled = false;
+  const secondStart = client.start().then(() => {
+    secondSettled = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(spawnCount, 1);
+  assert.equal(secondSettled, false);
+  child.stdout.write(`${JSON.stringify({ id: 1, result: { userAgent: "fixture" } })}\n`);
+  await Promise.all([firstStart, secondStart]);
+  assert.equal(secondSettled, true);
+  await client.close();
+});
+
+test("tears down initialization failures and can retry with a fresh child", async () => {
+  const children = [];
+  const client = new CodexAppServerClient({
+    spawnProcess() {
+      const child = new FakeCodexProcess(children.length === 0 ? {
+        initializeError: { code: -32600, message: "fixture initialization failure" },
+      } : {});
+      children.push(child);
+      return child;
+    },
+  });
+  await assert.rejects(client.start(), /fixture initialization failure/u);
+  assert.equal(client.process, null);
+  await client.start();
+  assert.equal(children.length, 2);
+  await client.close();
+});
+
+test("rejects pending requests and clears the child after stdin EPIPE", async () => {
+  const child = new FakeCodexProcess();
+  const client = new CodexAppServerClient({ spawnProcess: () => child });
+  await client.start();
+  const pending = client.request("thread/list");
+  const transportError = new Error("fixture pipe closed");
+  transportError.code = "EPIPE";
+  child.stdin.emit("error", transportError);
+  await assert.rejects(pending, /input stream failed/u);
+  assert.equal(client.pendingRequests.size, 0);
+  assert.equal(client.process, null);
+});
+
+test("handles a child spawn error without an unhandled event and permits restart", async () => {
+  const children = [];
+  const client = new CodexAppServerClient({
+    spawnProcess() {
+      const child = new FakeCodexProcess({ respondToInitialize: children.length > 0 });
+      children.push(child);
+      if (children.length === 1) queueMicrotask(() => child.emit("error", new Error("ENOENT")));
+      return child;
+    },
+  });
+  await assert.rejects(client.start(), /process failed to start/u);
+  await client.start();
+  assert.equal(children.length, 2);
+  await client.close();
+});
+
+test("runTurn consumes only notifications for the returned turn id", async () => {
+  const client = new CodexAppServerClient();
+  client.request = async (method) => {
+    assert.equal(method, "turn/start");
+    client.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: { threadId: "thread-1", turnId: "other-turn", delta: "wrong" },
+    });
+    client.emit("notification", {
+      method: "turn/completed",
+      params: { threadId: "thread-1", turn: { id: "other-turn", status: "completed" } },
+    });
+    client.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: { threadId: "thread-1", turnId: "target-turn", delta: "right" },
+    });
+    client.emit("notification", {
+      method: "turn/completed",
+      params: { threadId: "thread-1", turn: { id: "target-turn", status: "completed" } },
+    });
+    return { turn: { id: "target-turn" } };
+  };
+  assert.equal(await client.runTurn({ threadId: "thread-1", text: "fixture" }), "right");
 });

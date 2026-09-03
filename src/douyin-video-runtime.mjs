@@ -53,6 +53,14 @@ function boundedLimit(value, fallback, hardMaximum, minimum = 1) {
   return Math.max(minimum, Math.min(hardMaximum, normalized));
 }
 
+export class DouyinVideoDecodeError extends Error {
+  constructor(reason = "decode-unavailable") {
+    super(`The local browser could not decode the Douyin video (${reason}).`);
+    this.name = "DouyinVideoDecodeError";
+    this.reason = reason;
+  }
+}
+
 export function isTrustedDouyinMediaUrl(value) {
   try {
     const url = new URL(value);
@@ -369,6 +377,11 @@ export async function downloadCompatibleDouyinVideo({
   sourceResult,
   destination,
   downloadFn = downloadDouyinVideo,
+  validateFn = null,
+  cleanupFn = async () => {},
+  isRetryableValidationError = (error) => error instanceof DouyinVideoDecodeError,
+  maxWallTimeMs = DEFAULT_DOWNLOAD_WALL_TIME_MS,
+  now = Date.now,
 }) {
   const candidates = [...new Set([
     ...(Array.isArray(sourceResult?.sources) ? sourceResult.sources : []),
@@ -386,25 +399,64 @@ export async function downloadCompatibleDouyinVideo({
   if (candidates.length === 0) {
     throw new Error("The Douyin video has no trusted compatible source candidate.");
   }
-  const deadline = Date.now() + DEFAULT_DOWNLOAD_WALL_TIME_MS;
+  const boundedWallTimeMs = boundedLimit(
+    maxWallTimeMs,
+    DEFAULT_DOWNLOAD_WALL_TIME_MS,
+    DEFAULT_DOWNLOAD_WALL_TIME_MS,
+  );
+  const deadline = now() + boundedWallTimeMs;
   const failures = [];
   for (const source of candidates) {
-    const remainingWallTimeMs = deadline - Date.now();
+    const remainingWallTimeMs = deadline - now();
     if (remainingWallTimeMs < 1_000) break;
+    let download;
     try {
-      return await downloadFn({
+      download = await downloadFn({
         source,
         destination,
-        timeoutMs: VIDEO_SOURCE_ATTEMPT_TIMEOUT_MS,
+        timeoutMs: Math.min(VIDEO_SOURCE_ATTEMPT_TIMEOUT_MS, remainingWallTimeMs),
         maxWallTimeMs: remainingWallTimeMs,
       });
     } catch (error) {
       failures.push(classifyVideoDownloadFailure(error));
+      await cleanupFn();
+      continue;
+    }
+    if (typeof validateFn !== "function") return download;
+    const validationRemainingMs = deadline - now();
+    if (validationRemainingMs < 1_000) {
+      failures.push("wall-time");
+      await cleanupFn();
+      break;
+    }
+    try {
+      const processed = await validateFn({
+        download,
+        remainingWallTimeMs: validationRemainingMs,
+      });
+      return { ...download, processed };
+    } catch (error) {
+      if (!isRetryableValidationError(error)) throw error;
+      failures.push(`decode-${error?.reason || "unavailable"}`);
+      await cleanupFn();
     }
   }
   throw new Error(
     `Every compatible Douyin video source failed (${failures.join(",") || "wall-time"}).`,
   );
+}
+
+async function cleanupVideoCandidateArtifacts(job) {
+  const entries = await readdir(job.jobDirectory, { withFileTypes: true });
+  const removableNames = new Set([
+    path.basename(job.videoPath),
+    path.basename(job.audioPath),
+  ]);
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    if (!removableNames.has(entry.name) && !/^frame-\d+\.png$/u.test(entry.name)) continue;
+    await rm(path.join(job.jobDirectory, entry.name), { force: true });
+  }
 }
 
 export async function prepareLatestDouyinVideoMedia({
@@ -413,6 +465,9 @@ export async function prepareLatestDouyinVideoMedia({
   port = 9229,
   analyzeAudio = null,
   sourceResult = null,
+  downloadFn = downloadDouyinVideo,
+  extractFn = extractVideoMedia,
+  maxWallTimeMs = DEFAULT_DOWNLOAD_WALL_TIME_MS,
 }) {
   const resolvedSource = sourceResult ?? await cdp.evaluate(buildReadCompatibleAwemeSourceExpression());
   if (!resolvedSource?.ok) {
@@ -420,18 +475,24 @@ export async function prepareLatestDouyinVideoMedia({
   }
   const job = await createVideoAnalysisJob(projectRoot);
   try {
-    const download = await downloadCompatibleDouyinVideo({
+    const result = await downloadCompatibleDouyinVideo({
       sourceResult: resolvedSource,
       destination: job.videoPath,
+      downloadFn,
+      maxWallTimeMs,
+      cleanupFn: () => cleanupVideoCandidateArtifacts(job),
+      validateFn: ({ remainingWallTimeMs }) => extractFn({
+        port,
+        videoPath: job.videoPath,
+        audioPath: job.audioPath,
+        outputDirectory: job.jobDirectory,
+        extractAudio: typeof analyzeAudio === "function",
+        analyzeAudio,
+        maxOverallWallTimeMs: remainingWallTimeMs,
+      }),
     });
-    const media = await extractVideoMedia({
-      port,
-      videoPath: job.videoPath,
-      audioPath: job.audioPath,
-      outputDirectory: job.jobDirectory,
-      analyzeAudio,
-    });
-    return { ...job, ...download, ...media };
+    const { processed, ...download } = result;
+    return { ...job, ...download, ...processed };
   } catch (error) {
     await removeVideoAnalysisJob(projectRoot, job.jobDirectory);
     throw error;
@@ -797,11 +858,11 @@ async function waitForLocalVideo(pageCdp, timeoutMs = 20_000) {
       };
     })()`);
     lastState = state;
-    if (state?.errorCode) throw new Error(`Local video decode failed with code ${state.errorCode}.`);
+    if (state?.errorCode) throw new DouyinVideoDecodeError(`media-error-${state.errorCode}`);
     if (state?.ready) return state;
     await sleep(200);
   }
-  throw new Error(`Timed out decoding the temporary local video: ${JSON.stringify(lastState)}.`);
+  throw new DouyinVideoDecodeError(lastState?.videoFound ? "decode-timeout" : "video-missing");
 }
 
 export function buildScanFrameSignaturesExpression(times, {
@@ -986,9 +1047,23 @@ export async function extractVideoMedia({
   maxCaptureWallTimeMs = DEFAULT_MAX_CAPTURE_WALL_TIME_MS,
   maxFrameBytes = DEFAULT_MAX_FRAME_BYTES,
   maxTotalFrameBytes = DEFAULT_MAX_TOTAL_FRAME_BYTES,
+  maxOverallWallTimeMs = DEFAULT_DOWNLOAD_WALL_TIME_MS,
 }) {
+  const boundedOverallWallTimeMs = boundedLimit(
+    maxOverallWallTimeMs,
+    DEFAULT_DOWNLOAD_WALL_TIME_MS,
+    DEFAULT_DOWNLOAD_WALL_TIME_MS,
+  );
+  const overallDeadline = Date.now() + boundedOverallWallTimeMs;
+  const remainingTimeout = (maximumMs, minimumMs = 1) => {
+    const remainingMs = overallDeadline - Date.now();
+    if (remainingMs < minimumMs) {
+      throw new Error("Video processing exceeded its wall-time limit.");
+    }
+    return Math.max(minimumMs, Math.min(maximumMs, remainingMs));
+  };
   const versionResponse = await fetch(`http://127.0.0.1:${port}/json/version`, {
-    signal: AbortSignal.timeout(3_000),
+    signal: AbortSignal.timeout(remainingTimeout(3_000)),
   });
   if (!versionResponse.ok) throw new Error("Browser debugger version endpoint is unavailable.");
   const version = await versionResponse.json();
@@ -1019,17 +1094,17 @@ export async function extractVideoMedia({
   let targetId;
   let pageCdp;
   try {
-    await browserCdp.connect();
+    await browserCdp.connect(remainingTimeout(5_000));
     const created = await browserCdp.request("Target.createTarget", {
       url: mediaServer.url,
       background: false,
-    }, 10_000);
+    }, remainingTimeout(10_000));
     targetId = created?.targetId;
     if (!targetId) throw new Error("Browser did not create a temporary video target.");
-    const target = await waitForTarget(port, targetId);
+    const target = await waitForTarget(port, targetId, remainingTimeout(10_000));
     pageCdp = new CdpClient(target.webSocketDebuggerUrl);
-    await pageCdp.connect();
-    const state = await waitForLocalVideo(pageCdp);
+    await pageCdp.connect(remainingTimeout(5_000));
+    const state = await waitForLocalVideo(pageCdp, remainingTimeout(20_000));
     let audio = { ok: false, reason: "audio-extraction-unavailable" };
     if (extractAudio) {
       try {
@@ -1037,7 +1112,7 @@ export async function extractVideoMedia({
           uploadPath: mediaServer.audioUploadPath,
           maxAudioBytes: boundedMaxAudioBytes,
           maxDurationSeconds: boundedMaxAudioDurationSeconds,
-        }), 120_000);
+        }), remainingTimeout(120_000));
       } catch {
         audio = { ok: false, reason: "audio-extraction-timeout" };
         pageCdp.close();
@@ -1047,13 +1122,13 @@ export async function extractVideoMedia({
         const recreated = await browserCdp.request("Target.createTarget", {
           url: mediaServer.url,
           background: false,
-        }, 10_000);
+        }, remainingTimeout(10_000));
         targetId = recreated?.targetId;
         if (!targetId) throw new Error("Browser did not recreate the temporary video target.");
-        const recreatedTarget = await waitForTarget(port, targetId);
+        const recreatedTarget = await waitForTarget(port, targetId, remainingTimeout(10_000));
         pageCdp = new CdpClient(recreatedTarget.webSocketDebuggerUrl);
-        await pageCdp.connect();
-        await waitForLocalVideo(pageCdp);
+        await pageCdp.connect(remainingTimeout(5_000));
+        await waitForLocalVideo(pageCdp, remainingTimeout(20_000));
       }
       if (audio?.ok) await stat(audioPath);
     } else {
@@ -1067,6 +1142,7 @@ export async function extractVideoMedia({
           audioPath,
           durationSeconds: audio.processedDuration,
           truncated: Boolean(audio.truncated),
+          timeoutMs: remainingTimeout(120_000, 1_000),
         });
         audioUnderstanding = result && typeof result === "object"
           ? result
@@ -1094,7 +1170,7 @@ export async function extractVideoMedia({
     );
     const scan = await pageCdp.evaluate(buildScanFrameSignaturesExpression(scanTimes, {
       maxWallTimeMs: boundedScanWallTimeMs,
-    }), boundedScanWallTimeMs + 10_000);
+    }), remainingTimeout(boundedScanWallTimeMs + 10_000));
     if (!scan?.ok || !Array.isArray(scan.samples) || scan.samples.length === 0) {
       throw new Error(`Could not scan video scenes: ${scan?.reason || "unknown"}.`);
     }
@@ -1113,7 +1189,10 @@ export async function extractVideoMedia({
         Math.trunc(maxCaptureWallTimeMs) || DEFAULT_MAX_CAPTURE_WALL_TIME_MS,
       ),
     );
-    const captureDeadline = Date.now() + boundedCaptureWallTimeMs;
+    const captureDeadline = Math.min(
+      overallDeadline,
+      Date.now() + boundedCaptureWallTimeMs,
+    );
     const boundedFrameBytes = Math.max(
       64 * 1024,
       Math.min(DEFAULT_MAX_FRAME_BYTES, Math.trunc(maxFrameBytes) || DEFAULT_MAX_FRAME_BYTES),
@@ -1185,6 +1264,7 @@ export async function extractVideoMedia({
       },
     };
   } catch (error) {
+    if (error instanceof DouyinVideoDecodeError) throw error;
     throw new Error(`${error.message} Local server stats: ${JSON.stringify(mediaServer.getStats())}.`);
   } finally {
     const cleanupErrors = [];

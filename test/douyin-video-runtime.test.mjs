@@ -11,9 +11,12 @@ import {
   buildExtractAudioExpression,
   buildScanFrameSignaturesExpression,
   cleanupStaleVideoAnalysisJobs,
+  DouyinVideoDecodeError,
   downloadCompatibleDouyinVideo,
   downloadDouyinVideo,
   isTrustedDouyinMediaUrl,
+  prepareLatestDouyinVideoMedia,
+  removeVideoAnalysisJob,
   resolveVideoAnalysisRoot,
 } from "../src/douyin-video-runtime.mjs";
 
@@ -354,6 +357,122 @@ test("tries bounded trusted video source candidates in order", async () => {
       return true;
     },
   );
+});
+
+test("candidate fallback never deletes an unknown pre-existing destination", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "codex-douyin-video-existing-"));
+  const destination = path.join(projectRoot, "existing.mp4");
+  try {
+    await writeFile(destination, "keep");
+    await assert.rejects(downloadCompatibleDouyinVideo({
+      sourceResult: { source: "https://v1-dy.zjcdn.com/first.mp4" },
+      destination,
+      async downloadFn() {
+        throw new Error("fixture download failed");
+      },
+    }), /Every compatible Douyin video source failed/u);
+    assert.equal(await readFile(destination, "utf8"), "keep");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("retries the next video source only after an explicit local decode failure", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "codex-douyin-video-decode-fallback-"));
+  const calls = [];
+  let activeSource = null;
+  try {
+    const result = await prepareLatestDouyinVideoMedia({
+      cdp: null,
+      projectRoot,
+      sourceResult: {
+        ok: true,
+        source: "https://v1-dy.zjcdn.com/first.mp4",
+        sources: [
+          "https://v1-dy.zjcdn.com/first.mp4",
+          "https://v2-dy.zjcdn.com/second.mp4",
+        ],
+      },
+      async downloadFn({ source, destination }) {
+        activeSource = source;
+        calls.push({ operation: "download", source });
+        await writeFile(destination, Buffer.from([1, 2, 3]));
+        return { byteCount: 3, contentType: "video/mp4" };
+      },
+      async extractFn({ outputDirectory, extractAudio, maxOverallWallTimeMs }) {
+        calls.push({ operation: "decode", source: activeSource });
+        assert.equal(extractAudio, false);
+        assert.ok(maxOverallWallTimeMs > 0);
+        if (activeSource.includes("v1-dy")) {
+          await writeFile(path.join(outputDirectory, "frame-01.png"), Buffer.from([9]));
+          throw new DouyinVideoDecodeError("media-error-4");
+        }
+        await assert.rejects(access(path.join(outputDirectory, "frame-01.png")));
+        return {
+          framePaths: [path.join(outputDirectory, "frame-02.png")],
+          duration: 1,
+        };
+      },
+    });
+    assert.equal(result.byteCount, 3);
+    assert.equal(result.duration, 1);
+    assert.deepEqual(calls.map(({ operation, source }) => ({ operation, source })), [
+      { operation: "download", source: "https://v1-dy.zjcdn.com/first.mp4" },
+      { operation: "decode", source: "https://v1-dy.zjcdn.com/first.mp4" },
+      { operation: "download", source: "https://v2-dy.zjcdn.com/second.mp4" },
+      { operation: "decode", source: "https://v2-dy.zjcdn.com/second.mp4" },
+    ]);
+    await removeVideoAnalysisJob(projectRoot, result.jobDirectory);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("does not hide non-decode video processing failures behind another source", async () => {
+  let downloadCount = 0;
+  await assert.rejects(
+    () => downloadCompatibleDouyinVideo({
+      sourceResult: {
+        sources: [
+          "https://v1-dy.zjcdn.com/first.mp4",
+          "https://v2-dy.zjcdn.com/second.mp4",
+        ],
+      },
+      destination: path.resolve("C:/bounded/video.mp4"),
+      async downloadFn() {
+        downloadCount += 1;
+        return { byteCount: 3, contentType: "video/mp4" };
+      },
+      async validateFn() {
+        throw new Error("frame pipeline failed");
+      },
+    }),
+    /frame pipeline failed/u,
+  );
+  assert.equal(downloadCount, 1);
+});
+
+test("shares one bounded wall-clock budget across video download and validation", async () => {
+  let currentTime = 0;
+  let validationCalled = false;
+  await assert.rejects(
+    () => downloadCompatibleDouyinVideo({
+      sourceResult: { source: "https://v1-dy.zjcdn.com/first.mp4" },
+      destination: path.resolve("C:/bounded/video.mp4"),
+      maxWallTimeMs: 1_000,
+      now: () => currentTime,
+      async downloadFn() {
+        currentTime = 1_001;
+        return { byteCount: 3, contentType: "video/mp4" };
+      },
+      async validateFn() {
+        validationCalled = true;
+        return {};
+      },
+    }),
+    /failed \(wall-time\)/u,
+  );
+  assert.equal(validationCalled, false);
 });
 
 test("video cleanup paths must be children of the dedicated runtime root", () => {

@@ -10,6 +10,9 @@ import { isTrustedDouyinMediaUrl } from "./douyin-video-runtime.mjs";
 const IMAGE_JOB_NAME_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const DEFAULT_MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_IMAGE_BYTES = 64 * 1024 * 1024;
+const DEFAULT_IMAGE_POST_WALL_TIME_MS = 150_000;
+const MAX_IMAGE_SOURCE_CANDIDATES = 4;
+const MAX_IMAGE_DOWNLOAD_CONCURRENCY = 3;
 
 export function resolveImageAnalysisRoot(projectRoot) {
   return path.resolve(projectRoot, ".runtime", "image-analysis");
@@ -230,14 +233,14 @@ function hasImageSignature(header, contentType) {
   return false;
 }
 
-async function downloadDouyinImage({ source, destination, maxBytes, fetchFn }) {
+async function downloadDouyinImage({ source, destination, maxBytes, fetchFn, timeoutMs = 60_000 }) {
   if (!isTrustedDouyinMediaUrl(source)) {
     throw new Error("Refusing an untrusted Douyin image URL.");
   }
   const response = await fetchFn(source, {
     headers: { Referer: "https://www.douyin.com/" },
     redirect: "error",
-    signal: AbortSignal.timeout(60_000),
+    signal: AbortSignal.timeout(Math.max(1, Math.min(60_000, Math.trunc(timeoutMs) || 60_000))),
   });
   if (!response.ok || !response.body) throw new Error("Douyin image download failed.");
   const contentType = (response.headers.get("content-type") || "").split(";", 1)[0].trim().toLowerCase();
@@ -281,6 +284,9 @@ export async function prepareDouyinImagePost({
   fetchFn = fetch,
   maxImageBytes = DEFAULT_MAX_IMAGE_BYTES,
   maxTotalBytes = DEFAULT_MAX_TOTAL_IMAGE_BYTES,
+  maxWallTimeMs = DEFAULT_IMAGE_POST_WALL_TIME_MS,
+  concurrency = MAX_IMAGE_DOWNLOAD_CONCURRENCY,
+  now = Date.now,
 }) {
   const supportedMediaTypes = new Set(["image_post", "shared_cover"]);
   if (!manifest?.ok || !supportedMediaTypes.has(manifest.mediaType)
@@ -292,6 +298,21 @@ export async function prepareDouyinImagePost({
         && (manifest.sources.length !== 1 || manifest.sampled))) {
     throw new Error("Douyin image-post manifest is invalid.");
   }
+  const sourceCandidates = Array.isArray(manifest.sourceCandidates)
+    ? manifest.sourceCandidates
+    : manifest.sources.map((source) => [source]);
+  if (sourceCandidates.length !== manifest.sources.length
+      || sourceCandidates.some((candidates) => !Array.isArray(candidates)
+        || candidates.length === 0
+        || candidates.length > MAX_IMAGE_SOURCE_CANDIDATES
+        || candidates.some((source) => typeof source !== "string"))) {
+    throw new Error("Douyin image-post source candidates are invalid.");
+  }
+  if (sourceCandidates.some((candidates) => (
+    candidates.some((source) => !isTrustedDouyinMediaUrl(source))
+  ))) {
+    throw new Error("Refusing an untrusted Douyin image URL.");
+  }
   const boundedImageBytes = Math.max(64 * 1024, Math.min(
     DEFAULT_MAX_IMAGE_BYTES,
     Number.isFinite(maxImageBytes) ? Math.trunc(maxImageBytes) : DEFAULT_MAX_IMAGE_BYTES,
@@ -302,24 +323,80 @@ export async function prepareDouyinImagePost({
   ));
   const root = resolveImageAnalysisRoot(projectRoot);
   const jobDirectory = path.join(root, randomUUID());
-  const imagePaths = [];
-  let totalBytes = 0;
+  const boundedWallTimeMs = Math.max(100, Math.min(
+    180_000,
+    Number.isFinite(maxWallTimeMs) ? Math.trunc(maxWallTimeMs) : DEFAULT_IMAGE_POST_WALL_TIME_MS,
+  ));
+  const boundedConcurrency = Math.max(1, Math.min(
+    MAX_IMAGE_DOWNLOAD_CONCURRENCY,
+    Number.isFinite(concurrency) ? Math.trunc(concurrency) : MAX_IMAGE_DOWNLOAD_CONCURRENCY,
+  ));
+  const deadline = now() + boundedWallTimeMs;
+  const outcomes = new Array(sourceCandidates.length);
   try {
     await mkdir(jobDirectory, { recursive: true });
-    for (let index = 0; index < manifest.sources.length; index += 1) {
+    let nextIndex = 0;
+    let downloadedBytes = 0;
+    let fatalError = null;
+    const worker = async () => {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= sourceCandidates.length || fatalError) return;
       const temporaryPath = path.join(jobDirectory, `image-${String(index + 1).padStart(2, "0")}.download`);
-      const download = await downloadDouyinImage({
-        source: manifest.sources[index],
-        destination: temporaryPath,
-        maxBytes: boundedImageBytes,
-        fetchFn,
-      });
-      totalBytes += download.byteCount;
-      if (totalBytes > boundedTotalBytes) throw new Error("Douyin image post exceeds the total size limit.");
-      const finalPath = `${temporaryPath}${extensionForImageContentType(download.contentType)}`;
-      await rename(temporaryPath, finalPath);
-      imagePaths.push(finalPath);
+      for (const source of [...new Set(sourceCandidates[index])]) {
+        if (fatalError) break;
+        const remainingWallTimeMs = deadline - now();
+        if (remainingWallTimeMs <= 0) break;
+        let download;
+        try {
+          download = await downloadDouyinImage({
+            source,
+            destination: temporaryPath,
+            maxBytes: boundedImageBytes,
+            fetchFn,
+            timeoutMs: remainingWallTimeMs,
+          });
+        } catch {
+          await rm(temporaryPath, { force: true }).catch(() => {});
+          continue;
+        }
+        if (fatalError) {
+          await rm(temporaryPath, { force: true }).catch(() => {});
+          break;
+        }
+        downloadedBytes += download.byteCount;
+        if (downloadedBytes > boundedTotalBytes) {
+          fatalError = new Error("Douyin image post exceeds the total size limit.");
+          await rm(temporaryPath, { force: true }).catch(() => {});
+          break;
+        }
+        const finalPath = `${temporaryPath}${extensionForImageContentType(download.contentType)}`;
+        try {
+          await rename(temporaryPath, finalPath);
+        } catch {
+          fatalError = new Error("Douyin image post could not store a validated image.");
+          await rm(temporaryPath, { force: true }).catch(() => {});
+          break;
+        }
+        outcomes[index] = { ...download, finalPath };
+        return;
+      }
+      outcomes[index] = null;
+    };
+    const workers = Array.from(
+      { length: Math.min(boundedConcurrency, sourceCandidates.length) },
+      async () => {
+        while (!fatalError && nextIndex < sourceCandidates.length) await worker();
+      },
+    );
+    await Promise.all(workers);
+    if (fatalError) throw fatalError;
+    const successful = outcomes.filter(Boolean);
+    if (successful.length === 0) {
+      throw new Error("No bounded Douyin image-post source could be downloaded.");
     }
+    const totalBytes = successful.reduce((sum, outcome) => sum + outcome.byteCount, 0);
+    const imagePaths = successful.map((outcome) => outcome.finalPath);
     return {
       kind: manifest.mediaType,
       jobDirectory,
@@ -327,6 +404,9 @@ export async function prepareDouyinImagePost({
       totalBytes,
       totalImageCount: manifest.totalImageCount,
       sampled: Boolean(manifest.sampled),
+      requestedImageCount: sourceCandidates.length,
+      failedImageCount: sourceCandidates.length - successful.length,
+      partial: successful.length !== sourceCandidates.length,
     };
   } catch (error) {
     await removeImageAnalysisJob(projectRoot, jobDirectory).catch(() => {});

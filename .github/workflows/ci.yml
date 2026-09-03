@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-node:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm test
+      - name: Parse JavaScript modules
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -File -Filter *.mjs | ForEach-Object {
+            node --check $_.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $parseFailed = $false
+          Get-ChildItem -Recurse -File -Filter *.ps1 | ForEach-Object {
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$null,
+              [ref]$parseErrors
+            )
+            if ($parseErrors.Count -gt 0) {
+              $parseErrors | ForEach-Object { Write-Error $_.Message }
+              $parseFailed = $true
+            }
+          }
+          if ($parseFailed) { exit 1 }

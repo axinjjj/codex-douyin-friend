@@ -49,51 +49,128 @@ export function instructionSourcesContain(instructionSources, expectedPath) {
 }
 
 export class CodexAppServerClient extends EventEmitter {
-  constructor({ codexPath = process.env.CODEX_BIN || "codex" } = {}) {
+  constructor({
+    codexPath = process.env.CODEX_BIN || "codex",
+    spawnProcess = spawn,
+  } = {}) {
     super();
     this.codexPath = codexPath;
+    this.spawnProcess = spawnProcess;
     this.process = null;
     this.reader = null;
+    this.startPromise = null;
     this.nextRequestId = 1;
     this.pendingRequests = new Map();
   }
 
   async start() {
+    if (this.startPromise) return this.startPromise;
     if (this.process) return;
+    const operation = this.#startOnce();
+    const trackedOperation = operation.finally(() => {
+      if (this.startPromise === trackedOperation) this.startPromise = null;
+    });
+    this.startPromise = trackedOperation;
+    return trackedOperation;
+  }
 
-    this.process = spawn(this.codexPath, ["app-server", "--listen", "stdio://"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
+  async #startOnce() {
+    let child;
+    try {
+      child = this.spawnProcess(this.codexPath, ["app-server", "--listen", "stdio://"], {
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch {
+      throw new Error("Codex App Server could not be started.");
+    }
+    this.process = child;
+
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => this.emit("stderr", chunk));
+    child.stdin.once("error", () => {
+      this.#handleTransportFailure(child, "Codex App Server input stream failed.");
+    });
+    child.once("error", () => {
+      this.#handleTransportFailure(child, "Codex App Server process failed to start.");
+    });
+    child.once("exit", (code, signal) => {
+      this.#handleProcessExit(child, code, signal);
     });
 
-    this.process.stderr.setEncoding("utf8");
-    this.process.stderr.on("data", (chunk) => this.emit("stderr", chunk));
-    this.process.once("exit", (code, signal) => {
-      const error = new Error(
-        `Codex App Server exited unexpectedly (code=${code}, signal=${signal}).`,
-      );
-      for (const pending of this.pendingRequests.values()) {
-        pending.reject(error);
-      }
-      this.pendingRequests.clear();
-      this.emit("exit", { code, signal });
-    });
-
-    this.reader = readline.createInterface({ input: this.process.stdout });
+    this.reader = readline.createInterface({ input: child.stdout });
     this.reader.on("line", (line) => this.#handleLine(line));
 
-    await this.request("initialize", {
-      clientInfo: {
-        name: "codex_douyin_friend",
-        title: "Codex Douyin Friend",
-        version: "0.1.0",
-      },
-    });
-    this.notify("initialized", {});
+    try {
+      await this.request("initialize", {
+        clientInfo: {
+          name: "codex_douyin_friend",
+          title: "Codex Douyin Friend",
+          version: "0.1.0",
+        },
+      });
+      this.notify("initialized", {});
+    } catch (error) {
+      this.#disposeProcess(child, "Codex App Server initialization failed.");
+      throw error;
+    }
+  }
+
+  #handleTransportFailure(child, message) {
+    if (!this.#clearProcess(child, new Error(message))) return;
+    child.kill?.();
+    this.emit("exit", { code: null, signal: "transport-error" });
+  }
+
+  #handleProcessExit(child, code, signal) {
+    const error = new Error(
+      `Codex App Server exited unexpectedly (code=${code}, signal=${signal}).`,
+    );
+    if (!this.#clearProcess(child, error)) return;
+    this.emit("exit", { code, signal });
+  }
+
+  #clearProcess(child, error) {
+    if (this.process !== child) return false;
+    this.process = null;
+    this.reader?.close();
+    this.reader = null;
+    this.#rejectPending(error);
+    return true;
+  }
+
+  #disposeProcess(child, message) {
+    this.#clearProcess(child, new Error(message));
+    try {
+      child.stdin?.end();
+    } catch {
+      // The failed transport is already unusable.
+    }
+    child.kill?.();
+  }
+
+  #rejectPending(error) {
+    for (const pending of this.pendingRequests.values()) pending.reject(error);
+    this.pendingRequests.clear();
+  }
+
+  #writePayload(child, payload) {
+    if (this.process !== child || !child.stdin?.writable) {
+      throw new Error("Codex App Server is not running.");
+    }
+    try {
+      child.stdin.write(`${JSON.stringify(payload)}\n`, "utf8", (error) => {
+        if (error) this.#handleTransportFailure(child, "Codex App Server input stream failed.");
+      });
+    } catch {
+      this.#handleTransportFailure(child, "Codex App Server input stream failed.");
+      throw new Error("Codex App Server input stream failed.");
+    }
   }
 
   request(method, params = {}, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
-    if (!this.process?.stdin?.writable) {
+    const child = this.process;
+    if (!child?.stdin?.writable) {
       return Promise.reject(new Error("Codex App Server is not running."));
     }
 
@@ -118,15 +195,21 @@ export class CodexAppServerClient extends EventEmitter {
         },
       });
 
-      this.process.stdin.write(`${JSON.stringify(payload)}\n`, "utf8");
+      try {
+        this.#writePayload(child, payload);
+      } catch (error) {
+        this.pendingRequests.get(id)?.reject(error);
+        this.pendingRequests.delete(id);
+      }
     });
   }
 
   notify(method, params = {}) {
-    if (!this.process?.stdin?.writable) {
+    const child = this.process;
+    if (!child?.stdin?.writable) {
       throw new Error("Codex App Server is not running.");
     }
-    this.process.stdin.write(`${JSON.stringify({ method, params })}\n`, "utf8");
+    this.#writePayload(child, { method, params });
   }
 
   async startThread({ cwd, model, ephemeral = true }) {
@@ -165,75 +248,104 @@ export class CodexAppServerClient extends EventEmitter {
     timeoutMs = DEFAULT_TURN_TIMEOUT_MS,
   }) {
     const chunks = [];
+    const bufferedNotifications = [];
+    let expectedTurnId = null;
 
-    return new Promise(async (resolve, reject) => {
-      const timeout = setTimeout(() => {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(timeout);
+        this.off("notification", onNotification);
+        this.off("exit", onExit);
+      };
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
         cleanup();
-        reject(new Error("Timed out waiting for turn/completed."));
+        callback(value);
+      };
+      const timeout = setTimeout(() => {
+        finish(reject, new Error("Timed out waiting for turn/completed."));
       }, timeoutMs);
-
-      const onNotification = (message) => {
-        if (message?.params?.threadId && message.params.threadId !== threadId) {
-          return;
-        }
-
+      const notificationTurnId = (message) => (
+        message?.params?.turnId ?? message?.params?.turn?.id ?? null
+      );
+      const consumeNotification = (message) => {
+        if (notificationTurnId(message) !== expectedTurnId) return;
         if (message.method === "item/agentMessage/delta") {
           const delta = message.params?.delta;
           if (typeof delta === "string") chunks.push(delta);
         }
-
         if (message.method === "item/completed") {
           const completedText = extractAgentText(message.params?.item);
           if (completedText && chunks.length === 0) chunks.push(completedText);
         }
-
-        if (message.method === "turn/completed") {
-          cleanup();
-          const status = message.params?.turn?.status;
-          if (status && status !== "completed") {
-            reject(new Error(`Codex turn ended with status ${status}.`));
+        if (message.method !== "turn/completed") return;
+        const status = message.params?.turn?.status;
+        if (status && status !== "completed") {
+          finish(reject, new Error(`Codex turn ended with status ${status}.`));
+          return;
+        }
+        finish(resolve, chunks.join(""));
+      };
+      const onNotification = (message) => {
+        if (message?.params?.threadId !== threadId) return;
+        if (!expectedTurnId) {
+          if (bufferedNotifications.length >= 256) {
+            finish(reject, new Error("Too many Codex notifications arrived before turn/start completed."));
             return;
           }
-          resolve(chunks.join(""));
+          bufferedNotifications.push(message);
+          return;
         }
+        consumeNotification(message);
       };
-
-      const cleanup = () => {
-        clearTimeout(timeout);
-        this.off("notification", onNotification);
+      const onExit = () => {
+        finish(reject, new Error("Codex App Server exited before the turn completed."));
       };
 
       this.on("notification", onNotification);
-      try {
-        const params = {
-          threadId,
-          input: input ?? [{ type: "text", text }],
-        };
-        if (model) params.model = model;
-        if (effort) params.effort = effort;
-        await this.request("turn/start", params);
-      } catch (error) {
-        cleanup();
-        reject(error);
-      }
+      this.on("exit", onExit);
+      const params = {
+        threadId,
+        input: input ?? [{ type: "text", text }],
+      };
+      if (model) params.model = model;
+      if (effort) params.effort = effort;
+      this.request("turn/start", params).then((result) => {
+        expectedTurnId = result?.turn?.id ?? null;
+        if (!expectedTurnId) {
+          finish(reject, new Error("turn/start did not return a turn id."));
+          return;
+        }
+        for (const message of bufferedNotifications.splice(0)) {
+          if (settled) break;
+          consumeNotification(message);
+        }
+      }, (error) => finish(reject, error));
     });
   }
 
   async close() {
-    if (!this.process) return;
-    this.reader?.close();
-    this.process.stdin.end();
+    const child = this.process;
+    if (!child) return;
+    this.#clearProcess(child, new Error("Codex App Server client was closed."));
+    try {
+      child.stdin.end();
+    } catch {
+      child.kill?.();
+      return;
+    }
     await new Promise((resolve) => {
       const timer = setTimeout(() => {
-        this.process?.kill();
+        child.kill?.();
         resolve();
       }, 2_000);
-      this.process.once("exit", () => {
+      child.once("exit", () => {
         clearTimeout(timer);
         resolve();
       });
     });
-    this.process = null;
   }
 
   #handleLine(line) {

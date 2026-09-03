@@ -223,3 +223,30 @@ test("stops cooperatively through the bridge control channel", async (t) => {
   assert.equal(supervisor.getStatus().phase, "paused");
   assert.equal(supervisor.getStatus().bridge, "offline");
 });
+
+test("rejects process and thread controls while automatic compaction is active", async (t) => {
+  const root = await temporaryRoot(t);
+  const child = new FakeChild();
+  const supervisor = await createDouyinSupervisor({
+    projectRoot: root,
+    nodePath: process.execPath,
+    fetchFn: readyFetch,
+    spawnProcess: () => child,
+  });
+  await supervisor.start();
+  child.stdout.write('{"event":"bridge-ready","audioEnabled":true}\n');
+  child.stdout.write('{"event":"bridge-status","phase":"compacting"}\n');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const permissions = supervisor.getStatus().actionPermissions;
+  assert.equal(permissions.pause, false);
+  assert.equal(permissions.stop, false);
+  assert.equal(permissions.reconnect, false);
+  assert.equal(permissions.rotateThread, false);
+  await assert.rejects(supervisor.pause(), /not allowed while phase is compacting/u);
+  await assert.rejects(supervisor.stop(), /not allowed while phase is compacting/u);
+
+  child.stdout.write('{"event":"bridge-status","phase":"listening"}\n');
+  child.emit("exit", 0, null);
+  await supervisor.close();
+});

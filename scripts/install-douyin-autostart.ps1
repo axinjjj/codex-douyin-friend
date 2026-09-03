@@ -62,7 +62,7 @@ Register-ScheduledTask `
   -Trigger $trigger `
   -Principal $principal `
   -Settings $settings `
-  -Description "Runs the local-only Codex Douyin friend bridge after user logon." `
+  -Description "Runs the locally controlled Codex Douyin friend bridge after user logon." `
   -Force | Out-Null
 
 $registered = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop

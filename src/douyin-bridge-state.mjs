@@ -330,6 +330,12 @@ export function findAppendedMessages(previousSnapshot, currentSnapshot) {
 
   if (appendedCount === 0
       && previous.messages.length === current.messages.length
+      && previous.messages.every((message, index) => sameMessage(message, current.messages[index]))) {
+    return [];
+  }
+
+  if (appendedCount === 0
+      && previous.messages.length === current.messages.length
       && current.messages.length >= 3) {
     let overlapCount = 0;
     for (let candidate = current.messages.length - 1; candidate >= 2; candidate -= 1) {

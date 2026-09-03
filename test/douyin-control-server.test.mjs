@@ -50,8 +50,10 @@ test("serves a localhost-only dashboard without private conversation state", asy
   const pageText = await page.text();
   assert.match(pageText, /Codex · 抖音桥/u);
   assert.match(pageText, /允许模型给媒体点赞/u);
+  assert.match(pageText, /保留在持久 Codex 任务/u);
   const appText = await (await fetch(`${url}/app.js`)).text();
   assert.match(appText, /queued:"排队处理中"/u);
+  assert.match(appText, /产品数据设置约束/u);
 
   const status = await (await fetch(`${url}/api/status`)).json();
   assert.equal(status.phase, "listening");

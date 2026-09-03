@@ -4,7 +4,11 @@ import {
   instructionSourcesContain,
 } from "./codex-app-server-client.mjs";
 import { buildChatMessageMetadataExpression, normalizeOutboundText } from "./douyin-chat-page.mjs";
-import { focusAndClearChatEditor, replaceChatEditorText } from "./douyin-editor-control.mjs";
+import {
+  focusAndClearChatEditor,
+  replaceChatEditorText,
+  verifyChatEditorReady,
+} from "./douyin-editor-control.mjs";
 import { findExpectedNewOutgoingMessage } from "./douyin-chat-snapshot.mjs";
 import { computeTextMessageFingerprint } from "./douyin-bridge-state.mjs";
 import { MAX_FINAL_FRAME_COUNT } from "./video-frame-selection.mjs";
@@ -430,6 +434,8 @@ export async function generateDouyinImageReply({
   imagePaths,
   mediaType = "chat_image",
   totalImageCount = imagePaths?.length,
+  requestedImageCount = imagePaths?.length,
+  partial = false,
   inboundText = null,
   sharedComment = null,
   mediaReactionEnabled = false,
@@ -453,8 +459,11 @@ export async function generateDouyinImageReply({
     : mediaType === "shared_cover"
       ? "聊天对方刚在抖音中分享了一条作品，但当前登录态拿不到作品详情；下面只提供了分享卡片封面。"
       : "聊天对方刚在抖音中直接发来了一张聊天图片。";
-  const samplingBoundary = mediaType === "image_post" && totalImageCount > imagePaths.length
-    ? `原作品共有 ${totalImageCount} 张图，目前只提供了按时间均匀选取的 ${imagePaths.length} 张；不要声称看见了未提供的图片。`
+  const samplingBoundary = mediaType === "image_post" && totalImageCount > requestedImageCount
+    ? `原作品共有 ${totalImageCount} 张图，本次只选取了按时间均匀分布的 ${requestedImageCount} 张；不要声称看见了未选取的图片。`
+    : null;
+  const partialBoundary = mediaType === "image_post" && partial
+    ? `本次有界下载在选取的 ${requestedImageCount} 张图片中成功取得 ${imagePaths.length} 张；下面只包含成功取得的图片并保留原相对顺序，不要声称看见了缺失图片。`
     : null;
   const coverBoundary = mediaType === "shared_cover"
     ? [
@@ -478,6 +487,7 @@ export async function generateDouyinImageReply({
     text: [
       description,
       ...(samplingBoundary ? [samplingBoundary] : []),
+      ...(partialBoundary ? [partialBoundary] : []),
       ...(coverBoundary ? [coverBoundary] : []),
       ...sharedCommentLines,
       ...inboundTextLines,
@@ -501,6 +511,7 @@ export async function sendAndVerifyDouyinReply({
   cdp,
   reply,
   beforeSend,
+  expectedChatFingerprint,
   shouldStop = () => false,
   canSend = async () => true,
 }) {
@@ -526,6 +537,19 @@ export async function sendAndVerifyDouyinReply({
         ? "Bridge stop requested before Enter; the editor was cleared."
         : "The active Douyin chat changed before Enter; refusing to touch the new editor.",
       sendStillSafe ? "stop" : "chat-changed",
+    );
+  }
+  const editorAuthority = await verifyChatEditorReady(cdp, {
+    expectedText: reply,
+    expectedChatFingerprint,
+  });
+  if (!editorAuthority?.ok) {
+    if (editorAuthority?.chatMatches && editorAuthority?.canClear) {
+      await focusAndClearChatEditor(cdp).catch(() => {});
+    }
+    throw new DouyinSendAbortedError(
+      "Douyin editor authority was lost before Enter; refusing to send.",
+      "editor-authority-lost",
     );
   }
   await cdp.request("Input.dispatchKeyEvent", {

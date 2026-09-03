@@ -195,6 +195,29 @@ test("waits for both the contextCompaction item and its completed turn", async (
   manager.close();
 });
 
+test("reports one operation boundary for automatic and manual compaction", async () => {
+  const codex = new FakeCodex();
+  const phases = [];
+  const manager = new CodexContextCompactionManager({
+    codex,
+    threadId: "thread-1",
+    cooldownMs: 0,
+    onOperationStart: ({ trigger }) => phases.push(`start:${trigger}`),
+    onOperationEnd: ({ trigger }) => phases.push(`end:${trigger}`),
+  });
+  emitUsage(codex, 900);
+  assert.equal((await manager.maybeCompact()).action, "compacted");
+  emitUsage(codex, 500);
+  assert.equal((await manager.compactNow()).action, "compacted");
+  assert.deepEqual(phases, [
+    "start:threshold",
+    "end:threshold",
+    "start:manual",
+    "end:manual",
+  ]);
+  manager.close();
+});
+
 test("times out when the official compaction lifecycle never completes", async () => {
   const codex = new FakeCodex();
   codex.emitCompactionLifecycle = false;

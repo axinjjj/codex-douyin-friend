@@ -101,6 +101,7 @@ test("send aborts before touching the editor when shutdown was requested", async
       cdp: {},
       reply: "not sent",
       beforeSend: { messageCount: 0, messages: [] },
+      expectedChatFingerprint: "a".repeat(64),
       shouldStop: () => true,
     }),
     DouyinSendAbortedError,
@@ -123,12 +124,49 @@ test("send refuses Enter when the active chat changes after editor insertion", a
       cdp,
       reply: "not sent",
       beforeSend: { messageCount: 0, messages: [] },
+      expectedChatFingerprint: "a".repeat(64),
       canSend: async () => {
         safetyChecks += 1;
         return safetyChecks === 1;
       },
     }),
     (error) => error instanceof DouyinSendAbortedError && error.reason === "chat-changed",
+  );
+  assert.equal(
+    requests.some(({ params }) => params?.key === "Enter"),
+    false,
+  );
+});
+
+test("send refuses Enter when atomic editor authority is lost", async () => {
+  const requests = [];
+  let evaluationCount = 0;
+  const cdp = {
+    async evaluate() {
+      evaluationCount += 1;
+      if (evaluationCount <= 2) return { ok: true };
+      return {
+        ok: false,
+        reason: "chat-mismatch",
+        chatMatches: false,
+        canClear: false,
+      };
+    },
+    async request(method, params) {
+      requests.push({ method, params });
+    },
+  };
+  await assert.rejects(
+    () => sendAndVerifyDouyinReply({
+      cdp,
+      reply: "not sent",
+      beforeSend: { messageCount: 0, messages: [] },
+      expectedChatFingerprint: "a".repeat(64),
+    }),
+    (error) => (
+      error instanceof DouyinSendAbortedError
+      && error.reason === "editor-authority-lost"
+    ),
   );
   assert.equal(
     requests.some(({ params }) => params?.key === "Enter"),
@@ -592,7 +630,27 @@ test("states the sampling boundary for a long image post", async () => {
   });
   assert.match(turn.input[0].text, /图文作品/u);
   assert.match(turn.input[0].text, /原作品共有 20 张图/u);
-  assert.match(turn.input[0].text, /不要声称看见了未提供的图片/u);
+  assert.match(turn.input[0].text, /不要声称看见了未选取的图片/u);
+});
+
+test("states the bounded partial-image boundary", async () => {
+  let turn;
+  await generateDouyinImageReply({
+    codex: {
+      async runTurn(value) {
+        turn = value;
+        return "只回应看到的部分";
+      },
+    },
+    threadId: "thread-1",
+    imagePaths: ["C:/runtime/image-02.png"],
+    mediaType: "image_post",
+    totalImageCount: 3,
+    requestedImageCount: 3,
+    partial: true,
+  });
+  assert.match(turn.input[0].text, /选取的 3 张图片中成功取得 1 张/u);
+  assert.match(turn.input[0].text, /不要声称看见了缺失图片/u);
 });
 
 test("states the cover-only boundary and keeps attached text", async () => {
