@@ -6,6 +6,7 @@ import {
   DOUYIN_SHARED_MANIFEST_HANDLER_REGISTRY,
   matchDouyinMediaAdapter,
 } from "../src/douyin-media-pipeline.mjs";
+import { DouyinVideoSourcesExhaustedError } from "../src/douyin-video-runtime.mjs";
 
 const baseContext = Object.freeze({
   cdp: { async evaluate() { throw new Error("Unexpected real CDP read."); } },
@@ -179,6 +180,33 @@ test("preserves an explicit cover boundary only after the bounded player fallbac
   });
   assert.equal(fallbackCalled, true);
   assert.equal(result.kind, "shared_cover");
+});
+
+test("degrades an undecodable full video to its explicit cover instead of passing black frames", async () => {
+  let preparedCover = null;
+  const result = await acquireDouyinMedia({
+    ...baseContext,
+    mediaType: "shared_aweme",
+    dependencies: {
+      readSharedWorkManifest: async () => ({
+        ok: true,
+        mediaType: "video",
+        source: "https://v3-dy.zjcdn.com/video.mp4",
+        sources: ["https://v3-dy.zjcdn.com/video.mp4"],
+        coverSources: ["https://p3.douyinpic.com/video-cover"],
+      }),
+      prepareVideo: async () => {
+        throw new DouyinVideoSourcesExhaustedError(["decode-blank-video-frames"]);
+      },
+      prepareImagePost: async ({ manifest }) => {
+        preparedCover = manifest;
+        return { kind: manifest.mediaType, imagePaths: ["C:/runtime/video-cover.png"] };
+      },
+    },
+  });
+  assert.equal(result.kind, "shared_cover");
+  assert.equal(preparedCover.originalMediaType, "video");
+  assert.deepEqual(preparedCover.sources, ["https://p3.douyinpic.com/video-cover"]);
 });
 
 test("fails closed on an unregistered media type without touching acquisition dependencies", async () => {

@@ -85,7 +85,13 @@ export function resolveDouyinSharedWorkManifest({ detail = null, parsedContent =
     if (!parsed || seen.has(parsed) || depth > MAX_DEPTH || visited >= MAX_VISITED_OBJECTS) return;
     seen.add(parsed);
     visited += 1;
-    for (const key of Object.keys(parsed).slice(0, 80)) {
+    const keys = Object.keys(parsed);
+    const priorityKey = /^(?:video|video_info|videoInfo|images|image_list|imageList|photos|photo_list|photoList|image|photo|cover_url_v2|coverUrlV2|cover_url|coverUrl|content_thumb|contentThumb|image_count|imageCount|pic_count|picCount|photo_count|photoCount|aweType|awe_type|awemeType|aweme_type|aweme_detail|awemeDetail|aweme_info|awemeInfo|im_dynamic_patch|imDynamicPatch|raw_data|rawData|dynamic_card_data|dynamicCardData|card_data|cardData)$/u;
+    const boundedKeys = [...new Set([
+      ...keys.filter((key) => priorityKey.test(key)),
+      ...keys.slice(0, 80),
+    ])].slice(0, 160);
+    for (const key of boundedKeys) {
       const child = parseBoundedObject(parsed[key]) ?? parsed[key];
       if (["video", "video_info", "videoInfo"].includes(key) && child && typeof child === "object") {
         videoObjects.push(child);
@@ -144,6 +150,7 @@ export function resolveDouyinSharedWorkManifest({ detail = null, parsedContent =
     ...defaultVideoSources,
   ]).slice(0, MAX_VIDEO_SOURCES);
   if (compatibleVideoSources.length > 0) {
+    const coverSources = unique(covers).slice(0, 4);
     return {
       ok: true,
       mediaType: "video",
@@ -152,6 +159,7 @@ export function resolveDouyinSharedWorkManifest({ detail = null, parsedContent =
       selectedCodec: h264VideoSources.length > 0
         ? "h264"
         : bitRateVideoSources.length > 0 ? "bit-rate-compatible" : "default",
+      coverSources,
     };
   }
 

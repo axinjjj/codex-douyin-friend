@@ -7,6 +7,8 @@ import {
   buildReadOpenSharedWorkVideoExpression,
 } from "./douyin-chat-page.mjs";
 import {
+  assertCapturedVideoFrame,
+  assertUsableVideoFrameVisuals,
   buildCaptureFrameExpression,
   buildScanFrameSignaturesExpression,
   createVideoAnalysisJob,
@@ -137,6 +139,7 @@ export async function prepareOpenDouyinPlayerVideo({
     if (!scan?.ok || !Array.isArray(scan.samples) || scan.samples.length === 0) {
       throw new Error(`Could not scan the open Douyin player: ${scan?.reason || "unknown"}.`);
     }
+    const scanVisuals = assertUsableVideoFrameVisuals(scan.samples, "blank-open-player-scan");
     const selection = selectAdaptiveFrameSamples({
       samples: scan.samples,
       durationSeconds: state.duration,
@@ -154,6 +157,7 @@ export async function prepareOpenDouyinPlayerVideo({
     const captureDeadline = Date.now() + boundedCaptureWallTimeMs;
     const framePaths = [];
     const frameTimes = [];
+    const capturedFrames = [];
     let totalFrameBytes = 0;
     for (const selected of selection.selected) {
       if (Date.now() >= captureDeadline) {
@@ -172,6 +176,7 @@ export async function prepareOpenDouyinPlayerVideo({
         frame.dataUrl.slice("data:image/png;base64,".length),
         "base64",
       );
+      assertCapturedVideoFrame(frame, frameBytes);
       if (frameBytes.byteLength === 0 || frameBytes.byteLength > MAX_FRAME_BYTES) {
         throw new Error("An open-player keyframe violated its byte limit.");
       }
@@ -187,7 +192,12 @@ export async function prepareOpenDouyinPlayerVideo({
       await stat(framePath);
       framePaths.push(framePath);
       frameTimes.push(selected.time);
+      capturedFrames.push(frame);
     }
+    const captureVisuals = assertUsableVideoFrameVisuals(
+      capturedFrames,
+      "blank-open-player-frames",
+    );
     return {
       ...job,
       framePaths,
@@ -213,6 +223,8 @@ export async function prepareOpenDouyinPlayerVideo({
         audioAnchorCount: 0,
         sceneThreshold: selection.sceneThreshold,
         totalFrameBytes,
+        blankScanFrameCount: scanVisuals.blankFrameCount,
+        blankCapturedFrameCount: captureVisuals.blankFrameCount,
       },
     };
   } catch (error) {

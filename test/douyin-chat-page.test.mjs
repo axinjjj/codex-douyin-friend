@@ -319,6 +319,8 @@ test("shared-work inspection distinguishes videos from ordered image posts", () 
   assert.match(expression, /bit_rate/u);
   assert.match(expression, /bitRate/u);
   assert.match(expression, /MAX_VIDEO_SOURCES/u);
+  assert.match(expression, /priorityKey/u);
+  assert.match(expression, /keys\.filter/u);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
   assert.doesNotMatch(expression, /return \{[^}]*itemId/u);
 
@@ -401,6 +403,23 @@ test("resolves single-image, multi-image, video, and cover-only shared works", (
   });
   assert.equal(video.mediaType, "video");
   assert.equal(video.sources.length, 1);
+
+  const lateVideoDetail = Object.fromEntries(
+    Array.from({ length: 140 }, (_, index) => [`unrelated_${index}`, index]),
+  );
+  lateVideoDetail.cover_url = { url_list: ["https://p3.douyinpic.com/video-cover"] };
+  lateVideoDetail.video = {
+    play_addr_h264: { url_list: ["https://v3.douyinvod.com/late-h264"] },
+    play_addr: { url_list: ["https://v3.douyinvod.com/late-default"] },
+  };
+  const lateVideo = resolveDouyinSharedWorkManifest({ detail: lateVideoDetail });
+  assert.equal(lateVideo.mediaType, "video");
+  assert.equal(lateVideo.selectedCodec, "h264");
+  assert.deepEqual(lateVideo.sources, [
+    "https://v3.douyinvod.com/late-h264",
+    "https://v3.douyinvod.com/late-default",
+  ]);
+  assert.deepEqual(lateVideo.coverSources, ["https://p3.douyinpic.com/video-cover"]);
 
   const cover = resolveDouyinSharedWorkManifest({
     parsedContent: {

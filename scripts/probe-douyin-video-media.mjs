@@ -12,10 +12,15 @@ import {
   extractVideoMedia,
   removeVideoAnalysisJob,
 } from "../src/douyin-video-runtime.mjs";
+import {
+  resolveOptionalSenseVoiceRuntime,
+  transcribeSenseVoiceAudio,
+} from "../src/sensevoice-runtime.mjs";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(scriptDirectory, "..");
 const port = Number.parseInt(process.env.DOUYIN_DEBUG_PORT || "9229", 10);
+const senseVoice = await resolveOptionalSenseVoiceRuntime({ projectRoot });
 await cleanupStaleVideoAnalysisJobs(projectRoot);
 const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
   signal: AbortSignal.timeout(3_000),
@@ -38,6 +43,8 @@ try {
 }
 
 const job = await createVideoAnalysisJob(projectRoot);
+let report;
+let cleanupCompleted = false;
 try {
   const download = await downloadCompatibleDouyinVideo({ sourceResult, destination: job.videoPath });
   const media = await extractVideoMedia({
@@ -45,8 +52,15 @@ try {
     videoPath: job.videoPath,
     audioPath: job.audioPath,
     outputDirectory: job.jobDirectory,
+    analyzeAudio: senseVoice.enabled
+      ? ({ audioPath, timeoutMs }) => transcribeSenseVoiceAudio({
+        audioPath,
+        projectRoot,
+        timeoutMs,
+      })
+      : null,
   });
-  console.log(JSON.stringify({
+  report = {
     ok: true,
     byteCount: download.byteCount,
     contentType: download.contentType,
@@ -56,13 +70,20 @@ try {
     audioAvailable: media.audioAvailable,
     audioDurationSeconds: media.audioDuration == null ? null : Math.round(media.audioDuration * 10) / 10,
     audioTruncated: media.audioTruncated,
+    audioUnderstandingProcessed: Boolean(media.audioUnderstanding?.processed),
+    transcriptLength: media.audioUnderstanding?.transcript?.length || 0,
+    audioTimingSource: media.audioUnderstanding?.timingSource || null,
     frameBudget: media.sampling.frameBudget,
     scanSampleCount: media.sampling.completedScanCount,
     scanTruncated: media.sampling.scanTruncated,
+    blankScanFrameCount: media.sampling.blankScanFrameCount,
+    blankCapturedFrameCount: media.sampling.blankCapturedFrameCount,
     totalFrameBytes: media.sampling.totalFrameBytes,
-  }));
+  };
 } finally {
   if (process.env.DOUYIN_KEEP_VIDEO_PROBE !== "true") {
     await removeVideoAnalysisJob(projectRoot, job.jobDirectory);
+    cleanupCompleted = true;
   }
 }
+console.log(JSON.stringify({ ...report, cleanupCompleted }));

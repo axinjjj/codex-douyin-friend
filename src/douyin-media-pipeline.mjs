@@ -4,7 +4,10 @@ import {
   prepareDouyinImagePost,
 } from "./douyin-image-runtime.mjs";
 import { resolveDouyinSharedWorkPlayerFallback } from "./douyin-player-runtime.mjs";
-import { prepareLatestDouyinVideoMedia } from "./douyin-video-runtime.mjs";
+import {
+  DouyinVideoSourcesExhaustedError,
+  prepareLatestDouyinVideoMedia,
+} from "./douyin-video-runtime.mjs";
 
 const directImageAdapter = Object.freeze({
   key: "direct-image",
@@ -78,6 +81,18 @@ async function acquireSharedWork(context, dependencies) {
   if (!manifest?.ok) {
     throw new Error(`The shared Douyin work is unavailable: ${manifest?.reason || "unknown"}.`);
   }
+  let coverFallback = manifest.mediaType === "shared_cover" ? manifest : null;
+  if (!coverFallback && Array.isArray(manifest.coverSources) && manifest.coverSources.length > 0) {
+    coverFallback = {
+      ok: true,
+      mediaType: "shared_cover",
+      sources: [manifest.coverSources[0]],
+      sourceCandidates: [manifest.coverSources.slice(0, 4)],
+      totalImageCount: 1,
+      sampled: false,
+      originalMediaType: "video",
+    };
+  }
   if (manifest.mediaType === "shared_cover") {
     const fallback = await dependencies.resolvePlayerFallback({
       cdp: context.cdp,
@@ -98,7 +113,12 @@ async function acquireSharedWork(context, dependencies) {
     "prepare",
   );
   if (!handler) throw new Error("The shared Douyin work type is unsupported.");
-  return handler.prepare(context, dependencies, manifest);
+  try {
+    return await handler.prepare(context, dependencies, manifest);
+  } catch (error) {
+    if (!(error instanceof DouyinVideoSourcesExhaustedError) || !coverFallback) throw error;
+    return coverManifestHandler.prepare(context, dependencies, coverFallback);
+  }
 }
 
 const sharedWorkAdapter = Object.freeze({

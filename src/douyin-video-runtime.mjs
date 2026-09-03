@@ -63,6 +63,61 @@ export class DouyinVideoDecodeError extends Error {
   }
 }
 
+export class DouyinVideoSourcesExhaustedError extends Error {
+  constructor(failures = []) {
+    const safeFailures = Array.isArray(failures)
+      ? failures.filter((value) => /^[a-z0-9-]{1,80}$/u.test(value)).slice(0, MAX_VIDEO_SOURCE_CANDIDATES)
+      : [];
+    super(`Every compatible Douyin video source failed (${safeFailures.join(",") || "wall-time"}).`);
+    this.name = "DouyinVideoSourcesExhaustedError";
+    this.failures = safeFailures;
+  }
+}
+
+function isValidFrameVisual(visual) {
+  return visual && Number.isSafeInteger(visual.pixelCount) && visual.pixelCount > 0
+    && Number.isFinite(visual.meanLuminance)
+    && visual.meanLuminance >= 0 && visual.meanLuminance <= 255
+    && Number.isFinite(visual.maxLuminance)
+    && visual.maxLuminance >= 0 && visual.maxLuminance <= 255
+    && Number.isFinite(visual.nonBlackRatio)
+    && visual.nonBlackRatio >= 0 && visual.nonBlackRatio <= 1;
+}
+
+export function assertUsableVideoFrameVisuals(samples, reason = "blank-video-frames") {
+  if (!Array.isArray(samples) || samples.length === 0
+      || samples.some((sample) => !isValidFrameVisual(sample?.visual))) {
+    throw new DouyinVideoDecodeError("invalid-frame-visuals");
+  }
+  const blankFrameCount = samples.filter(({ visual }) => (
+    visual.maxLuminance <= 4 && visual.nonBlackRatio <= 0.0001
+  )).length;
+  if (blankFrameCount === samples.length) throw new DouyinVideoDecodeError(reason);
+  return { blankFrameCount, usableFrameCount: samples.length - blankFrameCount };
+}
+
+function assertCanvasPng(frameBytes, expectedWidth, expectedHeight) {
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (frameBytes.byteLength < 33 || !frameBytes.subarray(0, 8).equals(signature)
+      || frameBytes.toString("ascii", 12, 16) !== "IHDR") {
+    throw new DouyinVideoDecodeError("invalid-frame-png");
+  }
+  const width = frameBytes.readUInt32BE(16);
+  const height = frameBytes.readUInt32BE(20);
+  if (width !== expectedWidth || height !== expectedHeight || width < 2 || height < 2) {
+    throw new DouyinVideoDecodeError("invalid-frame-dimensions");
+  }
+}
+
+export function assertCapturedVideoFrame(frame, frameBytes) {
+  if (!frame || !Number.isSafeInteger(frame.width) || frame.width < 2
+      || !Number.isSafeInteger(frame.height) || frame.height < 2
+      || !Buffer.isBuffer(frameBytes) || !isValidFrameVisual(frame.visual)) {
+    throw new DouyinVideoDecodeError("invalid-frame-visuals");
+  }
+  assertCanvasPng(frameBytes, frame.width, frame.height);
+}
+
 export function isTrustedDouyinMediaUrl(value) {
   try {
     const url = new URL(value);
@@ -443,9 +498,7 @@ export async function downloadCompatibleDouyinVideo({
       await cleanupFn();
     }
   }
-  throw new Error(
-    `Every compatible Douyin video source failed (${failures.join(",") || "wall-time"}).`,
-  );
+  throw new DouyinVideoSourcesExhaustedError(failures);
 }
 
 async function cleanupVideoCandidateArtifacts(job) {
@@ -838,6 +891,7 @@ export function buildExtractAudioExpression({
 async function waitForLocalVideo(pageCdp, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   let lastState = null;
+  let frameUnavailableSince = null;
   while (Date.now() < deadline) {
     const state = await pageCdp.evaluate(`(() => {
       const video = document.querySelector('video');
@@ -848,7 +902,9 @@ async function waitForLocalVideo(pageCdp, timeoutMs = 20_000) {
         errorCode: null,
       };
       return {
-        ready: video.readyState >= 2 && Number.isFinite(video.duration) && video.duration > 0,
+        ready: video.readyState >= 2 && Number.isFinite(video.duration) && video.duration > 0
+          && Number.isFinite(video.videoWidth) && video.videoWidth >= 2
+          && Number.isFinite(video.videoHeight) && video.videoHeight >= 2,
         documentReadyState: document.readyState,
         videoFound: true,
         readyState: video.readyState,
@@ -862,9 +918,27 @@ async function waitForLocalVideo(pageCdp, timeoutMs = 20_000) {
     lastState = state;
     if (state?.errorCode) throw new DouyinVideoDecodeError(`media-error-${state.errorCode}`);
     if (state?.ready) return state;
+    const hasBufferedMediaWithoutFrames = state?.readyState >= 3
+      && Number.isFinite(state?.duration) && state.duration > 0
+      && (!Number.isFinite(state?.videoWidth) || state.videoWidth < 2
+        || !Number.isFinite(state?.videoHeight) || state.videoHeight < 2);
+    if (hasBufferedMediaWithoutFrames) {
+      frameUnavailableSince ??= Date.now();
+      if (Date.now() - frameUnavailableSince >= 1_500) {
+        throw new DouyinVideoDecodeError("video-frames-unavailable");
+      }
+    } else {
+      frameUnavailableSince = null;
+    }
     await sleep(200);
   }
-  throw new DouyinVideoDecodeError(lastState?.videoFound ? "decode-timeout" : "video-missing");
+  const reason = lastState?.videoFound
+    && Number.isFinite(lastState?.duration) && lastState.duration > 0
+    && (!Number.isFinite(lastState?.videoWidth) || lastState.videoWidth < 2
+      || !Number.isFinite(lastState?.videoHeight) || lastState.videoHeight < 2)
+    ? "video-frames-unavailable"
+    : lastState?.videoFound ? "decode-timeout" : "video-missing";
+  throw new DouyinVideoDecodeError(reason);
 }
 
 export function buildScanFrameSignaturesExpression(times, {
@@ -896,7 +970,9 @@ export function buildScanFrameSignaturesExpression(times, {
     : "video";
   return `(async () => {
     const video = document.querySelector(${JSON.stringify(safeVideoSelector)});
-    if (!video || !Number.isFinite(video.duration) || video.duration <= 0) {
+    if (!video || !Number.isFinite(video.duration) || video.duration <= 0
+        || !Number.isFinite(video.videoWidth) || video.videoWidth < 2
+        || !Number.isFinite(video.videoHeight) || video.videoHeight < 2) {
       return { ok: false, reason: 'video-not-ready', samples: [] };
     }
     video.muted = true;
@@ -925,6 +1001,24 @@ export function buildScanFrameSignaturesExpression(times, {
         video.currentTime = target;
       });
     };
+    const waitForPresentedFrame = async () => {
+      if (typeof video.requestVideoFrameCallback === 'function') {
+        await new Promise((resolve) => {
+          let callbackId = null;
+          const timer = setTimeout(() => {
+            if (callbackId !== null && typeof video.cancelVideoFrameCallback === 'function') {
+              video.cancelVideoFrameCallback(callbackId);
+            }
+            resolve();
+          }, 300);
+          callbackId = video.requestVideoFrameCallback(() => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+      }
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    };
     const capture = async (requestedTime, captureDeadline = deadline) => {
       const target = Math.min(Math.max(0, requestedTime), Math.max(0, video.duration - 0.05));
       const remainingBeforeRender = captureDeadline - performance.now() - 250;
@@ -935,21 +1029,37 @@ export function buildScanFrameSignaturesExpression(times, {
         failedSeekCount += 1;
         return null;
       }
-      await Promise.race([
-        new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
-        new Promise((resolve) => setTimeout(resolve, 250)),
-      ]);
+      await waitForPresentedFrame();
+      if (video.videoWidth < 2 || video.videoHeight < 2) return null;
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
       const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
       const signature = [];
+      let luminanceSum = 0;
+      let maxLuminance = 0;
+      let nonBlackPixels = 0;
       for (let offset = 0; offset < pixels.length; offset += 4) {
+        const luminance = (77 * pixels[offset] + 150 * pixels[offset + 1]
+          + 29 * pixels[offset + 2]) >> 8;
+        luminanceSum += luminance;
+        maxLuminance = Math.max(maxLuminance, luminance);
+        if (luminance > 8) nonBlackPixels += 1;
         signature.push(
           Math.max(0, Math.min(15, Math.round(pixels[offset] / 17))),
           Math.max(0, Math.min(15, Math.round(pixels[offset + 1] / 17))),
           Math.max(0, Math.min(15, Math.round(pixels[offset + 2] / 17)))
         );
       }
-      return { time: target, signature };
+      const pixelCount = canvas.width * canvas.height;
+      return {
+        time: target,
+        signature,
+        visual: {
+          pixelCount,
+          meanLuminance: luminanceSum / pixelCount,
+          maxLuminance,
+          nonBlackRatio: nonBlackPixels / pixelCount,
+        },
+      };
     };
 
     if (requestedTimes.length === 0) {
@@ -1000,7 +1110,9 @@ export function buildCaptureFrameExpression(
     : "video";
   return `(async () => {
     const video = document.querySelector(${JSON.stringify(safeVideoSelector)});
-    if (!video || !Number.isFinite(video.duration) || video.duration <= 0) {
+    if (!video || !Number.isFinite(video.duration) || video.duration <= 0
+        || !Number.isFinite(video.videoWidth) || video.videoWidth < 2
+        || !Number.isFinite(video.videoHeight) || video.videoHeight < 2) {
       return { ok: false, reason: 'video-not-ready' };
     }
     video.muted = true;
@@ -1020,10 +1132,25 @@ export function buildCaptureFrameExpression(
         video.currentTime = target;
       });
     }
-    await Promise.race([
-      new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
-      new Promise((resolve) => setTimeout(resolve, 250)),
-    ]);
+    if (typeof video.requestVideoFrameCallback === 'function') {
+      await new Promise((resolve) => {
+        let callbackId = null;
+        const timer = setTimeout(() => {
+          if (callbackId !== null && typeof video.cancelVideoFrameCallback === 'function') {
+            video.cancelVideoFrameCallback(callbackId);
+          }
+          resolve();
+        }, 300);
+        callbackId = video.requestVideoFrameCallback(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    if (video.videoWidth < 2 || video.videoHeight < 2) {
+      return { ok: false, reason: 'video-frames-unavailable' };
+    }
     const scale = Math.min(
       1,
       ${JSON.stringify(safeMaxDimension)} / video.videoWidth,
@@ -1036,11 +1163,29 @@ export function buildCaptureFrameExpression(
     canvas.height = height;
     const context = canvas.getContext('2d', { alpha: false });
     context.drawImage(video, 0, 0, width, height);
+    const pixels = context.getImageData(0, 0, width, height).data;
+    let luminanceSum = 0;
+    let maxLuminance = 0;
+    let nonBlackPixels = 0;
+    for (let offset = 0; offset < pixels.length; offset += 4) {
+      const luminance = (77 * pixels[offset] + 150 * pixels[offset + 1]
+        + 29 * pixels[offset + 2]) >> 8;
+      luminanceSum += luminance;
+      maxLuminance = Math.max(maxLuminance, luminance);
+      if (luminance > 8) nonBlackPixels += 1;
+    }
+    const pixelCount = width * height;
     return {
       ok: true,
       time: target,
       width,
       height,
+      visual: {
+        pixelCount,
+        meanLuminance: luminanceSum / pixelCount,
+        maxLuminance,
+        nonBlackRatio: nonBlackPixels / pixelCount,
+      },
       dataUrl: canvas.toDataURL('image/png'),
     };
   })()`;
@@ -1188,6 +1333,7 @@ export async function extractVideoMedia({
     if (!scan?.ok || !Array.isArray(scan.samples) || scan.samples.length === 0) {
       throw new Error(`Could not scan video scenes: ${scan?.reason || "unknown"}.`);
     }
+    const scanVisuals = assertUsableVideoFrameVisuals(scan.samples, "blank-video-scan");
     const selection = selectAdaptiveFrameSamples({
       samples: scan.samples,
       durationSeconds: state.duration,
@@ -1220,6 +1366,7 @@ export async function extractVideoMedia({
     );
     const framePaths = [];
     const frameTimes = [];
+    const capturedFrames = [];
     let totalFrameBytes = 0;
     for (const selected of selection.selected) {
       if (Date.now() >= captureDeadline) {
@@ -1236,6 +1383,7 @@ export async function extractVideoMedia({
         frame.dataUrl.slice("data:image/png;base64,".length),
         "base64",
       );
+      assertCapturedVideoFrame(frame, frameBytes);
       if (frameBytes.byteLength > boundedFrameBytes) {
         throw new Error("A captured video keyframe exceeded its byte limit.");
       }
@@ -1250,7 +1398,9 @@ export async function extractVideoMedia({
       await writeFile(framePath, frameBytes, { flag: "wx" });
       framePaths.push(framePath);
       frameTimes.push(selected.time);
+      capturedFrames.push(frame);
     }
+    const captureVisuals = assertUsableVideoFrameVisuals(capturedFrames);
     for (const framePath of framePaths) await stat(framePath);
     return {
       framePaths,
@@ -1275,6 +1425,8 @@ export async function extractVideoMedia({
         audioAnchorCount: audioAnchors.length,
         sceneThreshold: selection.sceneThreshold,
         totalFrameBytes,
+        blankScanFrameCount: scanVisuals.blankFrameCount,
+        blankCapturedFrameCount: captureVisuals.blankFrameCount,
       },
     };
   } catch (error) {

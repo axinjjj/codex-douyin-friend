@@ -26,6 +26,23 @@ const coverManifest = Object.freeze({
   totalImageCount: 1,
 });
 
+function canvasPngFixture(width, height) {
+  const bytes = Buffer.alloc(33);
+  Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(bytes);
+  bytes.writeUInt32BE(13, 8);
+  bytes.write("IHDR", 12, "ascii");
+  bytes.writeUInt32BE(width, 16);
+  bytes.writeUInt32BE(height, 20);
+  return bytes;
+}
+
+const visibleFrame = Object.freeze({
+  pixelCount: 64 * 64,
+  meanLuminance: 96,
+  maxLuminance: 220,
+  nonBlackRatio: 0.9,
+});
+
 function expressionKind(expression) {
   if (expression.includes("removed: false")) return "unguard";
   if (expression.includes("const key = '__codexDouyinSilentMediaV1'")
@@ -236,11 +253,11 @@ test("writes bounded open-player MSE keyframes into a removable video job", asyn
             return {
               ok: true,
               samples: [
-                { time: 0.1, signature: [0, 0, 0, 0, 0, 0] },
-                { time: 1.5, signature: [1, 1, 1, 1, 1, 1] },
-                { time: 3, signature: [8, 8, 8, 8, 8, 8] },
-                { time: 4.5, signature: [9, 9, 9, 9, 9, 9] },
-                { time: 6, signature: [15, 15, 15, 15, 15, 15] },
+                { time: 0.1, signature: [0, 0, 0, 0, 0, 0], visual: visibleFrame },
+                { time: 1.5, signature: [1, 1, 1, 1, 1, 1], visual: visibleFrame },
+                { time: 3, signature: [8, 8, 8, 8, 8, 8], visual: visibleFrame },
+                { time: 4.5, signature: [9, 9, 9, 9, 9, 9], visual: visibleFrame },
+                { time: 6, signature: [15, 15, 15, 15, 15, 15], visual: visibleFrame },
               ],
               failedSeekCount: 0,
               truncated: false,
@@ -253,7 +270,8 @@ test("writes bounded open-player MSE keyframes into a removable video job", asyn
               time: captureIndex,
               width: 64,
               height: 64,
-              dataUrl: `data:image/png;base64,${Buffer.from(`png-${captureIndex}`).toString("base64")}`,
+              visual: visibleFrame,
+              dataUrl: `data:image/png;base64,${canvasPngFixture(64, 64).toString("base64")}`,
             };
           }
           throw new Error("Unexpected capture expression.");

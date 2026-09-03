@@ -6,12 +6,15 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import {
+  assertCapturedVideoFrame,
+  assertUsableVideoFrameVisuals,
   assertVideoAnalysisJobPath,
   buildCaptureFrameExpression,
   buildExtractAudioExpression,
   buildScanFrameSignaturesExpression,
   cleanupStaleVideoAnalysisJobs,
   DouyinVideoDecodeError,
+  DouyinVideoSourcesExhaustedError,
   downloadCompatibleDouyinVideo,
   downloadDouyinVideo,
   isTrustedDouyinMediaUrl,
@@ -19,6 +22,16 @@ import {
   removeVideoAnalysisJob,
   resolveVideoAnalysisRoot,
 } from "../src/douyin-video-runtime.mjs";
+
+function canvasPngFixture(width, height) {
+  const bytes = Buffer.alloc(33);
+  Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(bytes);
+  bytes.writeUInt32BE(13, 8);
+  bytes.write("IHDR", 12, "ascii");
+  bytes.writeUInt32BE(width, 16);
+  bytes.writeUInt32BE(height, 20);
+  return bytes;
+}
 
 function createRequestFn(responseFactory, inspectOptions = () => {}) {
   return (source, options, callback) => {
@@ -99,6 +112,9 @@ test("builds sequential in-memory scene scanning and bounded final capture expre
   assert.doesNotMatch(scanExpression, /toDataURL|fetch\(['"]https?:/u);
   assert.match(scanExpression, /performance\.now\(\) \+ 45000/u);
   assert.match(scanExpression, /boundary-scan-failed/u);
+  assert.match(scanExpression, /requestVideoFrameCallback/u);
+  assert.match(scanExpression, /video\.videoWidth < 2/u);
+  assert.match(scanExpression, /maxLuminance/u);
   assert.match(scanExpression, /ending = await capture\(requestedTimes\.at\(-1\)\)/u);
   const requestedTimes = JSON.parse(/const requestedTimes = (\[[^;]+\]);/u.exec(scanExpression)[1]);
   assert.equal(requestedTimes.length, 72);
@@ -107,10 +123,47 @@ test("builds sequential in-memory scene scanning and bounded final capture expre
   assert.match(captureExpression, /768 \/ video\.videoWidth/u);
   assert.match(captureExpression, /768 \/ video\.videoHeight/u);
   assert.match(captureExpression, /toDataURL\('image\/png'\)/u);
+  assert.match(captureExpression, /requestVideoFrameCallback/u);
+  assert.match(captureExpression, /nonBlackRatio/u);
   const modalCapture = buildCaptureFrameExpression(5, 768, 2_500, {
     videoSelector: ".commonModalFullScreenModalFullScreen video",
   });
   assert.match(modalCapture, /commonModalFullScreenModalFullScreen video/u);
+});
+
+test("rejects dimensionless or all-black video artifacts before Codex can see them", () => {
+  const black = {
+    visual: {
+      pixelCount: 160,
+      meanLuminance: 0,
+      maxLuminance: 0,
+      nonBlackRatio: 0,
+    },
+  };
+  const visible = {
+    visual: {
+      pixelCount: 160,
+      meanLuminance: 42,
+      maxLuminance: 180,
+      nonBlackRatio: 0.75,
+    },
+  };
+  assert.throws(
+    () => assertUsableVideoFrameVisuals([black, black]),
+    (error) => error instanceof DouyinVideoDecodeError && error.reason === "blank-video-frames",
+  );
+  assert.deepEqual(assertUsableVideoFrameVisuals([black, visible]), {
+    blankFrameCount: 1,
+    usableFrameCount: 1,
+  });
+  assert.throws(
+    () => assertCapturedVideoFrame({ width: 1, height: 1, visual: visible.visual }, canvasPngFixture(1, 1)),
+    (error) => error instanceof DouyinVideoDecodeError,
+  );
+  assert.doesNotThrow(() => assertCapturedVideoFrame(
+    { width: 64, height: 64, visual: { ...visible.visual, pixelCount: 64 * 64 } },
+    canvasPngFixture(64, 64),
+  ));
 });
 
 test("caller options cannot raise the 100 MB Douyin download ceiling", async () => {
@@ -374,7 +427,10 @@ test("candidate fallback never deletes an unknown pre-existing destination", asy
       async downloadFn() {
         throw new Error("fixture download failed");
       },
-    }), /Every compatible Douyin video source failed/u);
+    }), (error) => (
+      error instanceof DouyinVideoSourcesExhaustedError
+      && /Every compatible Douyin video source failed/u.test(error.message)
+    ));
     assert.equal(await readFile(destination, "utf8"), "keep");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
