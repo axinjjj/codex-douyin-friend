@@ -71,6 +71,9 @@ test("chat identity returns only a hash", () => {
   assert.match(expression, /SHA-256/);
   assert.match(expression, /opponentUserProfile/);
   assert.match(expression, /sec_uid/);
+  assert.match(expression, /conversationConversationItemcurConversation/u);
+  assert.match(expression, /commonIMAvataravatarContainer/u);
+  assert.match(expression, /memoizedProps\?\.secUid/u);
   assert.doesNotMatch(expression, /slice\(0, 16\)/u);
   assert.doesNotMatch(expression, /return \{ found: true, (title|value)/);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);

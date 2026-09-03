@@ -34,7 +34,7 @@ Build a private, local-only bridge between one Douyin friend account and Codex A
 - The dedicated Edge profile is authenticated, and the current chat input/list/message structure is mapped.
 - One controlled text message completed an inbound/outbound live round trip through Codex App Server.
 - One native shared-video card completed an inbound/outbound live round trip using local H.264 keyframes as Codex `localImage` inputs.
-- The live bridge derives a full SHA-256 chat key from the selected opponent's opaque account id, locks that chat, orders reverse-DOM messages by visual position, and refuses startup when stable identity is unavailable.
+- The live bridge derives a full SHA-256 chat key from the selected opponent's opaque account id, locks that chat, orders reverse-DOM messages by visual position, and refuses startup when stable identity is unavailable. Identity prefers the right-panel profile and narrowly falls back to the selected conversation row's avatar `secUid`; neither path returns the identifier itself.
 - Incoming/outgoing direction is derived from Douyin's stable `isFromMe` DOM marker rather than live horizontal geometry, so background, minimized, or narrow Edge layouts do not collapse every message to the center.
 - Message fingerprints use the stable active content area and exclude both the dynamic time label and the bottom reaction panel, so day-boundary label changes or media likes do not invalidate a persisted append boundary.
 - Each chat key maps to one persistent Codex App Server thread. Restart uses `thread/resume` without reinjecting history; a confirmed missing or incompatible thread starts fresh and seeds visible history once while retaining a reliable message checkpoint.

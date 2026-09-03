@@ -95,6 +95,22 @@ const CHAT_IDENTITY_CAPTURE_SOURCE = `
       }
       identityElement = identityElement.parentElement;
     }
+    if (!opaqueId) {
+      const selectedAvatar = document.querySelector(
+        '.conversationConversationItemcurConversation .commonIMAvataravatarContainer'
+      );
+      const avatarFiberKey = selectedAvatar
+        ? Object.keys(selectedAvatar).find((key) => key.startsWith('__reactFiber$'))
+        : null;
+      let avatarFiber = avatarFiberKey ? selectedAvatar[avatarFiberKey] : null;
+      for (let fiberDepth = 0; avatarFiber && fiberDepth < 8 && !opaqueId;
+        fiberDepth += 1, avatarFiber = avatarFiber.return) {
+        const candidate = avatarFiber.memoizedProps?.secUid;
+        if (typeof candidate === 'string' && candidate.trim().length >= 8) {
+          opaqueId = candidate.trim();
+        }
+      }
+    }
 `;
 
 const MESSAGE_SIDE_CAPTURE_SOURCE = `
