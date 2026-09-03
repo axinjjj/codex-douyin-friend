@@ -42,6 +42,7 @@ function safeStatusEvent(status) {
     model: status.model,
     effort: status.effort,
     sendEnabled: status.sendEnabled,
+    mediaReactionEnabled: status.mediaReactionEnabled,
     lastLatencyMs: status.lastLatencyMs,
     contextUsage: status.contextUsage,
     compaction: status.compaction,

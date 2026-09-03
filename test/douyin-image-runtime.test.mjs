@@ -17,6 +17,7 @@ const ONE_PIXEL_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
   "base64",
 );
+const MINIMAL_WEBP = Buffer.from("524946460400000057454250", "hex");
 
 async function temporaryRoot(t) {
   const root = await mkdtemp(path.join(os.tmpdir(), "douyin-image-"));
@@ -120,7 +121,7 @@ test("decodes a bounded embedded direct chat image before screenshot fallback", 
         assert.match(expression, /currentSrc/u);
         return {
           ok: true,
-          source: `data:image/jpeg;base64,${ONE_PIXEL_PNG.toString("base64")}`,
+          source: `data:image/png;base64,${ONE_PIXEL_PNG.toString("base64")}`,
         };
       },
       async request() {
@@ -131,6 +132,64 @@ test("decodes a bounded embedded direct chat image before screenshot fallback", 
   });
   assert.equal(screenshotRequested, false);
   assert.equal(result.byteCount, ONE_PIXEL_PNG.length);
+  assert.equal(path.extname(result.imagePaths[0]), ".png");
+  await removeImageAnalysisJob(projectRoot, result.jobDirectory);
+});
+
+test("rejects an embedded image whose declared type disagrees with its bytes", async (t) => {
+  const projectRoot = await temporaryRoot(t);
+  let screenshotRequested = false;
+  const result = await captureLatestDouyinChatImage({
+    projectRoot,
+    cdp: {
+      async evaluate(expression) {
+        if (expression.includes("currentSrc")) {
+          return {
+            ok: true,
+            source: `data:image/jpeg;base64,${ONE_PIXEL_PNG.toString("base64")}`,
+          };
+        }
+        return {
+          ok: true,
+          clip: { x: 10, y: 20, width: 240, height: 180, scale: 1 },
+        };
+      },
+      async request() {
+        screenshotRequested = true;
+        return { data: ONE_PIXEL_PNG.toString("base64") };
+      },
+    },
+  });
+  assert.equal(screenshotRequested, true);
+  assert.equal(path.extname(result.imagePaths[0]), ".png");
+  await removeImageAnalysisJob(projectRoot, result.jobDirectory);
+});
+
+test("never passes an unnormalized WebP chat image to Codex", async (t) => {
+  const projectRoot = await temporaryRoot(t);
+  let screenshotRequested = false;
+  const result = await captureLatestDouyinChatImage({
+    projectRoot,
+    cdp: {
+      async evaluate(expression) {
+        if (expression.includes("currentSrc")) {
+          return {
+            ok: true,
+            source: `data:image/webp;base64,${MINIMAL_WEBP.toString("base64")}`,
+          };
+        }
+        return {
+          ok: true,
+          clip: { x: 10, y: 20, width: 240, height: 180, scale: 1 },
+        };
+      },
+      async request() {
+        screenshotRequested = true;
+        return { data: ONE_PIXEL_PNG.toString("base64") };
+      },
+    },
+  });
+  assert.equal(screenshotRequested, true);
   assert.equal(path.extname(result.imagePaths[0]), ".png");
   await removeImageAnalysisJob(projectRoot, result.jobDirectory);
 });

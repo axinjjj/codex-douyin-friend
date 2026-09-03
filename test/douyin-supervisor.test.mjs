@@ -83,6 +83,7 @@ test("starts a supervised hidden bridge and exposes sanitized live status", asyn
   assert.equal(calls[0].options.windowsHide, true);
   assert.equal(calls[0].options.env.DOUYIN_SUPERVISED, "true");
   assert.equal(calls[0].options.env.DOUYIN_SEND_ENABLED, "false");
+  assert.equal(calls[0].options.env.DOUYIN_MEDIA_REACTION_ENABLED, "false");
   assert.equal(calls[0].options.env.CODEX_DOUYIN_MODEL, "gpt-5.6-sol");
 
   children[0].stdout.write(`${JSON.stringify({
@@ -104,6 +105,7 @@ test("starts a supervised hidden bridge and exposes sanitized live status", asyn
   assert.equal(status.audio, "ready");
   assert.equal(status.contextUsage.ratio, 0.25);
   assert.equal(status.actionPermissions.compact, true);
+  assert.equal(status.actionPermissions.setMediaReactions, true);
   assert.doesNotMatch(JSON.stringify(status), /threadId|chatKey|prompt|messageText/iu);
 
   let command = "";
@@ -184,7 +186,9 @@ test("persists only a validated image-capable model and effort", async (t) => {
     /cannot process Douyin media images/u,
   );
   await supervisor.setModelEffort({ model: "gpt-5.6-sol", effort: "high" });
+  await supervisor.setMediaReactions(true);
   assert.equal((await loadSupervisorConfig(configPath)).effort, "high");
+  assert.equal((await loadSupervisorConfig(configPath)).mediaReactionEnabled, true);
   assert.doesNotMatch(await readFile(configPath, "utf8"), /token|thread|chat/iu);
 });
 

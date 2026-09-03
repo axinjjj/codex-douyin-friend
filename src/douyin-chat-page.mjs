@@ -416,6 +416,9 @@ export function buildReadLatestIncomingChatImageSourceExpression() {
       if (!image) continue;
       const source = image.currentSrc || image.src || '';
       if (!source) return { ok: false, reason: 'chat-image-source-not-found' };
+      if (/^data:image\\/webp;base64,/u.test(source)) {
+        return { ok: false, reason: 'chat-image-webp-requires-screenshot' };
+      }
       return { ok: true, source };
     }
     return { ok: false, reason: 'incoming-chat-image-not-found' };
@@ -880,6 +883,81 @@ export function buildReadIncomingMediaTextExpression(message) {
       chatFingerprint: opaqueId ? await digest(['douyin-opponent-v1', opaqueId].join('|')) : null,
       text: (bubble?.textContent || '').trim() || null,
     };
+  })()`;
+}
+
+export function buildLocateIncomingMediaReactionTargetExpression(message, ordinalShift = 1) {
+  if (!Number.isSafeInteger(message?.ordinalFromEnd) || message.ordinalFromEnd < 1 || message.ordinalFromEnd > 12
+      || !/^[0-9a-f]{64}$/u.test(message?.fingerprint)
+      || message?.kind !== "media" || message?.side !== "left"
+      || !Number.isSafeInteger(ordinalShift) || ordinalShift < 0 || ordinalShift > 2) {
+    throw new Error("Incoming media reaction metadata is invalid.");
+  }
+  const expected = {
+    ordinalFromEnd: message.ordinalFromEnd + ordinalShift,
+    fingerprint: message.fingerprint,
+  };
+  return `(async () => {
+    ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
+    if (!list) return { ok: false, reason: 'message-list-not-found' };
+    const expected = ${JSON.stringify(expected)};
+    const digest = async (value) => {
+      const bytes = new TextEncoder().encode(value);
+      const hash = await crypto.subtle.digest('SHA-256', bytes);
+      return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    };
+    const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
+      .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top);
+    const message = messages[messages.length - expected.ordinalFromEnd];
+    if (!message) return { ok: false, reason: 'incoming-media-reaction-target-not-visible' };
+    const bubble = message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)});
+    ${MESSAGE_SIDE_CAPTURE_SOURCE}
+    const content = message.querySelector('.messageMessageBoxcontentBox');
+    const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
+    const source = (bubble?.textContent || content?.textContent || '').trim();
+    const fingerprint = await digest(['media', side, source].join('|'));
+    if (side !== 'left' || !hasMedia || fingerprint !== expected.fingerprint) {
+      return { ok: false, reason: 'incoming-media-reaction-target-changed' };
+    }
+    const target = message.querySelector('.MessageBoxContentactiveClickArea') || content;
+    if (!target) return { ok: false, reason: 'incoming-media-reaction-surface-not-found' };
+    target.scrollIntoView({ block: 'center', inline: 'center' });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const rect = target.getBoundingClientRect();
+    if (rect.width < 16 || rect.height < 16 || rect.left < 0 || rect.top < 0
+        || rect.right > window.innerWidth || rect.bottom > window.innerHeight) {
+      return { ok: false, reason: 'incoming-media-reaction-surface-invalid' };
+    }
+    return {
+      ok: true,
+      chatFingerprint: opaqueId ? await digest(['douyin-opponent-v1', opaqueId].join('|')) : null,
+      point: {
+        x: Math.round(rect.left + rect.width / 2),
+        y: Math.round(rect.top + rect.height / 2),
+      },
+    };
+  })()`;
+}
+
+export function buildInspectOpenMediaLikeMenuExpression({ activate = false } = {}) {
+  if (typeof activate !== "boolean") throw new Error("Media-like menu activation must be boolean.");
+  const activationSource = activate
+    ? "likeEntries[0].click(); return { ok: true, available: true, activated: true };"
+    : "return { ok: true, available: true, activated: false };";
+  return `(() => {
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none' &&
+        style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+    };
+    const entries = Array.from(document.querySelectorAll('.MessageOperatePopBodydesc')).filter(visible);
+    if (entries.length < 2) return { ok: false, reason: 'media-message-menu-not-open' };
+    const likeEntries = entries.filter((entry) => (entry.textContent || '').trim() === '点赞');
+    if (likeEntries.length > 1) return { ok: false, reason: 'media-like-action-ambiguous' };
+    if (likeEntries.length === 0) return { ok: true, available: false, activated: false };
+    ${activationSource}
   })()`;
 }
 

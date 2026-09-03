@@ -87,17 +87,16 @@ function decodePng(data, maxBytes) {
 
 function decodeEmbeddedImage(source, maxBytes) {
   if (typeof source !== "string" || !source.startsWith("data:")) return null;
+  if (source.startsWith("data:image/webp;base64,")) return null;
   if (source.length > Math.ceil(maxBytes / 3) * 4 + 64) {
     throw new Error("Douyin embedded chat image exceeds the local size limit.");
   }
   const match = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]+={0,2})$/u.exec(source);
   if (!match) throw new Error("Douyin embedded chat image format is unsupported.");
-  const [, , data] = match;
+  const [, contentType, data] = match;
   const image = Buffer.from(data, "base64");
   const header = image.subarray(0, 12);
-  const contentType = ["image/png", "image/jpeg", "image/webp"]
-    .find((candidate) => hasImageSignature(header, candidate));
-  if (image.length === 0 || image.length > maxBytes || !contentType) {
+  if (image.length === 0 || image.length > maxBytes || !hasImageSignature(header, contentType)) {
     throw new Error("Douyin embedded chat image has invalid image data.");
   }
   return { image, contentType };
@@ -117,9 +116,15 @@ export async function captureLatestDouyinChatImage({
     Number.isFinite(maxBytes) ? Math.trunc(maxBytes) : DEFAULT_MAX_IMAGE_BYTES,
   ));
   const sourceResult = await cdp.evaluate(buildReadLatestIncomingChatImageSourceExpression());
-  const embeddedImage = sourceResult?.ok
-    ? decodeEmbeddedImage(sourceResult.source, boundedMaxBytes)
-    : null;
+  let embeddedImage = null;
+  let sourceDownloadError = null;
+  if (sourceResult?.ok) {
+    try {
+      embeddedImage = decodeEmbeddedImage(sourceResult.source, boundedMaxBytes);
+    } catch (error) {
+      sourceDownloadError = error;
+    }
+  }
   if (embeddedImage) {
     const root = resolveImageAnalysisRoot(projectRoot);
     const jobDirectory = path.join(root, randomUUID());
@@ -140,7 +145,6 @@ export async function captureLatestDouyinChatImage({
       throw error;
     }
   }
-  let sourceDownloadError = null;
   if (sourceResult?.ok && isTrustedDouyinMediaUrl(sourceResult.source)) {
     const root = resolveImageAnalysisRoot(projectRoot);
     const jobDirectory = path.join(root, randomUUID());
@@ -153,6 +157,9 @@ export async function captureLatestDouyinChatImage({
         maxBytes: boundedMaxBytes,
         fetchFn,
       });
+      if (download.contentType === "image/webp") {
+        throw new Error("Direct Douyin chat images must be normalized to PNG or JPEG.");
+      }
       const imagePath = `${temporaryPath}${extensionForImageContentType(download.contentType)}`;
       await rename(temporaryPath, imagePath);
       return {

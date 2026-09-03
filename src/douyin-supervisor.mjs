@@ -17,6 +17,7 @@ const DEFAULT_CONFIG = Object.freeze({
   model: "gpt-5.6-sol",
   effort: "xhigh",
   sendEnabled: false,
+  mediaReactionEnabled: false,
   bridgeTimeoutMs: 86_400_000,
   debugPort: 9229,
   autoLaunchEdge: true,
@@ -27,7 +28,9 @@ function validateConfig(value) {
   if (config.version !== 1) throw new Error("Unsupported supervisor config version.");
   if (!MODEL_PATTERN.test(config.model)) throw new Error("Invalid Codex model id.");
   if (!EFFORTS.has(config.effort)) throw new Error("Invalid Codex reasoning effort.");
-  if (typeof config.sendEnabled !== "boolean" || typeof config.autoLaunchEdge !== "boolean") {
+  if (typeof config.sendEnabled !== "boolean"
+      || typeof config.mediaReactionEnabled !== "boolean"
+      || typeof config.autoLaunchEdge !== "boolean") {
     throw new Error("Supervisor boolean config is invalid.");
   }
   if (!Number.isInteger(config.bridgeTimeoutMs) || config.bridgeTimeoutMs < 60_000) {
@@ -119,6 +122,7 @@ function actionPermissions(status) {
     compact: running && phase === "listening",
     rotateThread: (running && phase === "listening") || phase === "blocked",
     setAutoSend: idle,
+    setMediaReactions: idle,
     setModelEffort: idle,
   };
 }
@@ -169,6 +173,7 @@ export class DouyinSupervisor extends EventEmitter {
       model: this.config.model,
       effort: this.config.effort,
       sendEnabled: this.config.sendEnabled,
+      mediaReactionEnabled: this.config.mediaReactionEnabled,
       lastLatencyMs: null,
       contextUsage: null,
       compaction: "idle",
@@ -246,6 +251,20 @@ export class DouyinSupervisor extends EventEmitter {
     return this.getStatus();
   }
 
+  async setMediaReactions(mediaReactionEnabled) {
+    this.#requireAllowed("setMediaReactions");
+    if (typeof mediaReactionEnabled !== "boolean") {
+      throw new Error("mediaReactionEnabled must be boolean.");
+    }
+    this.config = await saveSupervisorConfig(this.configPath, {
+      ...this.config,
+      mediaReactionEnabled,
+    });
+    this.#update({ mediaReactionEnabled });
+    if (this.child) await this.#restartBridge();
+    return this.getStatus();
+  }
+
   async setModelEffort({ model, effort }) {
     this.#requireAllowed("setModelEffort");
     const models = await this.listModels();
@@ -271,6 +290,9 @@ export class DouyinSupervisor extends EventEmitter {
     if (action === "compact") return this.compact();
     if (action === "rotateThread") return this.rotateThread();
     if (action === "setAutoSend") return this.setAutoSend(payload.sendEnabled);
+    if (action === "setMediaReactions") {
+      return this.setMediaReactions(payload.mediaReactionEnabled);
+    }
     if (action === "setModelEffort") return this.setModelEffort(payload);
     throw new Error("Unknown supervisor action.");
   }
@@ -342,6 +364,7 @@ export class DouyinSupervisor extends EventEmitter {
         ...process.env,
         DOUYIN_SUPERVISED: "true",
         DOUYIN_SEND_ENABLED: String(this.config.sendEnabled),
+        DOUYIN_MEDIA_REACTION_ENABLED: String(this.config.mediaReactionEnabled),
         DOUYIN_BRIDGE_TIMEOUT_MS: String(this.config.bridgeTimeoutMs),
         DOUYIN_DEBUG_PORT: String(this.config.debugPort),
         DOUYIN_FORCE_FRESH_THREAD: String(this.forceFreshThread),
@@ -381,6 +404,7 @@ export class DouyinSupervisor extends EventEmitter {
         phase: "listening",
         model: String(event.model || this.config.model),
         effort: String(event.effort || this.config.effort),
+        mediaReactionEnabled: Boolean(event.mediaReactionEnabled),
       });
       return;
     }

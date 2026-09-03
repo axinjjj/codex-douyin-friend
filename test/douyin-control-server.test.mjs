@@ -14,13 +14,14 @@ function createController() {
     model: "gpt-5.6-sol",
     effort: "xhigh",
     sendEnabled: true,
+    mediaReactionEnabled: true,
     lastLatencyMs: null,
     contextUsage: null,
     compaction: "idle",
     cacheBytes: 0,
     lastError: null,
     restartAttempt: 0,
-    actionPermissions: { compact: true },
+    actionPermissions: { compact: true, setMediaReactions: true },
   };
   return {
     calls,
@@ -46,10 +47,13 @@ test("serves a localhost-only dashboard without private conversation state", asy
 
   const page = await fetch(url);
   assert.equal(page.status, 200);
-  assert.match(await page.text(), /Codex · 抖音桥/u);
+  const pageText = await page.text();
+  assert.match(pageText, /Codex · 抖音桥/u);
+  assert.match(pageText, /允许模型给媒体点赞/u);
 
   const status = await (await fetch(`${url}/api/status`)).json();
   assert.equal(status.phase, "listening");
+  assert.equal(status.mediaReactionEnabled, true);
   assert.equal(status.threadId, undefined);
   assert.equal(status.chatText, undefined);
 
@@ -57,6 +61,24 @@ test("serves a localhost-only dashboard without private conversation state", asy
   assert.equal(models[0].id, "gpt-5.6-sol");
   const session = await (await fetch(`${url}/api/session`)).json();
   assert.equal(session.csrfToken, "test-token");
+
+  const reactionAction = await fetch(`${url}/api/action`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin: url,
+      "x-csrf-token": "test-token",
+    },
+    body: JSON.stringify({
+      action: "setMediaReactions",
+      payload: { mediaReactionEnabled: false },
+    }),
+  });
+  assert.equal(reactionAction.status, 200);
+  assert.deepEqual(controller.calls, [{
+    action: "setMediaReactions",
+    payload: { mediaReactionEnabled: false },
+  }]);
 });
 
 test("requires exact origin and CSRF token for control actions", async (t) => {

@@ -49,6 +49,7 @@ import {
   prepareDouyinImagePost,
   removeImageAnalysisJob,
 } from "../src/douyin-image-runtime.mjs";
+import { likeIncomingDouyinMediaMessage } from "../src/douyin-media-reaction.mjs";
 import {
   cleanupStaleVideoAnalysisJobs,
   prepareLatestDouyinVideoMedia,
@@ -66,6 +67,7 @@ const expectedPersonaPath = path.join(os.homedir(), ".codex", "AGENTS.md");
 const port = Number.parseInt(process.env.DOUYIN_DEBUG_PORT || "9229", 10);
 const timeoutMs = Number.parseInt(process.env.DOUYIN_BRIDGE_TIMEOUT_MS || "3600000", 10);
 const sendEnabled = process.env.DOUYIN_SEND_ENABLED === "true";
+const mediaReactionEnabled = process.env.DOUYIN_MEDIA_REACTION_ENABLED === "true";
 const model = process.env.CODEX_DOUYIN_MODEL || "gpt-5.6-sol";
 const effort = process.env.CODEX_DOUYIN_EFFORT || "xhigh";
 const supervised = process.env.DOUYIN_SUPERVISED === "true";
@@ -106,6 +108,7 @@ const emitBridgeStatus = (requestId = null) => emitBridgeEvent({
   requestId,
   phase: currentPhase,
   sendEnabled,
+  mediaReactionEnabled,
   model,
   effort,
   lastLatencyMs,
@@ -240,6 +243,7 @@ try {
     personaLoaded: true,
     chatLocked: true,
     sendEnabled,
+    mediaReactionEnabled,
     model: runtime.model,
     effort: runtime.effort,
     audioEnabled: true,
@@ -434,6 +438,7 @@ try {
     try {
       let reply;
       let replyKind;
+      let mediaShouldLike = false;
       if (incomingBatch.mode === "text") {
         const inbound = await cdp.evaluate(buildReadIncomingTextBatchExpression(incomingBatch.textMessages));
         if (inbound?.chatFingerprint !== lockedChat.fingerprint) {
@@ -545,7 +550,7 @@ try {
           throw new Error("The Douyin chat changed during media capture; refusing the wrong conversation.");
         }
         if (media.kind === "chat_image" || media.kind === "image_post" || media.kind === "shared_cover") {
-          reply = await generateDouyinImageReply({
+          const decision = await generateDouyinImageReply({
             codex: contextManager,
             threadId: runtime.threadId,
             imagePaths: media.imagePaths,
@@ -553,9 +558,12 @@ try {
             totalImageCount: media.totalImageCount ?? media.imagePaths.length,
             inboundText,
             sharedComment,
+            mediaReactionEnabled,
             model: runtime.model,
             effort: runtime.effort,
           });
+          reply = decision.reply;
+          mediaShouldLike = decision.shouldLike;
           replyKind = "image";
         } else {
           const audioUnderstanding = media.audioUnderstanding || {
@@ -569,7 +577,7 @@ try {
               reason: "transcription-failed",
             }));
           }
-          reply = await generateDouyinVideoReply({
+          const decision = await generateDouyinVideoReply({
             codex: contextManager,
             threadId: runtime.threadId,
             framePaths: media.framePaths,
@@ -577,9 +585,12 @@ try {
             audioUnderstanding,
             inboundText,
             sharedComment,
+            mediaReactionEnabled,
             model: runtime.model,
             effort: runtime.effort,
           });
+          reply = decision.reply;
+          mediaShouldLike = decision.shouldLike;
           media.audioUnderstanding = audioUnderstanding;
           replyKind = "video";
         }
@@ -687,6 +698,27 @@ try {
         outboundFingerprint,
       });
       await saveBridgeState(projectRoot, activeState);
+      if (mediaReactionEnabled && mediaShouldLike && incomingBatch.mediaMessage) {
+        try {
+          const reaction = await likeIncomingDouyinMediaMessage({
+            cdp,
+            message: incomingBatch.mediaMessage,
+            expectedChatFingerprint: lockedChat.fingerprint,
+            ordinalShift: 1,
+          });
+          console.log(JSON.stringify({
+            ok: true,
+            event: reaction.applied ? "media-like-applied" : "media-like-skipped",
+            reason: reaction.reason,
+          }));
+        } catch {
+          console.log(JSON.stringify({
+            ok: false,
+            event: "media-like-failed",
+            reason: "verification-failed",
+          }));
+        }
+      }
       previous = current;
       setBridgePhase("listening");
     } catch (error) {

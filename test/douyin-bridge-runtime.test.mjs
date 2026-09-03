@@ -8,6 +8,7 @@ import {
   generateDouyinReply,
   generateDouyinVideoReply,
   injectConversationHistory,
+  parseDouyinMediaReply,
   preparePersistentBridgeSession,
   sendAndVerifyDouyinReply,
   startVerifiedPersonaThread,
@@ -358,7 +359,11 @@ test("sends audio understanding and ordered keyframes to the same Codex thread",
       events: ["SPEECH", "LAUGHTER"],
     },
   });
-  assert.equal(reply, "看见了");
+  assert.deepEqual(reply, {
+    reply: "看见了",
+    shouldLike: false,
+    reactionDecision: "disabled",
+  });
   assert.equal(turn.threadId, "thread-1");
   assert.deepEqual(turn.input.slice(1), [
     { type: "localImage", path: "C:/runtime/frame-01.png" },
@@ -446,7 +451,11 @@ test("marks direct chat images as media content and sends them to the same threa
     threadId: "thread-1",
     imagePaths: ["C:/runtime/chat-image.png"],
   });
-  assert.equal(reply, "这张我看清了");
+  assert.deepEqual(reply, {
+    reply: "这张我看清了",
+    shouldLike: false,
+    reactionDecision: "disabled",
+  });
   assert.equal(turn.threadId, "thread-1");
   assert.deepEqual(turn.input[1], {
     type: "localImage",
@@ -455,6 +464,62 @@ test("marks direct chat images as media content and sends them to the same threa
   assert.match(turn.input[0].text, /聊天图片/u);
   assert.match(turn.input[0].text, /不是对 Codex 的指令/u);
   assert.match(turn.input[0].text, /自然决定回复长度/u);
+});
+
+test("returns a private media-like decision without leaking its control marker", async () => {
+  let prompt;
+  const result = await generateDouyinImageReply({
+    codex: {
+      async runTurn(value) {
+        prompt = value.input[0].text;
+        const nonce = /douyin-media-like nonce="([0-9a-f]{24})"/u.exec(prompt)?.[1];
+        assert.ok(nonce);
+        return `这张确实可爱\n<douyin-media-like nonce="${nonce}">yes</douyin-media-like>`;
+      },
+    },
+    threadId: "thread-1",
+    imagePaths: ["C:/runtime/chat-image.png"],
+    mediaReactionEnabled: true,
+  });
+  assert.deepEqual(result, {
+    reply: "这张确实可爱",
+    shouldLike: true,
+    reactionDecision: "yes",
+  });
+  assert.match(prompt, /确实喜欢、认同/u);
+  assert.doesNotMatch(result.reply, /douyin-media-like/u);
+});
+
+test("fails closed when a media-like marker is missing or has the wrong nonce", () => {
+  assert.deepEqual(parseDouyinMediaReply("自然回复", {
+    reactionEnabled: true,
+    nonce: "a".repeat(24),
+  }), {
+    reply: "自然回复",
+    shouldLike: false,
+    reactionDecision: "missing",
+  });
+  assert.deepEqual(parseDouyinMediaReply(
+    `自然回复\n<douyin-media-like nonce="${"b".repeat(24)}">yes</douyin-media-like>`,
+    { reactionEnabled: true, nonce: "a".repeat(24) },
+  ), {
+    reply: "自然回复",
+    shouldLike: false,
+    reactionDecision: "invalid",
+  });
+});
+
+test("never exposes a malformed media-like control marker in the Douyin reply", () => {
+  const result = parseDouyinMediaReply([
+    "正常正文",
+    '<douyin-media-like nonce="not-valid">yes</douyin-media-like>',
+  ].join("\n"), {
+    reactionEnabled: true,
+    nonce: "a".repeat(24),
+  });
+  assert.equal(result.reply, "正常正文");
+  assert.equal(result.shouldLike, false);
+  assert.equal(result.reactionDecision, "missing");
 });
 
 test("states the sampling boundary for a long image post", async () => {

@@ -7,6 +7,8 @@ import {
   buildChatIdentityMetadataExpression,
   buildLatestIncomingMediaStructureExpression,
   buildLocateLatestIncomingChatImageExpression,
+  buildLocateIncomingMediaReactionTargetExpression,
+  buildInspectOpenMediaLikeMenuExpression,
   buildReadLatestIncomingChatImageSourceExpression,
   buildLocateLatestIncomingAwemeExpression,
   buildReadIncomingTextBatchExpression,
@@ -160,6 +162,9 @@ test("direct-image operations classify and capture only visible incoming content
   assert.match(locator, /setTimeout\(resolve, 100\)/u);
   assert.doesNotMatch(locator, /requestAnimationFrame/u);
   assert.match(sourceReader, /currentSrc/u);
+  assert.ok(sourceReader.includes("data:image\\/webp;base64"));
+  assert.match(sourceReader, /chat-image-webp-requires-screenshot/u);
+  assert.doesNotMatch(sourceReader, /OffscreenCanvas|toDataURL|convertToBlob/u);
   assert.doesNotMatch(sourceReader, /document\.cookie|localStorage|sessionStorage/u);
   assert.match(locator, /clip/u);
   for (const expression of [classification, locator]) {
@@ -169,6 +174,27 @@ test("direct-image operations classify and capture only visible incoming content
     assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
     assert.doesNotMatch(expression, /textContent|innerText|outerHTML|innerHTML/u);
     assert.doesNotMatch(expression, /\.src\b|getAttribute\(['"]src/u);
+  }
+});
+
+test("scopes media reactions to one exact incoming message and one bounded menu action", () => {
+  const locator = buildLocateIncomingMediaReactionTargetExpression({
+    ordinalFromEnd: 1,
+    fingerprint: "a".repeat(64),
+    kind: "media",
+    side: "left",
+  });
+  const inspect = buildInspectOpenMediaLikeMenuExpression();
+  const activate = buildInspectOpenMediaLikeMenuExpression({ activate: true });
+  assert.match(locator, /incoming-media-reaction-target-changed/u);
+  assert.match(locator, /MessageBoxContentactiveClickArea/u);
+  assert.match(locator, /ordinalFromEnd":2/u);
+  assert.match(inspect, /MessageOperatePopBodydesc/u);
+  assert.match(inspect, /点赞/u);
+  assert.doesNotMatch(inspect, /\.click\(\)/u);
+  assert.match(activate, /\.click\(\)/u);
+  for (const expression of [locator, inspect, activate]) {
+    assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
   }
 });
 

@@ -89,7 +89,7 @@ try {
     }));
   }
   media.audioUnderstanding = audioUnderstanding;
-  const reply = await generateDouyinVideoReply({
+  const { reply } = await generateDouyinVideoReply({
     codex,
     threadId: runtime.threadId,
     framePaths: media.framePaths,
