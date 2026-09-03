@@ -8,8 +8,22 @@ import {
   createDouyinSupervisor,
 } from "../src/douyin-supervisor.mjs";
 
+function resolveCodexBinArgument(argv) {
+  const flag = "--codex-bin";
+  const positions = argv
+    .map((value, index) => (value === flag ? index : -1))
+    .filter((index) => index >= 0);
+  if (positions.length === 0) return null;
+  if (positions.length !== 1 || positions[0] !== 0 || argv.length !== 2 || !argv[1]) {
+    throw new Error("The supervisor accepts only one --codex-bin path argument.");
+  }
+  return path.resolve(argv[1]);
+}
+
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(scriptDirectory, "..");
+const codexBinArgument = resolveCodexBinArgument(process.argv.slice(2));
+if (codexBinArgument) process.env.CODEX_BIN = codexBinArgument;
 const logDirectory = path.join(projectRoot, ".runtime", "logs");
 const logPath = path.join(logDirectory, "supervisor.jsonl");
 const previousLogPath = path.join(logDirectory, "supervisor.previous.jsonl");

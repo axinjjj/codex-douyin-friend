@@ -8,17 +8,16 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $taskName = "CodexDouyinFriendSupervisor"
 $scriptDirectory = Split-Path -Parent $PSCommandPath
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDirectory ".."))
-$launcherPath = [System.IO.Path]::GetFullPath((Join-Path $scriptDirectory "start-douyin-supervisor.ps1"))
+$supervisorScript = [System.IO.Path]::GetFullPath((Join-Path $scriptDirectory "run-douyin-supervisor.mjs"))
 $nodeCommand = Get-Command node.exe -CommandType Application -ErrorAction Stop |
   Select-Object -First 1
 $codexCommand = Get-Command codex.exe -CommandType Application -ErrorAction Stop |
   Select-Object -First 1
 $nodePath = [System.IO.Path]::GetFullPath($nodeCommand.Source)
 $codexPath = [System.IO.Path]::GetFullPath($codexCommand.Source)
-$windowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 $userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
-foreach ($requiredPath in @($launcherPath, $nodePath, $codexPath, $windowsPowerShell)) {
+foreach ($requiredPath in @($supervisorScript, $nodePath, $codexPath)) {
   if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
     throw "An autostart dependency is missing."
   }
@@ -34,17 +33,13 @@ if ($nodeMajor -lt 22) {
 }
 
 $arguments = @(
-  "-NoLogo"
-  "-NoProfile"
-  "-NonInteractive"
-  "-ExecutionPolicy Bypass"
-  "-File `"$launcherPath`""
-  "-NodeFallbackPath `"$nodePath`""
-  "-CodexFallbackPath `"$codexPath`""
+  "`"$supervisorScript`""
+  "--codex-bin"
+  "`"$codexPath`""
 ) -join " "
 
 $action = New-ScheduledTaskAction `
-  -Execute $windowsPowerShell `
+  -Execute $nodePath `
   -Argument $arguments `
   -WorkingDirectory $projectRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId

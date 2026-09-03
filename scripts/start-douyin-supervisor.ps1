@@ -61,7 +61,6 @@ if (-not (Test-Path -LiteralPath $supervisorScript -PathType Leaf)) {
   throw "Supervisor entry point is missing."
 }
 
-$env:CODEX_BIN = $codexPath
 Set-Location -LiteralPath $projectRoot
-& $nodePath $supervisorScript
+& $nodePath $supervisorScript --codex-bin $codexPath
 exit $LASTEXITCODE
