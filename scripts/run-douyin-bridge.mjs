@@ -18,6 +18,7 @@ import {
   buildBridgeStartupViewExpression,
   buildClassifyLatestIncomingMediaExpression,
   buildReadCompatibleAwemeMediaExpression,
+  buildReadIncomingCommentShareExpression,
   buildReadIncomingMediaTextExpression,
   buildReadIncomingTextBatchExpression,
   isDouyinChatTarget,
@@ -53,6 +54,7 @@ import {
   prepareLatestDouyinVideoMedia,
   removeVideoAnalysisJob,
 } from "../src/douyin-video-runtime.mjs";
+import { repairCollapsedDouyinViewport } from "../src/douyin-window-runtime.mjs";
 import {
   transcribeSenseVoiceAudio,
   verifySenseVoiceRuntime,
@@ -160,6 +162,7 @@ codex.on("stderr", () => {
 
 try {
   await cdp.connect();
+  await repairCollapsedDouyinViewport({ cdp, targetId: target.id });
   const lockedChat = await cdp.evaluate(buildChatIdentityMetadataExpression());
   if (!lockedChat?.found) throw new Error("The current Douyin chat could not be locked.");
   bridgeLock = await acquireBridgeRunLock(projectRoot, lockedChat.fingerprint);
@@ -274,6 +277,7 @@ try {
     }
     await sleep(750);
     if (stopRequested) break;
+    await repairCollapsedDouyinViewport({ cdp, targetId: target.id });
     let currentMetadata = await cdp.evaluate(buildChatMessageMetadataExpression());
     if (currentMetadata.chatFingerprint !== lockedChat.fingerprint) {
       setBridgePhase("blocked");
@@ -471,27 +475,41 @@ try {
           }
           inboundTextParts.push(...inbound.texts);
         }
-        const mediaMessage = await cdp.evaluate(
-          buildReadIncomingMediaTextExpression(incomingBatch.mediaMessage),
-        );
-        if (!mediaMessage?.ok || mediaMessage.chatFingerprint !== lockedChat.fingerprint) {
-          throw new Error(`The incoming Douyin media changed before capture: ${mediaMessage?.reason || "unknown"}.`);
-        }
-        if (mediaMessage.text && !inboundTextParts.includes(mediaMessage.text)) {
-          inboundTextParts.push(mediaMessage.text);
-        }
-        const inboundText = inboundTextParts.join("\n") || null;
         const mediaClassification = await cdp.evaluate(buildClassifyLatestIncomingMediaExpression());
         if (!mediaClassification?.ok) {
           throw new Error(`The latest Douyin media type is unsupported: ${mediaClassification?.reason || "unknown"}.`);
         }
+        let sharedComment = null;
+        if (mediaClassification.mediaType === "comment_share") {
+          const commentShare = await cdp.evaluate(
+            buildReadIncomingCommentShareExpression(incomingBatch.mediaMessage),
+          );
+          if (!commentShare?.ok || commentShare.chatFingerprint !== lockedChat.fingerprint) {
+            throw new Error(`The incoming Douyin comment share changed before capture: ${commentShare?.reason || "unknown"}.`);
+          }
+          sharedComment = commentShare.comment;
+        } else {
+          const mediaMessage = await cdp.evaluate(
+            buildReadIncomingMediaTextExpression(incomingBatch.mediaMessage),
+          );
+          if (!mediaMessage?.ok || mediaMessage.chatFingerprint !== lockedChat.fingerprint) {
+            throw new Error(`The incoming Douyin media changed before capture: ${mediaMessage?.reason || "unknown"}.`);
+          }
+          if (mediaMessage.text && !inboundTextParts.includes(mediaMessage.text)) {
+            inboundTextParts.push(mediaMessage.text);
+          }
+        }
+        const inboundText = inboundTextParts.join("\n") || null;
         if (mediaClassification.mediaType === "chat_image") {
           media = {
             kind: "chat_image",
             ...await captureLatestDouyinChatImage({ cdp, projectRoot }),
           };
-        } else if (mediaClassification.mediaType === "shared_aweme") {
-          const sharedManifest = await cdp.evaluate(buildReadCompatibleAwemeMediaExpression());
+        } else if (mediaClassification.mediaType === "shared_aweme"
+            || mediaClassification.mediaType === "comment_share") {
+          const sharedManifest = await cdp.evaluate(
+            buildReadCompatibleAwemeMediaExpression(incomingBatch.mediaMessage),
+          );
           if (!sharedManifest?.ok) {
             throw new Error(`The shared Douyin work is unavailable: ${sharedManifest?.reason || "unknown"}.`);
           }
@@ -534,6 +552,7 @@ try {
             mediaType: media.kind,
             totalImageCount: media.totalImageCount ?? media.imagePaths.length,
             inboundText,
+            sharedComment,
             model: runtime.model,
             effort: runtime.effort,
           });
@@ -557,6 +576,7 @@ try {
             durationSeconds: media.duration,
             audioUnderstanding,
             inboundText,
+            sharedComment,
             model: runtime.model,
             effort: runtime.effort,
           });

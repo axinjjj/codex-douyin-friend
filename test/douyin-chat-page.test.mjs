@@ -10,6 +10,7 @@ import {
   buildReadLatestIncomingChatImageSourceExpression,
   buildLocateLatestIncomingAwemeExpression,
   buildReadIncomingTextBatchExpression,
+  buildReadIncomingCommentShareExpression,
   buildReadIncomingMediaTextExpression,
   buildReadCompatibleAwemeMediaExpression,
   buildReadLatestIncomingTextExpression,
@@ -153,6 +154,7 @@ test("direct-image operations classify and capture only visible incoming content
   const locator = buildLocateLatestIncomingChatImageExpression();
   const sourceReader = buildReadLatestIncomingChatImageSourceExpression();
   assert.match(classification, /shared_aweme/u);
+  assert.match(classification, /comment_share/u);
   assert.match(classification, /chat_image/u);
   assert.match(locator, /scrollIntoView/u);
   assert.match(locator, /setTimeout\(resolve, 100\)/u);
@@ -199,15 +201,27 @@ test("shared-work inspection distinguishes videos from ordered image posts", () 
   assert.match(expression, /mediaType: 'shared_cover'/u);
   assert.match(expression, /cover_url_v2/u);
   assert.match(expression, /image_post_info/u);
+  assert.match(expression, /MessageItemCommentSharecontainer/u);
   assert.match(expression, /selectedIndexes/u);
   assert.match(expression, /maxImages = 12/u);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
   assert.doesNotMatch(expression, /return \{[^}]*itemId/u);
+
+  const exactExpression = buildReadCompatibleAwemeMediaExpression({
+    ordinalFromEnd: 1,
+    fingerprint: "a".repeat(64),
+    kind: "media",
+    side: "left",
+  });
+  assert.match(exactExpression, /incoming-shared-work-identity-changed/u);
+  assert.match(exactExpression, /messageMessageBoxcontentBox/u);
 });
 
 test("message metadata gives media priority and preserves attached-text identity", () => {
   for (const expression of [buildChatMessageMetadataExpression(), buildBridgeStartupViewExpression()]) {
     assert.match(expression, /hasMedia \? 'media' : (?:textBubble|bubble) \? 'text'/u);
+    assert.match(expression, /MessageItemCommentSharecontainer/u);
+    assert.match(expression, /messageMessageBoxcontentBox/u);
   }
   const expression = buildReadIncomingMediaTextExpression({
     ordinalFromEnd: 1,
@@ -217,5 +231,21 @@ test("message metadata gives media priority and preserves attached-text identity
   });
   assert.match(expression, /incoming-media-fingerprint-changed/u);
   assert.match(expression, /bubble\?\.textContent/u);
+  assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
+});
+
+test("reads an exact comment share without exposing comment or account identifiers", () => {
+  const expression = buildReadIncomingCommentShareExpression({
+    ordinalFromEnd: 1,
+    fingerprint: "a".repeat(64),
+    kind: "media",
+    side: "left",
+  });
+  assert.match(expression, /MessageItemCommentSharecommentText/u);
+  assert.match(expression, /MessageItemCommentSharetitleName/u);
+  assert.match(expression, /MessageItemCommentShareawemeTitle/u);
+  assert.match(expression, /incoming-comment-share-identity-changed/u);
+  assert.match(expression, /messageMessageBoxcontentBox/u);
+  assert.doesNotMatch(expression, /comment_id|comment_secuid|itemId/u);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
 });

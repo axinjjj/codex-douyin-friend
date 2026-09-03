@@ -3,6 +3,11 @@ export const DOUYIN_CHAT_INPUT_SELECTOR =
 export const DOUYIN_CHAT_LIST_SELECTOR = ".messageMessageListlist";
 export const DOUYIN_MESSAGE_SELECTOR = ".messageMessageBoxmessageBox";
 export const DOUYIN_TEXT_BUBBLE_SELECTOR = ".MessageItemTextbubbleTextContent";
+const DOUYIN_COMMENT_SHARE_SELECTOR = ".MessageItemCommentSharecontainer";
+const DOUYIN_SHARED_WORK_SELECTOR =
+  `${DOUYIN_COMMENT_SHARE_SELECTOR}, .MessageItemShareAwemecontainer`;
+const DOUYIN_MEDIA_CONTENT_SELECTOR =
+  `${DOUYIN_SHARED_WORK_SELECTOR}, .MessageItemImageImageBox, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]`;
 
 const STRUCTURE_HINT =
   /(chat|message|conversation|right|panel|scroll|content|item|list|editor|input|bubble|card|video|streak)/i;
@@ -142,10 +147,9 @@ export function buildChatMessageMetadataExpression() {
     const captured = allMessages.slice(-12).map((message) => {
       const textBubble = message.querySelector(textBubbleSelector);
       ${MESSAGE_SIDE_CAPTURE_SOURCE}
-      const source = (textBubble?.textContent || message.textContent || '').trim();
-      const hasMedia = Boolean(message.querySelector(
-        '.MessageItemShareAwemecontainer, .MessageItemImageImageBox, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]'
-      ));
+      const content = message.querySelector('.messageMessageBoxcontentBox');
+      const source = (textBubble?.textContent || content?.textContent || '').trim();
+      const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
       const kind = hasMedia ? 'media' : textBubble ? 'text' : centered ? 'system' : 'unknown';
       const structuralKey = kind === 'media' || kind === 'text'
         ? [kind, side, source].join('|')
@@ -193,10 +197,9 @@ export function buildBridgeStartupViewExpression(limit = 12) {
       .map((message) => {
         const bubble = message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)});
         ${MESSAGE_SIDE_CAPTURE_SOURCE}
-        const source = (bubble?.textContent || message.textContent || '').trim();
-        const hasMedia = Boolean(message.querySelector(
-          '.MessageItemShareAwemecontainer, .MessageItemImageImageBox, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]'
-        ));
+        const content = message.querySelector('.messageMessageBoxcontentBox');
+        const source = (bubble?.textContent || content?.textContent || '').trim();
+        const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
         const kind = hasMedia ? 'media' : bubble ? 'text' : centered ? 'system' : 'unknown';
         const structuralKey = kind === 'media' || kind === 'text'
           ? [kind, side, source].join('|')
@@ -264,9 +267,7 @@ export function buildLatestIncomingMediaStructureExpression() {
     for (const message of messages) {
       ${MESSAGE_SIDE_CAPTURE_SOURCE}
       if (side !== 'left') continue;
-      const hasMedia = Boolean(message.querySelector(
-        '.MessageItemShareAwemecontainer, .MessageItemImageImageBox, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]'
-      ));
+      const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
       if (!hasMedia) continue;
       const descendants = Array.from(message.querySelectorAll('*'));
       const hinted = [message, ...descendants]
@@ -320,6 +321,9 @@ export function buildClassifyLatestIncomingMediaExpression() {
       const content = message.querySelector('.MessageBoxContentactiveClickArea') ||
         message.querySelector('.messageMessageBoxcontentBox');
       if (!content) continue;
+      if (message.querySelector(${JSON.stringify(DOUYIN_COMMENT_SHARE_SELECTOR)})) {
+        return { ok: true, mediaType: 'comment_share' };
+      }
       if (message.querySelector('.MessageItemShareAwemecontainer')) {
         return { ok: true, mediaType: 'shared_aweme' };
       }
@@ -350,7 +354,7 @@ export function buildLocateLatestIncomingChatImageExpression() {
       const content = message.querySelector('.MessageBoxContentactiveClickArea') ||
         message.querySelector('.messageMessageBoxcontentBox');
       if (!content) continue;
-      if (message.querySelector('.MessageItemShareAwemecontainer')) {
+      if (message.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)})) {
         return { ok: false, reason: 'latest-media-is-shared-aweme' };
       }
       const image = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
@@ -401,7 +405,7 @@ export function buildReadLatestIncomingChatImageSourceExpression() {
       const content = message.querySelector('.MessageBoxContentactiveClickArea') ||
         message.querySelector('.messageMessageBoxcontentBox');
       if (!content) continue;
-      if (message.querySelector('.MessageItemShareAwemecontainer')) continue;
+      if (message.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)})) continue;
       const image = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
         .find((candidate) => {
           const imageRect = candidate.getBoundingClientRect();
@@ -665,7 +669,7 @@ export function buildReadCompatibleAwemeSourceExpression() {
     for (const message of messages) {
       ${MESSAGE_SIDE_CAPTURE_SOURCE}
       if (side !== 'left') continue;
-      const candidate = message.querySelector('.MessageItemShareAwemecontainer');
+      const candidate = message.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)});
       if (!candidate) continue;
       card = candidate;
       break;
@@ -694,20 +698,51 @@ export function buildReadCompatibleAwemeSourceExpression() {
   })()`;
 }
 
-export function buildReadCompatibleAwemeMediaExpression() {
+export function buildReadCompatibleAwemeMediaExpression(message = null) {
+  if (message !== null && (!Number.isSafeInteger(message?.ordinalFromEnd)
+      || message.ordinalFromEnd < 1 || message.ordinalFromEnd > 12
+      || !/^[0-9a-f]{64}$/u.test(message?.fingerprint)
+      || message?.kind !== "media" || message?.side !== "left")) {
+    throw new Error("Incoming shared-work metadata is invalid.");
+  }
+  const expected = message === null ? null : {
+    ordinalFromEnd: message.ordinalFromEnd,
+    fingerprint: message.fingerprint,
+  };
   return `(async () => {
     const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
     if (!list) return { ok: false, reason: 'message-list-not-found' };
-    const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
-      .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
+    const expected = ${JSON.stringify(expected)};
+    const digest = async (value) => {
+      const bytes = new TextEncoder().encode(value);
+      const hash = await crypto.subtle.digest('SHA-256', bytes);
+      return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    };
+    const recent = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
+      .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top)
+      .slice(-12);
     let card = null;
-    for (const message of messages) {
+    if (expected) {
+      const message = recent[recent.length - expected.ordinalFromEnd];
+      if (!message) return { ok: false, reason: 'incoming-shared-work-not-visible' };
+      const bubble = message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)});
       ${MESSAGE_SIDE_CAPTURE_SOURCE}
-      if (side !== 'left') continue;
-      const candidate = message.querySelector('.MessageItemShareAwemecontainer');
-      if (!candidate) continue;
-      card = candidate;
-      break;
+      const content = message.querySelector('.messageMessageBoxcontentBox');
+      const source = (bubble?.textContent || content?.textContent || '').trim();
+      const fingerprint = await digest(['media', side, source].join('|'));
+      if (side !== 'left' || fingerprint !== expected.fingerprint) {
+        return { ok: false, reason: 'incoming-shared-work-identity-changed' };
+      }
+      card = message.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)});
+    } else {
+      for (const message of [...recent].reverse()) {
+        ${MESSAGE_SIDE_CAPTURE_SOURCE}
+        if (side !== 'left') continue;
+        const candidate = message.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)});
+        if (!candidate) continue;
+        card = candidate;
+        break;
+      }
     }
     if (!card) return { ok: false, reason: 'aweme-card-not-found' };
     const fiberKey = Object.keys(card).find((key) => key.startsWith('__reactFiber$'));
@@ -830,13 +865,12 @@ export function buildReadIncomingMediaTextExpression(message) {
     if (!message) return { ok: false, reason: 'incoming-media-not-visible', text: null };
     const bubble = message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)});
     ${MESSAGE_SIDE_CAPTURE_SOURCE}
-    const hasMedia = Boolean(message.querySelector(
-      '.MessageItemShareAwemecontainer, .MessageItemImageImageBox, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]'
-    ));
+    const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
     if (side !== 'left' || !hasMedia) {
       return { ok: false, reason: 'incoming-media-identity-changed', text: null };
     }
-    const source = (bubble?.textContent || message.textContent || '').trim();
+    const content = message.querySelector('.messageMessageBoxcontentBox');
+    const source = (bubble?.textContent || content?.textContent || '').trim();
     const fingerprint = await digest(['media', side, source].join('|'));
     if (fingerprint !== expected.fingerprint) {
       return { ok: false, reason: 'incoming-media-fingerprint-changed', text: null };
@@ -845,6 +879,58 @@ export function buildReadIncomingMediaTextExpression(message) {
       ok: true,
       chatFingerprint: opaqueId ? await digest(['douyin-opponent-v1', opaqueId].join('|')) : null,
       text: (bubble?.textContent || '').trim() || null,
+    };
+  })()`;
+}
+
+export function buildReadIncomingCommentShareExpression(message) {
+  if (!Number.isSafeInteger(message?.ordinalFromEnd) || message.ordinalFromEnd < 1 || message.ordinalFromEnd > 12
+      || !/^[0-9a-f]{64}$/u.test(message?.fingerprint)
+      || message?.kind !== "media" || message?.side !== "left") {
+    throw new Error("Incoming comment-share metadata is invalid.");
+  }
+  const expected = {
+    ordinalFromEnd: message.ordinalFromEnd,
+    fingerprint: message.fingerprint,
+  };
+  return `(async () => {
+    ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
+    if (!list) return { ok: false, reason: 'message-list-not-found' };
+    const expected = ${JSON.stringify(expected)};
+    const digest = async (value) => {
+      const bytes = new TextEncoder().encode(value);
+      const hash = await crypto.subtle.digest('SHA-256', bytes);
+      return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    };
+    const recent = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
+      .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top)
+      .slice(-12);
+    const message = recent[recent.length - expected.ordinalFromEnd];
+    if (!message) return { ok: false, reason: 'incoming-comment-share-not-visible' };
+    const bubble = message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)});
+    ${MESSAGE_SIDE_CAPTURE_SOURCE}
+    const card = message.querySelector(${JSON.stringify(DOUYIN_COMMENT_SHARE_SELECTOR)});
+    const content = message.querySelector('.messageMessageBoxcontentBox');
+    const source = (bubble?.textContent || content?.textContent || '').trim();
+    const fingerprint = await digest(['media', side, source].join('|'));
+    if (side !== 'left' || !card || fingerprint !== expected.fingerprint) {
+      return { ok: false, reason: 'incoming-comment-share-identity-changed' };
+    }
+    const author = (card.querySelector('.MessageItemCommentSharetitleName')?.textContent || '').trim();
+    const comment = (card.querySelector('.MessageItemCommentSharecommentText')?.textContent || '').trim();
+    const awemeTitle = (card.querySelector('.MessageItemCommentShareawemeTitle')?.textContent || '').trim();
+    if (!comment || comment.length > 4000 || author.length > 200 || awemeTitle.length > 1000) {
+      return { ok: false, reason: 'incoming-comment-share-content-invalid' };
+    }
+    return {
+      ok: true,
+      chatFingerprint: opaqueId ? await digest(['douyin-opponent-v1', opaqueId].join('|')) : null,
+      comment: {
+        author: author || null,
+        text: comment,
+        awemeTitle: awemeTitle || null,
+      },
     };
   })()`;
 }
