@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { buildLocateLatestIncomingChatImageExpression } from "./douyin-chat-page.mjs";
+import {
+  buildLocateLatestIncomingChatImageExpression,
+  buildReadLatestIncomingChatImageSourceExpression,
+} from "./douyin-chat-page.mjs";
 import { isTrustedDouyinMediaUrl } from "./douyin-video-runtime.mjs";
 
 const IMAGE_JOB_NAME_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -82,10 +85,29 @@ function decodePng(data, maxBytes) {
   return image;
 }
 
+function decodeEmbeddedImage(source, maxBytes) {
+  if (typeof source !== "string" || !source.startsWith("data:")) return null;
+  if (source.length > Math.ceil(maxBytes / 3) * 4 + 64) {
+    throw new Error("Douyin embedded chat image exceeds the local size limit.");
+  }
+  const match = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]+={0,2})$/u.exec(source);
+  if (!match) throw new Error("Douyin embedded chat image format is unsupported.");
+  const [, , data] = match;
+  const image = Buffer.from(data, "base64");
+  const header = image.subarray(0, 12);
+  const contentType = ["image/png", "image/jpeg", "image/webp"]
+    .find((candidate) => hasImageSignature(header, candidate));
+  if (image.length === 0 || image.length > maxBytes || !contentType) {
+    throw new Error("Douyin embedded chat image has invalid image data.");
+  }
+  return { image, contentType };
+}
+
 export async function captureLatestDouyinChatImage({
   cdp,
   projectRoot,
   maxBytes = DEFAULT_MAX_IMAGE_BYTES,
+  fetchFn = fetch,
 }) {
   if (!cdp || typeof cdp.evaluate !== "function" || typeof cdp.request !== "function") {
     throw new Error("A connected CDP client is required for chat-image capture.");
@@ -94,17 +116,77 @@ export async function captureLatestDouyinChatImage({
     DEFAULT_MAX_IMAGE_BYTES,
     Number.isFinite(maxBytes) ? Math.trunc(maxBytes) : DEFAULT_MAX_IMAGE_BYTES,
   ));
+  const sourceResult = await cdp.evaluate(buildReadLatestIncomingChatImageSourceExpression());
+  const embeddedImage = sourceResult?.ok
+    ? decodeEmbeddedImage(sourceResult.source, boundedMaxBytes)
+    : null;
+  if (embeddedImage) {
+    const root = resolveImageAnalysisRoot(projectRoot);
+    const jobDirectory = path.join(root, randomUUID());
+    const imagePath = path.join(
+      jobDirectory,
+      `chat-image${extensionForImageContentType(embeddedImage.contentType)}`,
+    );
+    try {
+      await mkdir(jobDirectory, { recursive: true });
+      await writeFile(imagePath, embeddedImage.image, { flag: "wx" });
+      return {
+        jobDirectory,
+        imagePaths: [imagePath],
+        byteCount: embeddedImage.image.length,
+      };
+    } catch (error) {
+      await removeImageAnalysisJob(projectRoot, jobDirectory).catch(() => {});
+      throw error;
+    }
+  }
+  let sourceDownloadError = null;
+  if (sourceResult?.ok && isTrustedDouyinMediaUrl(sourceResult.source)) {
+    const root = resolveImageAnalysisRoot(projectRoot);
+    const jobDirectory = path.join(root, randomUUID());
+    const temporaryPath = path.join(jobDirectory, "chat-image.download");
+    try {
+      await mkdir(jobDirectory, { recursive: true });
+      const download = await downloadDouyinImage({
+        source: sourceResult.source,
+        destination: temporaryPath,
+        maxBytes: boundedMaxBytes,
+        fetchFn,
+      });
+      const imagePath = `${temporaryPath}${extensionForImageContentType(download.contentType)}`;
+      await rename(temporaryPath, imagePath);
+      return {
+        jobDirectory,
+        imagePaths: [imagePath],
+        byteCount: download.byteCount,
+      };
+    } catch (error) {
+      sourceDownloadError = error;
+      await removeImageAnalysisJob(projectRoot, jobDirectory).catch(() => {});
+    }
+  }
   const location = await cdp.evaluate(buildLocateLatestIncomingChatImageExpression());
   if (!location?.ok) {
     throw new Error(`The latest Douyin chat image is unavailable: ${location?.reason || "unknown"}.`);
   }
   const clip = validateClip(location.clip);
-  const capture = await cdp.request("Page.captureScreenshot", {
-    format: "png",
-    fromSurface: true,
-    captureBeyondViewport: false,
-    clip,
-  }, 10_000);
+  let capture;
+  try {
+    capture = await cdp.request("Page.captureScreenshot", {
+      format: "png",
+      fromSurface: true,
+      captureBeyondViewport: false,
+      clip,
+    }, 30_000);
+  } catch (error) {
+    if (sourceDownloadError) {
+      throw new AggregateError(
+        [sourceDownloadError, error],
+        "Douyin chat image could not be downloaded or captured.",
+      );
+    }
+    throw error;
+  }
   const image = decodePng(capture?.data, boundedMaxBytes);
   const root = resolveImageAnalysisRoot(projectRoot);
   const jobDirectory = path.join(root, randomUUID());
@@ -190,11 +272,14 @@ export async function prepareDouyinImagePost({
   maxImageBytes = DEFAULT_MAX_IMAGE_BYTES,
   maxTotalBytes = DEFAULT_MAX_TOTAL_IMAGE_BYTES,
 }) {
-  if (!manifest?.ok || manifest.mediaType !== "image_post"
+  const supportedMediaTypes = new Set(["image_post", "shared_cover"]);
+  if (!manifest?.ok || !supportedMediaTypes.has(manifest.mediaType)
       || !Array.isArray(manifest.sources) || manifest.sources.length === 0
       || manifest.sources.length > 12
       || !Number.isSafeInteger(manifest.totalImageCount)
-      || manifest.totalImageCount < manifest.sources.length) {
+      || manifest.totalImageCount < manifest.sources.length
+      || (manifest.mediaType === "shared_cover"
+        && (manifest.sources.length !== 1 || manifest.totalImageCount !== 1 || manifest.sampled))) {
     throw new Error("Douyin image-post manifest is invalid.");
   }
   const boundedImageBytes = Math.max(64 * 1024, Math.min(
@@ -226,7 +311,7 @@ export async function prepareDouyinImagePost({
       imagePaths.push(finalPath);
     }
     return {
-      kind: "image_post",
+      kind: manifest.mediaType,
       jobDirectory,
       imagePaths,
       totalBytes,

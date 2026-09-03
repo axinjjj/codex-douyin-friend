@@ -27,6 +27,14 @@ const CHAT_IDENTITY_CAPTURE_SOURCE = `
     }
 `;
 
+const MESSAGE_SIDE_CAPTURE_SOURCE = `
+    const centered = message.classList.contains('messageMessageBoxisFullRowCenterMessage');
+    const fromMe = Boolean(message.querySelector(
+      '.messageMessageBoxisFromMe, .MessageBoxContentisFromMe, .MessageItemTextisFromMe'
+    ));
+    const side = centered ? 'center' : fromMe ? 'right' : 'left';
+`;
+
 export function buildChatStructureExpression() {
   return `(() => {
     const inputSelector = ${JSON.stringify(DOUYIN_CHAT_INPUT_SELECTOR)};
@@ -127,30 +135,18 @@ export function buildChatMessageMetadataExpression() {
       return { listFound: false, messageCount: 0, messages: [] };
     }
 
-    const listRect = list.getBoundingClientRect();
     const allMessages = Array.from(list.querySelectorAll(messageSelector))
       .sort((left, right) =>
         left.getBoundingClientRect().top - right.getBoundingClientRect().top
       );
     const captured = allMessages.slice(-12).map((message) => {
       const textBubble = message.querySelector(textBubbleSelector);
-      const anchor = textBubble ||
-        message.querySelector('.MessageBoxContentactiveClickArea') ||
-        message.querySelector('.messageMessageBoxcontentBox') ||
-        message;
-      const anchorRect = anchor.getBoundingClientRect();
-      const relativeCenter = listRect.width > 0
-        ? (anchorRect.left + anchorRect.width / 2 - listRect.left) / listRect.width
-        : 0.5;
-      const centered = message.classList.contains('messageMessageBoxisFullRowCenterMessage');
-      const side = centered ? 'center' : relativeCenter < 0.45 ? 'left' : relativeCenter > 0.55 ? 'right' : 'center';
+      ${MESSAGE_SIDE_CAPTURE_SOURCE}
       const source = (textBubble?.textContent || message.textContent || '').trim();
-      const mediaRoot = message.querySelector('.MessageBoxContentactiveClickArea') ||
-        message.querySelector('.messageMessageBoxcontentBox');
-      const hasMedia = Boolean(mediaRoot?.querySelector(
-        'img, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]'
+      const hasMedia = Boolean(message.querySelector(
+        '.MessageItemShareAwemecontainer, .MessageItemImageImageBox, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]'
       ));
-      const kind = textBubble ? 'text' : hasMedia ? 'media' : centered ? 'system' : 'unknown';
+      const kind = hasMedia ? 'media' : textBubble ? 'text' : centered ? 'system' : 'unknown';
       const structuralKey = kind === 'media' || kind === 'text'
         ? [kind, side, source].join('|')
         : [kind, side, source, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|');
@@ -192,28 +188,16 @@ export function buildBridgeStartupViewExpression(limit = 12) {
       const hash = await crypto.subtle.digest('SHA-256', bytes);
       return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
     };
-    const listRect = list.getBoundingClientRect();
     const captured = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
       .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top)
       .map((message) => {
         const bubble = message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)});
-        const anchor = bubble ||
-          message.querySelector('.MessageBoxContentactiveClickArea') ||
-          message.querySelector('.messageMessageBoxcontentBox') ||
-          message;
-        const rect = anchor.getBoundingClientRect();
-        const relativeCenter = listRect.width > 0
-          ? (rect.left + rect.width / 2 - listRect.left) / listRect.width
-          : 0.5;
-        const centered = message.classList.contains('messageMessageBoxisFullRowCenterMessage');
-        const side = centered ? 'center' : relativeCenter < 0.45 ? 'left' : relativeCenter > 0.55 ? 'right' : 'center';
+        ${MESSAGE_SIDE_CAPTURE_SOURCE}
         const source = (bubble?.textContent || message.textContent || '').trim();
-        const mediaRoot = message.querySelector('.MessageBoxContentactiveClickArea') ||
-          message.querySelector('.messageMessageBoxcontentBox');
-        const hasMedia = Boolean(mediaRoot?.querySelector(
-          'img, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]'
+        const hasMedia = Boolean(message.querySelector(
+          '.MessageItemShareAwemecontainer, .MessageItemImageImageBox, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]'
         ));
-        const kind = bubble ? 'text' : hasMedia ? 'media' : centered ? 'system' : 'unknown';
+        const kind = hasMedia ? 'media' : bubble ? 'text' : centered ? 'system' : 'unknown';
         const structuralKey = kind === 'media' || kind === 'text'
           ? [kind, side, source].join('|')
           : [kind, side, source, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|');
@@ -272,24 +256,18 @@ export function buildLatestIncomingMediaStructureExpression() {
       return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0'))
         .join('');
     };
-    const listRect = list.getBoundingClientRect();
     const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
       .sort((left, right) =>
         right.getBoundingClientRect().top - left.getBoundingClientRect().top
       );
 
     for (const message of messages) {
-      if (message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)})) continue;
-      const anchor = message.querySelector('.MessageBoxContentactiveClickArea') ||
-        message.querySelector('.messageMessageBoxcontentBox') ||
-        message.querySelector('a, video, img, button, [role="button"]') ||
-        message;
-      const rect = anchor.getBoundingClientRect();
-      const relativeCenter = listRect.width > 0
-        ? (rect.left + rect.width / 2 - listRect.left) / listRect.width
-        : 0.5;
-      if (relativeCenter >= 0.45) continue;
-
+      ${MESSAGE_SIDE_CAPTURE_SOURCE}
+      if (side !== 'left') continue;
+      const hasMedia = Boolean(message.querySelector(
+        '.MessageItemShareAwemecontainer, .MessageItemImageImageBox, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]'
+      ));
+      if (!hasMedia) continue;
       const descendants = Array.from(message.querySelectorAll('*'));
       const hinted = [message, ...descendants]
         .filter((element) => classHints(element).length > 0)
@@ -334,23 +312,18 @@ export function buildClassifyLatestIncomingMediaExpression() {
   return `(() => {
     const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
     if (!list) return { ok: false, reason: 'message-list-not-found' };
-    const listRect = list.getBoundingClientRect();
     const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
       .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
     for (const message of messages) {
-      if (message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)})) continue;
+      ${MESSAGE_SIDE_CAPTURE_SOURCE}
+      if (side !== 'left') continue;
       const content = message.querySelector('.MessageBoxContentactiveClickArea') ||
         message.querySelector('.messageMessageBoxcontentBox');
       if (!content) continue;
-      const rect = content.getBoundingClientRect();
-      const relativeCenter = listRect.width > 0
-        ? (rect.left + rect.width / 2 - listRect.left) / listRect.width
-        : 0.5;
-      if (relativeCenter >= 0.45) continue;
-      if (content.querySelector('.MessageItemShareAwemecontainer')) {
+      if (message.querySelector('.MessageItemShareAwemecontainer')) {
         return { ok: true, mediaType: 'shared_aweme' };
       }
-      const visibleImage = Array.from(content.querySelectorAll('img'))
+      const visibleImage = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
         .find((image) => {
           const imageRect = image.getBoundingClientRect();
           const style = getComputedStyle(image);
@@ -358,6 +331,7 @@ export function buildClassifyLatestIncomingMediaExpression() {
             style.display !== 'none' && style.visibility !== 'hidden';
         });
       if (visibleImage) return { ok: true, mediaType: 'chat_image' };
+      if (message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)})) continue;
       return { ok: false, reason: 'unsupported-media-type' };
     }
     return { ok: false, reason: 'incoming-media-not-found' };
@@ -368,32 +342,30 @@ export function buildLocateLatestIncomingChatImageExpression() {
   return `(async () => {
     const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
     if (!list) return { ok: false, reason: 'message-list-not-found' };
-    const listRect = list.getBoundingClientRect();
     const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
       .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
     for (const message of messages) {
-      if (message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)})) continue;
+      ${MESSAGE_SIDE_CAPTURE_SOURCE}
+      if (side !== 'left') continue;
       const content = message.querySelector('.MessageBoxContentactiveClickArea') ||
         message.querySelector('.messageMessageBoxcontentBox');
       if (!content) continue;
-      const contentRect = content.getBoundingClientRect();
-      const relativeCenter = listRect.width > 0
-        ? (contentRect.left + contentRect.width / 2 - listRect.left) / listRect.width
-        : 0.5;
-      if (relativeCenter >= 0.45) continue;
-      if (content.querySelector('.MessageItemShareAwemecontainer')) {
+      if (message.querySelector('.MessageItemShareAwemecontainer')) {
         return { ok: false, reason: 'latest-media-is-shared-aweme' };
       }
-      const image = Array.from(content.querySelectorAll('img'))
+      const image = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
         .find((candidate) => {
           const rect = candidate.getBoundingClientRect();
           const style = getComputedStyle(candidate);
           return rect.width >= 32 && rect.height >= 32 &&
             style.display !== 'none' && style.visibility !== 'hidden';
         });
-      if (!image) return { ok: false, reason: 'chat-image-not-found' };
+      if (!image) {
+        if (message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)})) continue;
+        return { ok: false, reason: 'chat-image-not-found' };
+      }
       image.scrollIntoView({ block: 'center', inline: 'center' });
-      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      await new Promise((resolve) => setTimeout(resolve, 100));
       const rect = image.getBoundingClientRect();
       const x = Math.max(0, rect.left + window.scrollX);
       const y = Math.max(0, rect.top + window.scrollY);
@@ -417,25 +389,50 @@ export function buildLocateLatestIncomingChatImageExpression() {
   })()`;
 }
 
+export function buildReadLatestIncomingChatImageSourceExpression() {
+  return `(() => {
+    const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
+    if (!list) return { ok: false, reason: 'message-list-not-found' };
+    const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
+      .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
+    for (const message of messages) {
+      ${MESSAGE_SIDE_CAPTURE_SOURCE}
+      if (side !== 'left') continue;
+      const content = message.querySelector('.MessageBoxContentactiveClickArea') ||
+        message.querySelector('.messageMessageBoxcontentBox');
+      if (!content) continue;
+      if (message.querySelector('.MessageItemShareAwemecontainer')) continue;
+      const image = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
+        .find((candidate) => {
+          const imageRect = candidate.getBoundingClientRect();
+          const style = getComputedStyle(candidate);
+          return imageRect.width >= 32 && imageRect.height >= 32 &&
+            style.display !== 'none' && style.visibility !== 'hidden';
+        });
+      if (!image) continue;
+      const source = image.currentSrc || image.src || '';
+      if (!source) return { ok: false, reason: 'chat-image-source-not-found' };
+      return { ok: true, source };
+    }
+    return { ok: false, reason: 'incoming-chat-image-not-found' };
+  })()`;
+}
+
 export function buildLocateLatestIncomingAwemeExpression() {
   return `(() => {
     const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
     if (!list) return { ok: false, reason: 'message-list-not-found' };
-    const listRect = list.getBoundingClientRect();
     const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
       .sort((left, right) =>
         right.getBoundingClientRect().top - left.getBoundingClientRect().top
       );
 
     for (const message of messages) {
+      ${MESSAGE_SIDE_CAPTURE_SOURCE}
+      if (side !== 'left') continue;
       const card = message.querySelector('.MessageItemShareAwemecontainer');
       if (!card) continue;
       const clickTarget = message.querySelector('.MessageBoxContentactiveClickArea') || card;
-      const rect = clickTarget.getBoundingClientRect();
-      const relativeCenter = listRect.width > 0
-        ? (rect.left + rect.width / 2 - listRect.left) / listRect.width
-        : 0.5;
-      if (relativeCenter >= 0.45) continue;
       clickTarget.scrollIntoView({ block: 'center', inline: 'center' });
       const centeredRect = clickTarget.getBoundingClientRect();
       return {
@@ -662,21 +659,16 @@ export function buildReadCompatibleAwemeSourceExpression() {
   return `(async () => {
     const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
     if (!list) return { ok: false, reason: 'message-list-not-found' };
-    const listRect = list.getBoundingClientRect();
     const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
       .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
     let card = null;
     for (const message of messages) {
+      ${MESSAGE_SIDE_CAPTURE_SOURCE}
+      if (side !== 'left') continue;
       const candidate = message.querySelector('.MessageItemShareAwemecontainer');
       if (!candidate) continue;
-      const rect = candidate.getBoundingClientRect();
-      const relativeCenter = listRect.width > 0
-        ? (rect.left + rect.width / 2 - listRect.left) / listRect.width
-        : 0.5;
-      if (relativeCenter < 0.45) {
-        card = candidate;
-        break;
-      }
+      card = candidate;
+      break;
     }
     if (!card) return { ok: false, reason: 'aweme-card-not-found' };
     const fiberKey = Object.keys(card).find((key) => key.startsWith('__reactFiber$'));
@@ -706,36 +698,40 @@ export function buildReadCompatibleAwemeMediaExpression() {
   return `(async () => {
     const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
     if (!list) return { ok: false, reason: 'message-list-not-found' };
-    const listRect = list.getBoundingClientRect();
     const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
       .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
     let card = null;
     for (const message of messages) {
+      ${MESSAGE_SIDE_CAPTURE_SOURCE}
+      if (side !== 'left') continue;
       const candidate = message.querySelector('.MessageItemShareAwemecontainer');
       if (!candidate) continue;
-      const rect = candidate.getBoundingClientRect();
-      const relativeCenter = listRect.width > 0
-        ? (rect.left + rect.width / 2 - listRect.left) / listRect.width
-        : 0.5;
-      if (relativeCenter < 0.45) {
-        card = candidate;
-        break;
-      }
+      card = candidate;
+      break;
     }
     if (!card) return { ok: false, reason: 'aweme-card-not-found' };
     const fiberKey = Object.keys(card).find((key) => key.startsWith('__reactFiber$'));
     let fiber = fiberKey ? card[fiberKey] : null;
-    let itemId = null;
-    for (let depth = 0; fiber && depth < 20 && !itemId; depth += 1, fiber = fiber.return) {
-      itemId = fiber.memoizedProps?.message?.parsedContent?.itemId || null;
+    let parsedContent = null;
+    for (let depth = 0; fiber && depth < 20 && !parsedContent; depth += 1, fiber = fiber.return) {
+      const candidate = fiber.memoizedProps?.message?.parsedContent;
+      if (candidate && typeof candidate === 'object') parsedContent = candidate;
     }
-    if (!itemId) return { ok: false, reason: 'aweme-item-id-not-found' };
-    const response = await fetch('/aweme/v1/web/aweme/detail/?aweme_id=' + encodeURIComponent(itemId), {
-      credentials: 'include',
-    });
-    if (!response.ok) return { ok: false, reason: 'aweme-detail-request-failed' };
-    const payload = await response.json();
-    const detail = payload?.aweme_detail;
+    const itemId = parsedContent?.itemId || null;
+    let detail = null;
+    if (itemId) {
+      try {
+        const response = await fetch('/aweme/v1/web/aweme/detail/?aweme_id=' + encodeURIComponent(itemId), {
+          credentials: 'include',
+        });
+        if (response.ok) {
+          const payload = await response.json();
+          detail = payload?.aweme_detail || null;
+        }
+      } catch {
+        detail = null;
+      }
+    }
     const video = detail?.video;
     const h264Urls = video?.play_addr_h264?.url_list;
     const defaultUrls = video?.play_addr?.url_list;
@@ -770,21 +766,85 @@ export function buildReadCompatibleAwemeMediaExpression() {
       }
       return null;
     }).filter(Boolean);
-    if (allSources.length === 0) {
-      return { ok: false, reason: 'compatible-aweme-media-not-found' };
+    if (allSources.length > 0) {
+      const maxImages = 12;
+      const selectedIndexes = allSources.length <= maxImages
+        ? allSources.map((_, index) => index)
+        : Array.from({ length: maxImages }, (_, index) =>
+          Math.round(index * (allSources.length - 1) / (maxImages - 1))
+        );
+      return {
+        ok: true,
+        mediaType: 'image_post',
+        sources: selectedIndexes.map((index) => allSources[index]),
+        totalImageCount: allSources.length,
+        sampled: allSources.length > maxImages,
+      };
     }
-    const maxImages = 12;
-    const selectedIndexes = allSources.length <= maxImages
-      ? allSources.map((_, index) => index)
-      : Array.from({ length: maxImages }, (_, index) =>
-        Math.round(index * (allSources.length - 1) / (maxImages - 1))
-      );
+    const coverLists = [
+      parsedContent?.cover_url_v2?.url_list,
+      parsedContent?.cover_url?.url_list,
+      parsedContent?.content_thumb?.url_list,
+    ];
+    for (const urls of coverLists) {
+      if (!Array.isArray(urls)) continue;
+      const source = urls.find((value) => typeof value === 'string' && value.length > 0);
+      if (source) {
+        return {
+          ok: true,
+          mediaType: 'shared_cover',
+          sources: [source],
+          totalImageCount: 1,
+          sampled: false,
+        };
+      }
+    }
+    return { ok: false, reason: 'compatible-aweme-media-not-found' };
+  })()`;
+}
+
+export function buildReadIncomingMediaTextExpression(message) {
+  if (!Number.isSafeInteger(message?.ordinalFromEnd) || message.ordinalFromEnd < 1 || message.ordinalFromEnd > 12
+      || !/^[0-9a-f]{64}$/u.test(message?.fingerprint)
+      || message?.kind !== "media" || message?.side !== "left") {
+    throw new Error("Incoming media metadata is invalid.");
+  }
+  const expected = {
+    ordinalFromEnd: message.ordinalFromEnd,
+    fingerprint: message.fingerprint,
+  };
+  return `(async () => {
+    ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
+    if (!list) return { ok: false, reason: 'message-list-not-found', text: null };
+    const expected = ${JSON.stringify(expected)};
+    const digest = async (value) => {
+      const bytes = new TextEncoder().encode(value);
+      const hash = await crypto.subtle.digest('SHA-256', bytes);
+      return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    };
+    const recent = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
+      .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top)
+      .slice(-12);
+    const message = recent[recent.length - expected.ordinalFromEnd];
+    if (!message) return { ok: false, reason: 'incoming-media-not-visible', text: null };
+    const bubble = message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)});
+    ${MESSAGE_SIDE_CAPTURE_SOURCE}
+    const hasMedia = Boolean(message.querySelector(
+      '.MessageItemShareAwemecontainer, .MessageItemImageImageBox, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]'
+    ));
+    if (side !== 'left' || !hasMedia) {
+      return { ok: false, reason: 'incoming-media-identity-changed', text: null };
+    }
+    const source = (bubble?.textContent || message.textContent || '').trim();
+    const fingerprint = await digest(['media', side, source].join('|'));
+    if (fingerprint !== expected.fingerprint) {
+      return { ok: false, reason: 'incoming-media-fingerprint-changed', text: null };
+    }
     return {
       ok: true,
-      mediaType: 'image_post',
-      sources: selectedIndexes.map((index) => allSources[index]),
-      totalImageCount: allSources.length,
-      sampled: allSources.length > maxImages,
+      chatFingerprint: opaqueId ? await digest(['douyin-opponent-v1', opaqueId].join('|')) : null,
+      text: (bubble?.textContent || '').trim() || null,
     };
   })()`;
 }
@@ -794,19 +854,15 @@ export function buildReadLatestIncomingTextExpression() {
     const list = document.querySelector(${JSON.stringify(DOUYIN_CHAT_LIST_SELECTOR)});
     if (!list) return { ok: false, reason: 'message-list-not-found' };
 
-    const listRect = list.getBoundingClientRect();
     const messages = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
       .sort((left, right) =>
         right.getBoundingClientRect().top - left.getBoundingClientRect().top
       );
     for (const message of messages) {
+      ${MESSAGE_SIDE_CAPTURE_SOURCE}
+      if (side !== 'left') continue;
       const textBubble = message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)});
       if (!textBubble) continue;
-      const bubbleRect = textBubble.getBoundingClientRect();
-      const relativeCenter = listRect.width > 0
-        ? (bubbleRect.left + bubbleRect.width / 2 - listRect.left) / listRect.width
-        : 0.5;
-      if (relativeCenter >= 0.45) continue;
 
       const text = (textBubble.textContent || '').trim();
       if (!text) continue;
@@ -844,7 +900,6 @@ export function buildReadIncomingTextBatchExpression(messages) {
       const hash = await crypto.subtle.digest('SHA-256', bytes);
       return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
     };
-    const listRect = list.getBoundingClientRect();
     const recent = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
       .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top)
       .slice(-12);
@@ -853,11 +908,8 @@ export function buildReadIncomingTextBatchExpression(messages) {
       const message = recent[recent.length - descriptor.ordinalFromEnd];
       const bubble = message?.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)});
       if (!message || !bubble) return { ok: false, reason: 'incoming-text-not-visible', texts: [] };
-      const rect = bubble.getBoundingClientRect();
-      const relativeCenter = listRect.width > 0
-        ? (rect.left + rect.width / 2 - listRect.left) / listRect.width
-        : 0.5;
-      if (relativeCenter >= 0.45) return { ok: false, reason: 'incoming-text-side-changed', texts: [] };
+      ${MESSAGE_SIDE_CAPTURE_SOURCE}
+      if (side !== 'left') return { ok: false, reason: 'incoming-text-side-changed', texts: [] };
       const text = (bubble.textContent || '').trim();
       if (!text) return { ok: false, reason: 'incoming-text-empty', texts: [] };
       captured.push({ descriptor, text, structuralKey: ['text', 'left', text].join('|') });
@@ -887,7 +939,6 @@ export function buildReadRecentConversationExpression(limit = 12) {
       const hash = await crypto.subtle.digest('SHA-256', bytes);
       return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
     };
-    const listRect = list.getBoundingClientRect();
     const ordered = Array.from(list.querySelectorAll(${JSON.stringify(DOUYIN_MESSAGE_SELECTOR)}))
       .sort((left, right) =>
         left.getBoundingClientRect().top - right.getBoundingClientRect().top
@@ -896,12 +947,8 @@ export function buildReadRecentConversationExpression(limit = 12) {
     for (const message of ordered) {
       const bubble = message.querySelector(${JSON.stringify(DOUYIN_TEXT_BUBBLE_SELECTOR)});
       if (!bubble) continue;
-      const rect = bubble.getBoundingClientRect();
-      const relativeCenter = listRect.width > 0
-        ? (rect.left + rect.width / 2 - listRect.left) / listRect.width
-        : 0.5;
-      const side = relativeCenter < 0.45 ? 'left' : relativeCenter > 0.55 ? 'right' : null;
-      const role = relativeCenter < 0.45 ? 'user' : relativeCenter > 0.55 ? 'assistant' : null;
+      ${MESSAGE_SIDE_CAPTURE_SOURCE}
+      const role = side === 'left' ? 'user' : side === 'right' ? 'assistant' : null;
       const text = (bubble.textContent || '').trim();
       if (role && text) messages.push({
         role,

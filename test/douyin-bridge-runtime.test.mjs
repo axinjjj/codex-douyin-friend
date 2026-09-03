@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { CodexAppServerRequestError } from "../src/codex-app-server-client.mjs";
 import {
   DouyinSendAbortedError,
+  classifyDouyinIncomingBatch,
   generateDouyinImageReply,
   generateDouyinReply,
   generateDouyinVideoReply,
@@ -11,6 +12,17 @@ import {
   sendAndVerifyDouyinReply,
   startVerifiedPersonaThread,
 } from "../src/douyin-bridge-runtime.mjs";
+
+test("combines text plus exactly one media item into one incoming media batch", () => {
+  const text = { kind: "text", fingerprint: "a".repeat(64) };
+  const media = { kind: "media", fingerprint: "b".repeat(64) };
+  const combined = classifyDouyinIncomingBatch([text, media]);
+  assert.equal(combined.mode, "media");
+  assert.deepEqual(combined.textMessages, [text]);
+  assert.equal(combined.mediaMessage, media);
+  assert.equal(classifyDouyinIncomingBatch([media, { ...media }]).mode, "ambiguous");
+  assert.equal(classifyDouyinIncomingBatch([text, { ...text }]).mode, "text");
+});
 
 test("lets text replies choose a natural length", async () => {
   let turn;
@@ -377,6 +389,24 @@ test("states the visual-only boundary when audio processing is unavailable", asy
   assert.match(turn.input[0].text, /不要声称听到了声音/u);
 });
 
+test("keeps text attached to a shared video in the media turn", async () => {
+  let turn;
+  await generateDouyinVideoReply({
+    codex: {
+      async runTurn(value) {
+        turn = value;
+        return "一起回应";
+      },
+    },
+    threadId: "thread-1",
+    framePaths: ["C:/runtime/frame-01.png"],
+    durationSeconds: 5,
+    inboundText: "你觉得他说得对吗？",
+  });
+  assert.match(turn.input[0].text, /同时附带/u);
+  assert.match(turn.input[0].text, /你觉得他说得对吗/u);
+});
+
 test("marks direct chat images as media content and sends them to the same thread", async () => {
   let turn;
   const reply = await generateDouyinImageReply({
@@ -417,6 +447,26 @@ test("states the sampling boundary for a long image post", async () => {
   assert.match(turn.input[0].text, /图文作品/u);
   assert.match(turn.input[0].text, /原作品共有 20 张图/u);
   assert.match(turn.input[0].text, /不要声称看见了未提供的图片/u);
+});
+
+test("states the cover-only boundary and keeps attached text", async () => {
+  let turn;
+  await generateDouyinImageReply({
+    codex: {
+      async runTurn(value) {
+        turn = value;
+        return "只根据封面回应";
+      },
+    },
+    threadId: "thread-1",
+    imagePaths: ["C:/runtime/cover.png"],
+    mediaType: "shared_cover",
+    totalImageCount: 1,
+    inboundText: "看看这个",
+  });
+  assert.match(turn.input[0].text, /只提供了分享卡片封面/u);
+  assert.match(turn.input[0].text, /不要声称看过完整视频、图文、声音或正文/u);
+  assert.match(turn.input[0].text, /看看这个/u);
 });
 
 test("refuses duplicate keyframe paths or inputs above the hard frame limit", async () => {

@@ -18,11 +18,13 @@ import {
   buildBridgeStartupViewExpression,
   buildClassifyLatestIncomingMediaExpression,
   buildReadCompatibleAwemeMediaExpression,
+  buildReadIncomingMediaTextExpression,
   buildReadIncomingTextBatchExpression,
   isDouyinChatTarget,
 } from "../src/douyin-chat-page.mjs";
 import {
   DouyinSendAbortedError,
+  classifyDouyinIncomingBatch,
   generateDouyinReply,
   generateDouyinImageReply,
   generateDouyinVideoReply,
@@ -272,7 +274,7 @@ try {
     }
     await sleep(750);
     if (stopRequested) break;
-    const currentMetadata = await cdp.evaluate(buildChatMessageMetadataExpression());
+    let currentMetadata = await cdp.evaluate(buildChatMessageMetadataExpression());
     if (currentMetadata.chatFingerprint !== lockedChat.fingerprint) {
       setBridgePhase("blocked");
       console.log(JSON.stringify({ ok: false, event: "chat-changed-bridge-stopped" }));
@@ -280,12 +282,39 @@ try {
       break;
     }
 
-    const current = normalizeBridgeSnapshot({
+    let current = normalizeBridgeSnapshot({
       messageCount: currentMetadata.messageCount,
       messages: currentMetadata.messages,
     });
-    const appended = findAppendedMessages(previous, current);
+    let appended = findAppendedMessages(previous, current);
     if (appended.length === 0) continue;
+    if (appended.some((message) => message.side === "left")) {
+      let chatChangedDuringSettle = false;
+      for (let settleRound = 0; settleRound < 3 && !stopRequested; settleRound += 1) {
+        await sleep(750);
+        const settledMetadata = await cdp.evaluate(buildChatMessageMetadataExpression());
+        if (settledMetadata.chatFingerprint !== lockedChat.fingerprint) {
+          setBridgePhase("blocked");
+          chatChangedDuringSettle = true;
+          break;
+        }
+        const settled = normalizeBridgeSnapshot({
+          messageCount: settledMetadata.messageCount,
+          messages: settledMetadata.messages,
+        });
+        const additional = findAppendedMessages(current, settled);
+        currentMetadata = settledMetadata;
+        current = settled;
+        if (additional.length === 0) break;
+      }
+      if (stopRequested) break;
+      if (chatChangedDuringSettle) {
+        console.log(JSON.stringify({ ok: false, event: "chat-changed-bridge-stopped" }));
+        process.exitCode = 4;
+        break;
+      }
+      appended = findAppendedMessages(previous, current);
+    }
     const incoming = appended.filter((message) => (
       message.side === "left" && (message.kind === "text" || message.kind === "media")
     ));
@@ -359,9 +388,8 @@ try {
       continue;
     }
 
-    const textBatch = incoming.every((message) => message.kind === "text");
-    const singleMedia = incoming.length === 1 && incoming[0].kind === "media";
-    if ((!textBatch && !singleMedia) || unsupportedIncoming.length > 0) {
+    const incomingBatch = classifyDouyinIncomingBatch(incoming);
+    if (incomingBatch.mode === "ambiguous" || unsupportedIncoming.length > 0) {
       setBridgePhase("blocked");
       activeState = createBridgeState({
         chatKey: lockedChat.fingerprint,
@@ -402,12 +430,13 @@ try {
     try {
       let reply;
       let replyKind;
-      if (textBatch) {
-        const inbound = await cdp.evaluate(buildReadIncomingTextBatchExpression(incoming));
+      if (incomingBatch.mode === "text") {
+        const inbound = await cdp.evaluate(buildReadIncomingTextBatchExpression(incomingBatch.textMessages));
         if (inbound?.chatFingerprint !== lockedChat.fingerprint) {
           throw new Error("The Douyin chat changed before text capture; refusing the wrong conversation.");
         }
-        if (!inbound.ok || !Array.isArray(inbound.texts) || inbound.texts.length !== incoming.length) {
+        if (!inbound.ok || !Array.isArray(inbound.texts)
+            || inbound.texts.length !== incomingBatch.textMessages.length) {
           throw new Error("New incoming messages were detected but could not be read exactly.");
         }
         reply = await generateDouyinReply({
@@ -432,6 +461,26 @@ try {
         if (findAppendedMessages(current, mediaCheck).length !== 0) {
           throw new Error("The Douyin chat changed before media capture; refusing to analyze the wrong item.");
         }
+        const inboundTextParts = [];
+        if (incomingBatch.textMessages.length > 0) {
+          const inbound = await cdp.evaluate(buildReadIncomingTextBatchExpression(incomingBatch.textMessages));
+          if (inbound?.chatFingerprint !== lockedChat.fingerprint
+              || !inbound.ok || !Array.isArray(inbound.texts)
+              || inbound.texts.length !== incomingBatch.textMessages.length) {
+            throw new Error("Text accompanying the Douyin media could not be read exactly.");
+          }
+          inboundTextParts.push(...inbound.texts);
+        }
+        const mediaMessage = await cdp.evaluate(
+          buildReadIncomingMediaTextExpression(incomingBatch.mediaMessage),
+        );
+        if (!mediaMessage?.ok || mediaMessage.chatFingerprint !== lockedChat.fingerprint) {
+          throw new Error(`The incoming Douyin media changed before capture: ${mediaMessage?.reason || "unknown"}.`);
+        }
+        if (mediaMessage.text && !inboundTextParts.includes(mediaMessage.text)) {
+          inboundTextParts.push(mediaMessage.text);
+        }
+        const inboundText = inboundTextParts.join("\n") || null;
         const mediaClassification = await cdp.evaluate(buildClassifyLatestIncomingMediaExpression());
         if (!mediaClassification?.ok) {
           throw new Error(`The latest Douyin media type is unsupported: ${mediaClassification?.reason || "unknown"}.`);
@@ -460,7 +509,8 @@ try {
                 }),
               }),
             };
-          } else if (sharedManifest.mediaType === "image_post") {
+          } else if (sharedManifest.mediaType === "image_post"
+              || sharedManifest.mediaType === "shared_cover") {
             media = await prepareDouyinImagePost({
               projectRoot,
               manifest: sharedManifest,
@@ -476,13 +526,14 @@ try {
             || currentChatAfterCapture.fingerprint !== lockedChat.fingerprint) {
           throw new Error("The Douyin chat changed during media capture; refusing the wrong conversation.");
         }
-        if (media.kind === "chat_image" || media.kind === "image_post") {
+        if (media.kind === "chat_image" || media.kind === "image_post" || media.kind === "shared_cover") {
           reply = await generateDouyinImageReply({
             codex: contextManager,
             threadId: runtime.threadId,
             imagePaths: media.imagePaths,
             mediaType: media.kind,
             totalImageCount: media.totalImageCount ?? media.imagePaths.length,
+            inboundText,
             model: runtime.model,
             effort: runtime.effort,
           });
@@ -505,6 +556,7 @@ try {
             framePaths: media.framePaths,
             durationSeconds: media.duration,
             audioUnderstanding,
+            inboundText,
             model: runtime.model,
             effort: runtime.effort,
           });
@@ -641,7 +693,7 @@ try {
       break;
     } finally {
       if (media?.jobDirectory) {
-        if (media.kind === "chat_image" || media.kind === "image_post") {
+        if (media.kind === "chat_image" || media.kind === "image_post" || media.kind === "shared_cover") {
           await removeImageAnalysisJob(projectRoot, media.jobDirectory);
         } else {
           await removeVideoAnalysisJob(projectRoot, media.jobDirectory);

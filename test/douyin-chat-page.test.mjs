@@ -7,8 +7,10 @@ import {
   buildChatIdentityMetadataExpression,
   buildLatestIncomingMediaStructureExpression,
   buildLocateLatestIncomingChatImageExpression,
+  buildReadLatestIncomingChatImageSourceExpression,
   buildLocateLatestIncomingAwemeExpression,
   buildReadIncomingTextBatchExpression,
+  buildReadIncomingMediaTextExpression,
   buildReadCompatibleAwemeMediaExpression,
   buildReadLatestIncomingTextExpression,
   buildReadXgPlayerSourceExpression,
@@ -149,12 +151,19 @@ test("video-card operations stay scoped to the visible page DOM", () => {
 test("direct-image operations classify and capture only visible incoming content", () => {
   const classification = buildClassifyLatestIncomingMediaExpression();
   const locator = buildLocateLatestIncomingChatImageExpression();
+  const sourceReader = buildReadLatestIncomingChatImageSourceExpression();
   assert.match(classification, /shared_aweme/u);
   assert.match(classification, /chat_image/u);
   assert.match(locator, /scrollIntoView/u);
+  assert.match(locator, /setTimeout\(resolve, 100\)/u);
+  assert.doesNotMatch(locator, /requestAnimationFrame/u);
+  assert.match(sourceReader, /currentSrc/u);
+  assert.doesNotMatch(sourceReader, /document\.cookie|localStorage|sessionStorage/u);
   assert.match(locator, /clip/u);
   for (const expression of [classification, locator]) {
-    assert.match(expression, /relativeCenter < 0\.45|relativeCenter >= 0\.45/u);
+    assert.match(expression, /messageMessageBoxisFromMe/u);
+    assert.match(expression, /side !== 'left'/u);
+    assert.doesNotMatch(expression, /relativeCenter/u);
     assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
     assert.doesNotMatch(expression, /textContent|innerText|outerHTML|innerHTML/u);
     assert.doesNotMatch(expression, /\.src\b|getAttribute\(['"]src/u);
@@ -187,9 +196,26 @@ test("shared-work inspection distinguishes videos from ordered image posts", () 
   const expression = buildReadCompatibleAwemeMediaExpression();
   assert.match(expression, /mediaType: 'video'/u);
   assert.match(expression, /mediaType: 'image_post'/u);
+  assert.match(expression, /mediaType: 'shared_cover'/u);
+  assert.match(expression, /cover_url_v2/u);
   assert.match(expression, /image_post_info/u);
   assert.match(expression, /selectedIndexes/u);
   assert.match(expression, /maxImages = 12/u);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
   assert.doesNotMatch(expression, /return \{[^}]*itemId/u);
+});
+
+test("message metadata gives media priority and preserves attached-text identity", () => {
+  for (const expression of [buildChatMessageMetadataExpression(), buildBridgeStartupViewExpression()]) {
+    assert.match(expression, /hasMedia \? 'media' : (?:textBubble|bubble) \? 'text'/u);
+  }
+  const expression = buildReadIncomingMediaTextExpression({
+    ordinalFromEnd: 1,
+    fingerprint: "a".repeat(64),
+    kind: "media",
+    side: "left",
+  });
+  assert.match(expression, /incoming-media-fingerprint-changed/u);
+  assert.match(expression, /bubble\?\.textContent/u);
+  assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
 });

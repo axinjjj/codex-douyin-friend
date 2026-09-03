@@ -31,6 +31,7 @@ test("captures only a bounded visible chat-image clip into an isolated job", asy
     projectRoot,
     cdp: {
       async evaluate(expression) {
+        if (expression.includes("currentSrc")) return { ok: false, reason: "source-unavailable" };
         assert.match(expression, /chat-image-not-found/u);
         return {
           ok: true,
@@ -57,7 +58,8 @@ test("refuses invalid clips, non-PNG captures, and paths outside the job root", 
   await assert.rejects(captureLatestDouyinChatImage({
     projectRoot,
     cdp: {
-      async evaluate() {
+      async evaluate(expression) {
+        if (expression.includes("currentSrc")) return { ok: false, reason: "source-unavailable" };
         return { ok: true, clip: { x: -1, y: 0, width: 10, height: 10, scale: 1 } };
       },
       async request() {
@@ -68,7 +70,8 @@ test("refuses invalid clips, non-PNG captures, and paths outside the job root", 
   await assert.rejects(captureLatestDouyinChatImage({
     projectRoot,
     cdp: {
-      async evaluate() {
+      async evaluate(expression) {
+        if (expression.includes("currentSrc")) return { ok: false, reason: "source-unavailable" };
         return { ok: true, clip: { x: 1, y: 1, width: 40, height: 40, scale: 1 } };
       },
       async request() {
@@ -77,6 +80,59 @@ test("refuses invalid clips, non-PNG captures, and paths outside the job root", 
     },
   }), /not a valid bounded PNG/u);
   assert.throws(() => assertImageAnalysisJobPath(projectRoot, projectRoot), /outside/u);
+});
+
+test("downloads a direct chat image from a trusted visible source before screenshot fallback", async (t) => {
+  const projectRoot = await temporaryRoot(t);
+  let screenshotRequested = false;
+  const result = await captureLatestDouyinChatImage({
+    projectRoot,
+    cdp: {
+      async evaluate(expression) {
+        assert.match(expression, /currentSrc/u);
+        return { ok: true, source: "https://p3.douyinpic.com/chat-image" };
+      },
+      async request() {
+        screenshotRequested = true;
+        throw new Error("must not capture");
+      },
+    },
+    async fetchFn() {
+      return new Response(ONE_PIXEL_PNG, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      });
+    },
+  });
+  assert.equal(screenshotRequested, false);
+  assert.equal(result.byteCount, ONE_PIXEL_PNG.length);
+  assert.equal(path.extname(result.imagePaths[0]), ".png");
+  await removeImageAnalysisJob(projectRoot, result.jobDirectory);
+});
+
+test("decodes a bounded embedded direct chat image before screenshot fallback", async (t) => {
+  const projectRoot = await temporaryRoot(t);
+  let screenshotRequested = false;
+  const result = await captureLatestDouyinChatImage({
+    projectRoot,
+    cdp: {
+      async evaluate(expression) {
+        assert.match(expression, /currentSrc/u);
+        return {
+          ok: true,
+          source: `data:image/jpeg;base64,${ONE_PIXEL_PNG.toString("base64")}`,
+        };
+      },
+      async request() {
+        screenshotRequested = true;
+        throw new Error("must not capture");
+      },
+    },
+  });
+  assert.equal(screenshotRequested, false);
+  assert.equal(result.byteCount, ONE_PIXEL_PNG.length);
+  assert.equal(path.extname(result.imagePaths[0]), ".png");
+  await removeImageAnalysisJob(projectRoot, result.jobDirectory);
 });
 
 test("stale cleanup removes only UUID job directories", async (t) => {
@@ -128,6 +184,43 @@ test("downloads an ordered image-post sample from trusted Douyin media hosts", a
   assert.equal(requested[0].options.redirect, "error");
   for (const imagePath of result.imagePaths) await access(imagePath);
   await removeImageAnalysisJob(projectRoot, result.jobDirectory);
+});
+
+test("downloads one trusted share-card cover with an explicit cover kind", async (t) => {
+  const projectRoot = await temporaryRoot(t);
+  const result = await prepareDouyinImagePost({
+    projectRoot,
+    manifest: {
+      ok: true,
+      mediaType: "shared_cover",
+      sources: ["https://p3.douyinpic.com/cover"],
+      totalImageCount: 1,
+      sampled: false,
+    },
+    async fetchFn() {
+      return new Response(ONE_PIXEL_PNG, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      });
+    },
+  });
+  assert.equal(result.kind, "shared_cover");
+  assert.equal(result.imagePaths.length, 1);
+  await removeImageAnalysisJob(projectRoot, result.jobDirectory);
+});
+
+test("refuses a multi-image share-card cover manifest", async (t) => {
+  const projectRoot = await temporaryRoot(t);
+  await assert.rejects(prepareDouyinImagePost({
+    projectRoot,
+    manifest: {
+      ok: true,
+      mediaType: "shared_cover",
+      sources: ["https://p3.douyinpic.com/one", "https://p6.byteimg.com/two"],
+      totalImageCount: 2,
+      sampled: false,
+    },
+  }), /manifest is invalid/u);
 });
 
 test("refuses image-post downloads from an untrusted host", async (t) => {
