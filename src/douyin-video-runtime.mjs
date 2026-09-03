@@ -42,6 +42,7 @@ const DEFAULT_DOWNLOAD_TIMEOUT_MS = 120_000;
 const DEFAULT_DOWNLOAD_WALL_TIME_MS = 6 * 60_000;
 const VIDEO_SOURCE_ATTEMPT_TIMEOUT_MS = 30_000;
 const VIDEO_RANGE_CHUNK_BYTES = 1024 * 1024;
+const VIDEO_RANGE_ATTEMPTS = 3;
 const MAX_VIDEO_SOURCE_CANDIDATES = 4;
 const MAX_VIDEO_SOURCE_REDIRECTS = 2;
 const VIDEO_JOB_NAME_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -240,36 +241,55 @@ export async function downloadDouyinVideo({
         throw new Error("Douyin media download exceeded its wall-time limit.");
       }
       const end = Math.min(probeRange.total - 1, start + VIDEO_RANGE_CHUNK_BYTES - 1);
-      ({ request, response, finalSource: currentSource } = await openDouyinVideoResponse({
-        source: currentSource,
-        timeoutMs: Math.min(boundedTimeoutMs, Math.max(1_000, deadline - Date.now())),
-        requestFn: (rangeSource, options, callback) => requestFn(rangeSource, {
-          ...options,
-          headers: { ...options.headers, Range: `bytes=${start}-${end}` },
-        }, callback),
-      }));
-      if (response.statusCode !== 206) {
-        throw new Error(`Douyin media range download failed with HTTP ${response.statusCode}.`);
-      }
-      const returnedRange = parseDouyinContentRange(response.headers["content-range"]);
-      if (!returnedRange || returnedRange.start !== start || returnedRange.end !== end
-          || returnedRange.total !== probeRange.total) {
-        throw new Error("Douyin media returned an unexpected byte range.");
-      }
       const expectedBytes = end - start + 1;
-      let receivedBytes = 0;
-      for await (const value of response) {
-        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
-        receivedBytes += chunk.byteLength;
-        byteCount += chunk.byteLength;
-        if (receivedBytes > expectedBytes || byteCount > boundedMaxBytes) {
-          throw new Error("Douyin video exceeds the local size limit.");
+      let completedRange = null;
+      for (let attempt = 0; attempt < VIDEO_RANGE_ATTEMPTS && !completedRange; attempt += 1) {
+        if (wallTimeExpired || Date.now() >= deadline) break;
+        try {
+          const opened = await openDouyinVideoResponse({
+            source: attempt === 0 ? currentSource : source,
+            timeoutMs: Math.min(boundedTimeoutMs, Math.max(1_000, deadline - Date.now())),
+            requestFn: (rangeSource, options, callback) => requestFn(rangeSource, {
+              ...options,
+              headers: { ...options.headers, Range: `bytes=${start}-${end}` },
+            }, callback),
+          });
+          request = opened.request;
+          response = opened.response;
+          if (response.statusCode !== 206) {
+            throw new Error(`Douyin media range download failed with HTTP ${response.statusCode}.`);
+          }
+          const returnedRange = parseDouyinContentRange(response.headers["content-range"]);
+          if (!returnedRange || returnedRange.start !== start || returnedRange.end !== end
+              || returnedRange.total !== probeRange.total) {
+            throw new Error("Douyin media returned an unexpected byte range.");
+          }
+          const chunks = [];
+          let receivedBytes = 0;
+          for await (const value of response) {
+            const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+            receivedBytes += chunk.byteLength;
+            if (receivedBytes > expectedBytes) {
+              throw new Error("Douyin media returned an oversized byte range.");
+            }
+            chunks.push(chunk);
+          }
+          if (receivedBytes !== expectedBytes) {
+            throw new Error("Douyin media returned an incomplete byte range.");
+          }
+          completedRange = Buffer.concat(chunks, receivedBytes);
+          currentSource = opened.finalSource;
+        } catch {
+          response?.destroy();
+          request?.destroy();
         }
-        await handle.write(chunk);
       }
-      if (receivedBytes !== expectedBytes) {
-        throw new Error("Douyin media returned an incomplete byte range.");
+      if (!completedRange) {
+        throw new Error("Douyin media range failed after bounded retries.");
       }
+      byteCount += completedRange.byteLength;
+      if (byteCount > boundedMaxBytes) throw new Error("Douyin video exceeds the local size limit.");
+      await handle.write(completedRange);
     }
     if (byteCount !== probeRange.total) throw new Error("Douyin video download was incomplete.");
     await handle.close();

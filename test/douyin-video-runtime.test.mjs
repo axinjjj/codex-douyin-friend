@@ -199,6 +199,37 @@ test("video download follows only bounded trusted redirects", async () => {
   }
 });
 
+test("video download retries an incomplete range without writing duplicate bytes", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "codex-douyin-video-range-retry-"));
+  const destination = path.join(projectRoot, "video.mp4");
+  let requestCount = 0;
+  try {
+    const result = await downloadDouyinVideo({
+      source: "https://v5-dy.zjcdn.com/video.mp4",
+      destination,
+      requestFn: createRequestFn((_source, options) => {
+        requestCount += 1;
+        if (options.headers.Range === "bytes=0-0") {
+          return Object.assign(Readable.from([Buffer.from([1])]), {
+            statusCode: 206,
+            headers: { "content-type": "video/mp4", "content-range": "bytes 0-0/3" },
+          });
+        }
+        const bytes = requestCount === 2 ? Buffer.from([1]) : Buffer.from([1, 2, 3]);
+        return Object.assign(Readable.from([bytes]), {
+          statusCode: 206,
+          headers: { "content-type": "video/mp4", "content-range": "bytes 0-2/3" },
+        });
+      }),
+    });
+    assert.equal(requestCount, 3);
+    assert.equal(result.byteCount, 3);
+    assert.deepEqual(await readFile(destination), Buffer.from([1, 2, 3]));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("tries bounded trusted video source candidates in order", async () => {
   const calls = [];
   const result = await downloadCompatibleDouyinVideo({
