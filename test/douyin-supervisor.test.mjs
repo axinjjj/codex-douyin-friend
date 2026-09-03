@@ -114,7 +114,7 @@ test("starts a supervised hidden bridge and exposes sanitized live status", asyn
   assert.match(command, /"command":"compact"/u);
 });
 
-test("blocks instead of restarting after a crash during dangerous work", async (t) => {
+test("blocks safely after an unknown media structure crashes during processing", async (t) => {
   const root = await temporaryRoot(t);
   const child = new FakeChild();
   const timers = [];
@@ -131,11 +131,25 @@ test("blocks instead of restarting after a crash during dangerous work", async (
   });
   await supervisor.start();
   child.stdout.write('{"event":"bridge-status","phase":"processing"}\n');
+  child.stdout.write(`${JSON.stringify({
+    event: "unknown-media-structure",
+    reason: "unsupported-media-type",
+    diagnostic: {
+      version: 1,
+      signature: "a".repeat(64),
+      body: "must-not-enter-status",
+      url: "https://example.invalid/must-not-enter-status",
+      accountId: "must-not-enter-status",
+      itemId: "must-not-enter-status",
+    },
+  })}\n`);
   await new Promise((resolve) => setImmediate(resolve));
   child.emit("exit", 1, null);
 
-  assert.equal(supervisor.getStatus().phase, "blocked");
-  assert.equal(supervisor.getStatus().actionPermissions.reconnect, true);
+  const status = supervisor.getStatus();
+  assert.equal(status.phase, "blocked");
+  assert.equal(status.actionPermissions.reconnect, true);
+  assert.doesNotMatch(JSON.stringify(status), /must-not-enter-status/u);
   assert.equal(timers.length, 0);
 });
 
