@@ -314,9 +314,13 @@ export function rebindPendingMessages(snapshot, pendingMessages) {
 function firstPendingBatchLength(pending) {
   let length = 0;
   while (length < pending.length && pending[length].kind === "text") length += 1;
-  if (length < pending.length && pending[length].kind === "media") return length + 1;
   if (length === pending.length) return length;
-  throw new Error("The persisted Douyin queue contains an unsupported message kind.");
+  if (pending[length].kind !== "media") {
+    throw new Error("The persisted Douyin queue contains an unsupported message kind.");
+  }
+  length += 1;
+  while (length < pending.length && pending[length].kind === "text") length += 1;
+  return length;
 }
 
 export function findAppendedMessages(previousSnapshot, currentSnapshot) {

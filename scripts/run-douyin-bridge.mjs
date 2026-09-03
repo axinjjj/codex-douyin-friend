@@ -30,6 +30,7 @@ import {
   generateDouyinVideoReply,
   planDouyinIncomingQueue,
   preparePersistentBridgeSession,
+  sanitizeDouyinMediaDiagnostic,
   sendAndVerifyDouyinReply,
 } from "../src/douyin-bridge-runtime.mjs";
 import {
@@ -509,6 +510,13 @@ try {
           buildClassifyLatestIncomingMediaExpression(incomingBatch.mediaMessage),
         );
         if (!mediaClassification?.ok) {
+          const diagnostic = sanitizeDouyinMediaDiagnostic(mediaClassification?.diagnostic);
+          console.log(JSON.stringify({
+            ok: false,
+            event: "unknown-media-structure",
+            reason: "unsupported-media-type",
+            ...(diagnostic ? { diagnostic } : {}),
+          }));
           throw new Error(`The latest Douyin media type is unsupported: ${mediaClassification?.reason || "unknown"}.`);
         }
         let sharedComment = null;

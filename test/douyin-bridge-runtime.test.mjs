@@ -10,6 +10,7 @@ import {
   parseDouyinMediaReply,
   planDouyinIncomingQueue,
   preparePersistentBridgeSession,
+  sanitizeDouyinMediaDiagnostic,
   sendAndVerifyDouyinReply,
   startVerifiedPersonaThread,
 } from "../src/douyin-bridge-runtime.mjs";
@@ -36,11 +37,46 @@ test("plans incoming text and media into chronological reply batches", () => {
   ]);
   assert.equal(plan.ok, true);
   assert.deepEqual(plan.batches.map((batch) => batch.messages), [
-    [text, media],
-    [secondText, secondMedia],
-    [trailingText],
+    [text, media, secondText],
+    [secondMedia, trailingText],
   ]);
+  assert.deepEqual(planDouyinIncomingQueue([media, trailingText]).batches[0], {
+    mode: "media",
+    textMessages: [trailingText],
+    mediaMessage: media,
+    messages: [media, trailingText],
+  });
   assert.equal(planDouyinIncomingQueue([{ ...text, side: "right" }]).ok, false);
+});
+
+test("sanitizes unknown media diagnostics before a safe stop", () => {
+  const diagnostic = sanitizeDouyinMediaDiagnostic({
+    version: 1,
+    signature: "a".repeat(64),
+    descendantCount: 12,
+    imageCount: 2,
+    videoCount: 0,
+    canvasCount: 0,
+    buttonCount: 1,
+    classHints: ["BulletUnknownCard", "private text", "item-structure"],
+    attributeNames: ["role", "data-kind", "href", "src", "id"],
+    body: "private message",
+    url: "https://example.invalid/private",
+    accountId: "private-account",
+    itemId: "private-item",
+  });
+  assert.deepEqual(diagnostic, {
+    version: 1,
+    signature: "a".repeat(64),
+    descendantCount: 12,
+    imageCount: 2,
+    videoCount: 0,
+    canvasCount: 0,
+    buttonCount: 1,
+    classHints: ["BulletUnknownCard", "item-structure"],
+    attributeNames: ["role", "data-kind"],
+  });
+  assert.equal(sanitizeDouyinMediaDiagnostic({ version: 1, signature: "short" }), null);
 });
 
 test("lets text replies choose a natural length", async () => {

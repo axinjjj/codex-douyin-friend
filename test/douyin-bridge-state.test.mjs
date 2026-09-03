@@ -326,6 +326,32 @@ test("recovers only the unfinished tail after a verified queued send", () => {
   ]);
 });
 
+test("verified-send recovery consumes a media item and its following caption together", () => {
+  const firstMedia = message("first-media", "left", "media");
+  const followingCaption = message("following-caption");
+  const secondMedia = message("second-media", "left", "media");
+  const beforeSend = snapshot(3, [firstMedia, followingCaption, secondMedia]);
+  const outboundFingerprint = computeTextMessageFingerprint("first reply");
+  const sending = createBridgeState({
+    chatKey,
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
+    snapshot: beforeSend,
+    phase: "sending",
+    pending: [firstMedia, followingCaption, secondMedia],
+    outboundFingerprint,
+  });
+  const afterSend = snapshot(4, [
+    firstMedia,
+    followingCaption,
+    secondMedia,
+    { fingerprint: outboundFingerprint, kind: "text", side: "right" },
+  ]);
+  const recovered = recoverBridgeStateForStartup(sending, afterSend);
+  assert.deepEqual(recovered.queuedPending, [{ ...secondMedia, ordinalFromEnd: 2 }]);
+});
+
 test("rebinds a paused queue by occurrence and appends newly visible input", () => {
   const repeated = message("same", "left", "media");
   const reply = message("reply", "right");

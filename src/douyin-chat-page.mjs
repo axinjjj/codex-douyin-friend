@@ -4,10 +4,202 @@ export const DOUYIN_CHAT_LIST_SELECTOR = ".messageMessageListlist";
 export const DOUYIN_MESSAGE_SELECTOR = ".messageMessageBoxmessageBox";
 export const DOUYIN_TEXT_BUBBLE_SELECTOR = ".MessageItemTextbubbleTextContent";
 const DOUYIN_COMMENT_SHARE_SELECTOR = ".MessageItemCommentSharecontainer";
+export const DOUYIN_SHARED_WORK_VARIANTS = Object.freeze([
+  Object.freeze({ name: "legacy-aweme", selector: ".MessageItemShareAwemecontainer" }),
+  Object.freeze({ name: "bullet-video", selector: ".BulletBulletVideocontainer" }),
+]);
+const DOUYIN_SHARED_CARD_SELECTOR = DOUYIN_SHARED_WORK_VARIANTS
+  .map(({ selector }) => selector)
+  .join(", ");
 const DOUYIN_SHARED_WORK_SELECTOR =
-  `${DOUYIN_COMMENT_SHARE_SELECTOR}, .MessageItemShareAwemecontainer`;
+  `${DOUYIN_COMMENT_SHARE_SELECTOR}, ${DOUYIN_SHARED_CARD_SELECTOR}`;
 const DOUYIN_MEDIA_CONTENT_SELECTOR =
   `${DOUYIN_SHARED_WORK_SELECTOR}, .MessageItemImageImageBox, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]`;
+
+export function resolveDouyinSharedWorkManifest({ detail = null, parsedContent = null } = {}) {
+  const MAX_VISITED_OBJECTS = 1_200;
+  const MAX_DEPTH = 8;
+  const MAX_JSON_LENGTH = 1024 * 1024;
+  const MAX_IMAGE_COUNT = 10_000;
+  const MAX_SELECTED_IMAGES = 12;
+  const MAX_VIDEO_SOURCES = 6;
+  const IMAGE_WORK_TYPES = new Set(["68"]);
+  const field = (value, names) => {
+    if (!value || typeof value !== "object") return undefined;
+    for (const name of names) {
+      if (value[name] !== undefined && value[name] !== null) return value[name];
+    }
+    return undefined;
+  };
+  const parseBoundedObject = (value) => {
+    if (value && typeof value === "object") return value;
+    if (typeof value !== "string" || value.length === 0 || value.length > MAX_JSON_LENGTH
+        || !/^[\[{]/u.test(value.trimStart())) return null;
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      return null;
+    }
+  };
+  const collectUrls = (value, depth = 0, seen = new WeakSet()) => {
+    if (depth > 4 || value === null || value === undefined) return [];
+    if (typeof value === "string") return /^https?:\/\//iu.test(value) ? [value] : [];
+    if (typeof value !== "object" || seen.has(value)) return [];
+    seen.add(value);
+    if (Array.isArray(value)) {
+      return value.flatMap((entry) => collectUrls(entry, depth + 1, seen));
+    }
+    const urlFields = [
+      "url_list", "urlList", "download_url_list", "downloadUrlList",
+      "display_image", "displayImage", "owner_watermark_image", "ownerWatermarkImage",
+      "image", "url", "src",
+    ];
+    return urlFields.flatMap((name) => (
+      value[name] === undefined ? [] : collectUrls(value[name], depth + 1, seen)
+    ));
+  };
+  const firstUrl = (value) => collectUrls(value).find(Boolean) || null;
+  const imageGroups = [];
+  const videoObjects = [];
+  const covers = [];
+  const imageCountHints = [];
+  const workTypeHints = [];
+  const roots = [];
+  const addRoot = (value) => {
+    const parsed = parseBoundedObject(value);
+    if (parsed) roots.push(parsed);
+  };
+  addRoot(detail);
+  const awemeInfo = field(parsedContent, ["aweme_info", "awemeInfo"]);
+  addRoot(awemeInfo);
+  addRoot(parsedContent);
+  const dynamicPatch = field(parsedContent, ["im_dynamic_patch", "imDynamicPatch"]);
+  addRoot(field(dynamicPatch, ["raw_data", "rawData"]));
+  addRoot(field(parsedContent, ["dynamic_card_data", "dynamicCardData", "card_data", "cardData"]));
+
+  const seen = new WeakSet();
+  let visited = 0;
+  const walk = (value, depth) => {
+    const parsed = parseBoundedObject(value);
+    if (!parsed || seen.has(parsed) || depth > MAX_DEPTH || visited >= MAX_VISITED_OBJECTS) return;
+    seen.add(parsed);
+    visited += 1;
+    for (const key of Object.keys(parsed).slice(0, 80)) {
+      const child = parseBoundedObject(parsed[key]) ?? parsed[key];
+      if (["video", "video_info", "videoInfo"].includes(key) && child && typeof child === "object") {
+        videoObjects.push(child);
+      }
+      if (["images", "image_list", "imageList", "photos", "photo_list", "photoList"].includes(key)
+          && Array.isArray(child)) {
+        const group = child.map((entry) => firstUrl(entry)).filter(Boolean);
+        if (group.length > 0) imageGroups.push(group);
+      }
+      if (["image", "photo"].includes(key) && child && typeof child === "object") {
+        const source = firstUrl(child);
+        if (source) imageGroups.push([source]);
+      }
+      if (["cover_url_v2", "coverUrlV2", "cover_url", "coverUrl", "content_thumb", "contentThumb"].includes(key)) {
+        const source = firstUrl(child);
+        if (source) covers.push(source);
+      }
+      if (["image_count", "imageCount", "pic_count", "picCount", "photo_count", "photoCount"].includes(key)) {
+        const count = Number.parseInt(String(parsed[key]), 10);
+        if (Number.isSafeInteger(count) && count > 0 && count <= MAX_IMAGE_COUNT) {
+          imageCountHints.push(count);
+        }
+      }
+      if (["aweType", "awe_type", "awemeType", "aweme_type"].includes(key)) {
+        const type = String(parsed[key]);
+        if (/^\d{1,4}$/u.test(type)) workTypeHints.push(type);
+      }
+      walk(child, depth + 1);
+    }
+  };
+  for (const root of roots) walk(root, 0);
+
+  const unique = (values) => [...new Set(values.filter(Boolean))];
+  const h264VideoSources = [];
+  const bitRateVideoSources = [];
+  const defaultVideoSources = [];
+  for (const video of videoObjects) {
+    h264VideoSources.push(...collectUrls(field(video, ["play_addr_h264", "playAddrH264"])));
+    const bitRates = field(video, ["bit_rate", "bitRate"]);
+    if (Array.isArray(bitRates)) {
+      for (const entry of bitRates) {
+        const isH265 = field(entry, ["is_h265", "isH265"]) === 1;
+        const isBytevc1 = field(entry, ["is_bytevc1", "isBytevc1"]) === 1;
+        const codec = String(field(entry, ["codec_type", "codecType", "format"]) || "");
+        if (!isH265 && !isBytevc1 && !/h265|hevc|bytevc1/iu.test(codec)) {
+          bitRateVideoSources.push(...collectUrls(field(entry, ["play_addr", "playAddr"])));
+        }
+      }
+    }
+    defaultVideoSources.push(...collectUrls(field(video, ["play_addr", "playAddr"])));
+  }
+  const compatibleVideoSources = unique([
+    ...h264VideoSources,
+    ...bitRateVideoSources,
+    ...defaultVideoSources,
+  ]).slice(0, MAX_VIDEO_SOURCES);
+  if (compatibleVideoSources.length > 0) {
+    return {
+      ok: true,
+      mediaType: "video",
+      source: compatibleVideoSources[0],
+      sources: compatibleVideoSources,
+      selectedCodec: h264VideoSources.length > 0
+        ? "h264"
+        : bitRateVideoSources.length > 0 ? "bit-rate-compatible" : "default",
+    };
+  }
+
+  const bestImageGroup = imageGroups
+    .map((group) => unique(group))
+    .sort((left, right) => right.length - left.length)[0] || [];
+  const declaredImageCount = imageCountHints.length > 0 ? Math.max(...imageCountHints) : null;
+  if (bestImageGroup.length > 0) {
+    const totalImageCount = Math.max(bestImageGroup.length, declaredImageCount || 0);
+    const selectedIndexes = bestImageGroup.length <= MAX_SELECTED_IMAGES
+      ? bestImageGroup.map((_, index) => index)
+      : Array.from({ length: MAX_SELECTED_IMAGES }, (_, index) => (
+        Math.round(index * (bestImageGroup.length - 1) / (MAX_SELECTED_IMAGES - 1))
+      ));
+    return {
+      ok: true,
+      mediaType: "image_post",
+      sources: selectedIndexes.map((index) => bestImageGroup[index]),
+      totalImageCount,
+      sampled: bestImageGroup.length > MAX_SELECTED_IMAGES,
+      sourceEvidence: "image-list",
+    };
+  }
+
+  const coverSource = unique(covers)[0] || null;
+  const isImageWork = workTypeHints.some((value) => IMAGE_WORK_TYPES.has(value))
+    || declaredImageCount !== null;
+  if (coverSource && isImageWork && (declaredImageCount === null || declaredImageCount === 1)) {
+    return {
+      ok: true,
+      mediaType: "image_post",
+      sources: [coverSource],
+      totalImageCount: 1,
+      sampled: false,
+      sourceEvidence: "single-image-react",
+    };
+  }
+  if (coverSource) {
+    return {
+      ok: true,
+      mediaType: "shared_cover",
+      sources: [coverSource],
+      totalImageCount: declaredImageCount || 1,
+      sampled: false,
+      originalMediaType: isImageWork ? "image_post" : "unknown_work",
+    };
+  }
+  return { ok: false, reason: "compatible-aweme-media-not-found" };
+}
 
 function normalizeExactIncomingMediaMessage(message) {
   if (message === null || message === undefined) return null;
@@ -399,8 +591,12 @@ export function buildClassifyLatestIncomingMediaExpression(mediaMessage = null) 
     if (message.querySelector(${JSON.stringify(DOUYIN_COMMENT_SHARE_SELECTOR)})) {
       return { ok: true, mediaType: 'comment_share' };
     }
-    if (message.querySelector('.MessageItemShareAwemecontainer')) {
-      return { ok: true, mediaType: 'shared_aweme' };
+    const registeredSharedWorkVariants = ${JSON.stringify(DOUYIN_SHARED_WORK_VARIANTS)};
+    const matchedSharedWorkVariant = registeredSharedWorkVariants.find((variant) => (
+      Boolean(message.querySelector(variant.selector))
+    ));
+    if (matchedSharedWorkVariant) {
+      return { ok: true, mediaType: 'shared_aweme', variant: matchedSharedWorkVariant.name };
     }
     const visibleImage = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
       .find((image) => {
@@ -408,9 +604,36 @@ export function buildClassifyLatestIncomingMediaExpression(mediaMessage = null) 
         const style = getComputedStyle(image);
         return imageRect.width >= 32 && imageRect.height >= 32 &&
           style.display !== 'none' && style.visibility !== 'hidden';
-      });
+    });
     if (visibleImage) return { ok: true, mediaType: 'chat_image' };
-    return { ok: false, reason: 'unsupported-media-type' };
+    const descendants = Array.from(message.querySelectorAll('*')).slice(0, 200);
+    const safeClassHints = [...new Set([message, ...descendants]
+      .flatMap((element) => Array.from(element.classList || []))
+      .filter((token) => ${STRUCTURE_HINT}.test(token) && /^[A-Za-z0-9_-]{1,100}$/u.test(token)))].slice(0, 24);
+    const safeAttributeNames = [...new Set([message, ...descendants]
+      .flatMap((element) => Array.from(element.attributes || [], (attribute) => attribute.name))
+      .filter((name) => /^[A-Za-z_:][A-Za-z0-9_:.-]{0,99}$/u.test(name)
+        && !['id', 'href', 'src', 'value'].includes(name)
+        && !name.startsWith('data-e2e-'))) ].slice(0, 24);
+    const safeShape = {
+      descendantCount: message.querySelectorAll('*').length,
+      imageCount: message.querySelectorAll('img').length,
+      videoCount: message.querySelectorAll('video').length,
+      canvasCount: message.querySelectorAll('canvas').length,
+      buttonCount: message.querySelectorAll('button, [role="button"]').length,
+      classHints: safeClassHints,
+      attributeNames: safeAttributeNames,
+    };
+    const diagnosticBytes = new TextEncoder().encode(JSON.stringify(safeShape));
+    const diagnosticHash = await crypto.subtle.digest('SHA-256', diagnosticBytes);
+    const signature = Array.from(new Uint8Array(diagnosticHash), (byte) => (
+      byte.toString(16).padStart(2, '0')
+    )).join('');
+    return {
+      ok: false,
+      reason: 'unsupported-media-type',
+      diagnostic: { version: 1, signature, ...safeShape },
+    };
   })()`;
 }
 
@@ -488,7 +711,7 @@ export function buildLocateLatestIncomingAwemeExpression() {
     for (const message of messages) {
       ${MESSAGE_SIDE_CAPTURE_SOURCE}
       if (side !== 'left') continue;
-      const card = message.querySelector('.MessageItemShareAwemecontainer');
+      const card = message.querySelector(${JSON.stringify(DOUYIN_SHARED_CARD_SELECTOR)});
       if (!card) continue;
       const clickTarget = message.querySelector('.MessageBoxContentactiveClickArea') || card;
       clickTarget.scrollIntoView({ block: 'center', inline: 'center' });
@@ -626,7 +849,7 @@ export function buildRecentDouyinResourcePathsExpression() {
 
 export function buildAwemeReactDataShapeExpression() {
   return `(() => {
-    const card = document.querySelector('.MessageItemShareAwemecontainer');
+    const card = document.querySelector(${JSON.stringify(DOUYIN_SHARED_CARD_SELECTOR)});
     if (!card) return { ok: false, reason: 'aweme-card-not-found' };
     const fiberKey = Object.keys(card).find((key) => key.startsWith('__reactFiber$'));
     if (!fiberKey) return { ok: false, reason: 'react-fiber-not-found' };
@@ -671,13 +894,16 @@ export function buildAwemeReactDataShapeExpression() {
 
 export function buildProbeAwemeDetailVariantsExpression() {
   return `(async () => {
-    const card = document.querySelector('.MessageItemShareAwemecontainer');
+    const card = document.querySelector(${JSON.stringify(DOUYIN_SHARED_CARD_SELECTOR)});
     if (!card) return { ok: false, reason: 'aweme-card-not-found' };
     const fiberKey = Object.keys(card).find((key) => key.startsWith('__reactFiber$'));
     let fiber = fiberKey ? card[fiberKey] : null;
     let itemId = null;
     for (let depth = 0; fiber && depth < 20 && !itemId; depth += 1, fiber = fiber.return) {
-      itemId = fiber.memoizedProps?.message?.parsedContent?.itemId || null;
+      const parsedContent = fiber.memoizedProps?.message?.parsedContent;
+      const awemeInfo = parsedContent?.aweme_info || parsedContent?.awemeInfo;
+      itemId = parsedContent?.itemId || parsedContent?.item_id ||
+        awemeInfo?.itemId || awemeInfo?.item_id || null;
     }
     if (!itemId) return { ok: false, reason: 'aweme-item-id-not-found' };
 
@@ -690,13 +916,14 @@ export function buildProbeAwemeDetailVariantsExpression() {
     } catch {
       return { ok: false, reason: 'aweme-detail-not-json', status: response.status };
     }
-    const detail = payload?.aweme_detail;
-    const video = detail?.video;
-    const variants = Array.isArray(video?.bit_rate) ? video.bit_rate.map((variant) => ({
-      codecType: variant?.codec_type ?? null,
-      gearName: variant?.gear_name ?? null,
-      qualityType: variant?.quality_type ?? null,
-      urlCount: variant?.play_addr?.url_list?.length ?? 0,
+    const detail = payload?.aweme_detail || payload?.awemeDetail;
+    const video = detail?.video || detail?.video_info || detail?.videoInfo;
+    const bitRates = video?.bit_rate || video?.bitRate;
+    const variants = Array.isArray(bitRates) ? bitRates.map((variant) => ({
+      codecType: variant?.codec_type ?? variant?.codecType ?? null,
+      gearName: variant?.gear_name ?? variant?.gearName ?? null,
+      qualityType: variant?.quality_type ?? variant?.qualityType ?? null,
+      urlCount: (variant?.play_addr?.url_list || variant?.playAddr?.urlList)?.length ?? 0,
     })) : [];
     return {
       ok: response.ok && Boolean(detail),
@@ -706,9 +933,9 @@ export function buildProbeAwemeDetailVariantsExpression() {
       videoFound: Boolean(video),
       videoKeys: video && typeof video === 'object' ? Object.keys(video).slice(0, 60) : [],
       variants,
-      playAddrUrlCount: video?.play_addr?.url_list?.length ?? 0,
-      playAddr265UrlCount: video?.play_addr_265?.url_list?.length ?? 0,
-      playAddrH264UrlCount: video?.play_addr_h264?.url_list?.length ?? 0,
+      playAddrUrlCount: (video?.play_addr?.url_list || video?.playAddr?.urlList)?.length ?? 0,
+      playAddr265UrlCount: (video?.play_addr_265?.url_list || video?.playAddr265?.urlList)?.length ?? 0,
+      playAddrH264UrlCount: (video?.play_addr_h264?.url_list || video?.playAddrH264?.urlList)?.length ?? 0,
     };
   })()`;
 }
@@ -733,7 +960,10 @@ export function buildReadCompatibleAwemeSourceExpression() {
     let fiber = fiberKey ? card[fiberKey] : null;
     let itemId = null;
     for (let depth = 0; fiber && depth < 20 && !itemId; depth += 1, fiber = fiber.return) {
-      itemId = fiber.memoizedProps?.message?.parsedContent?.itemId || null;
+      const parsedContent = fiber.memoizedProps?.message?.parsedContent;
+      const awemeInfo = parsedContent?.aweme_info || parsedContent?.awemeInfo;
+      itemId = parsedContent?.itemId || parsedContent?.item_id ||
+        awemeInfo?.itemId || awemeInfo?.item_id || null;
     }
     if (!itemId) return { ok: false, reason: 'aweme-item-id-not-found' };
 
@@ -742,9 +972,10 @@ export function buildReadCompatibleAwemeSourceExpression() {
     });
     if (!response.ok) return { ok: false, reason: 'aweme-detail-request-failed' };
     const payload = await response.json();
-    const video = payload?.aweme_detail?.video;
-    const h264Urls = video?.play_addr_h264?.url_list;
-    const defaultUrls = video?.play_addr?.url_list;
+    const detail = payload?.aweme_detail || payload?.awemeDetail;
+    const video = detail?.video || detail?.video_info || detail?.videoInfo;
+    const h264Urls = video?.play_addr_h264?.url_list || video?.playAddrH264?.urlList;
+    const defaultUrls = video?.play_addr?.url_list || video?.playAddr?.urlList;
     const source = (Array.isArray(h264Urls) && h264Urls.find(Boolean)) ||
       (Array.isArray(defaultUrls) && defaultUrls.find(Boolean)) || '';
     if (!source) return { ok: false, reason: 'compatible-video-source-not-found' };
@@ -807,25 +1038,12 @@ export function buildReadCompatibleAwemeMediaExpression(message = null) {
       const candidate = fiber.memoizedProps?.message?.parsedContent;
       if (candidate && typeof candidate === 'object') parsedContent = candidate;
     }
-    const itemId = parsedContent?.itemId || null;
+    const awemeInfo = parsedContent?.aweme_info || parsedContent?.awemeInfo;
+    const itemId = parsedContent?.itemId || parsedContent?.item_id ||
+      awemeInfo?.itemId || awemeInfo?.item_id || null;
+    const resolveManifest = ${resolveDouyinSharedWorkManifest.toString()};
     let detail = null;
     if (itemId) {
-      const containsUsableMedia = (candidate) => {
-        const candidateVideo = candidate?.video;
-        const videoLists = [
-          candidateVideo?.play_addr_h264?.url_list,
-          candidateVideo?.play_addr?.url_list,
-          ...(Array.isArray(candidateVideo?.bit_rate)
-            ? candidateVideo.bit_rate.map((entry) => entry?.play_addr?.url_list)
-            : []),
-        ];
-        if (videoLists.some((urls) => Array.isArray(urls) && urls.some(Boolean))) return true;
-        return [
-          candidate?.images,
-          candidate?.image_post_info?.images,
-          candidate?.image_post_info?.image_list,
-        ].some((images) => Array.isArray(images) && images.length > 0);
-      };
       for (let attempt = 0; attempt < 3; attempt += 1) {
         let requestTimer = null;
         try {
@@ -837,8 +1055,10 @@ export function buildReadCompatibleAwemeMediaExpression(message = null) {
           });
           if (response.ok) {
             const payload = await response.json();
-            detail = payload?.aweme_detail || detail;
-            if (containsUsableMedia(detail)) break;
+            const candidateDetail = payload?.aweme_detail || payload?.awemeDetail || null;
+            if (candidateDetail && typeof candidateDetail === 'object') detail = candidateDetail;
+            const candidateManifest = resolveManifest({ detail: candidateDetail });
+            if (candidateManifest.ok && candidateManifest.mediaType !== 'shared_cover') break;
           }
         } catch {
           // A later bounded attempt may still recover this transient page request.
@@ -850,88 +1070,7 @@ export function buildReadCompatibleAwemeMediaExpression(message = null) {
         }
       }
     }
-    const video = detail?.video;
-    const h264Urls = video?.play_addr_h264?.url_list;
-    const compatibleBitRateUrls = Array.isArray(video?.bit_rate)
-      ? video.bit_rate
-        .filter((entry) => entry?.is_h265 !== 1 && entry?.is_bytevc1 !== 1
-          && !/h265|hevc|bytevc1/iu.test(String(entry?.codec_type || entry?.format || '')))
-        .flatMap((entry) => Array.isArray(entry?.play_addr?.url_list) ? entry.play_addr.url_list : [])
-      : [];
-    const defaultUrls = video?.play_addr?.url_list;
-    const videoSources = [...new Set([
-      ...(Array.isArray(h264Urls) ? h264Urls : []),
-      ...compatibleBitRateUrls,
-      ...(Array.isArray(defaultUrls) ? defaultUrls : []),
-    ].filter((value) => typeof value === 'string' && value.length > 0))].slice(0, 6);
-    const videoSource = videoSources[0] || '';
-    if (videoSource) {
-      const selectedCodec = Array.isArray(h264Urls) && h264Urls.some(Boolean)
-        ? 'h264'
-        : compatibleBitRateUrls.some(Boolean) ? 'bit-rate-compatible' : 'default';
-      return {
-        ok: true,
-        mediaType: 'video',
-        source: videoSource,
-        sources: videoSources,
-        selectedCodec,
-      };
-    }
-    const imageCandidates = [
-      detail?.images,
-      detail?.image_post_info?.images,
-      detail?.image_post_info?.image_list,
-    ].find((candidate) => Array.isArray(candidate) && candidate.length > 0) || [];
-    const allSources = imageCandidates.map((image) => {
-      const lists = [
-        image?.url_list,
-        image?.download_url_list,
-        image?.display_image?.url_list,
-        image?.image?.url_list,
-        image?.owner_watermark_image?.url_list,
-      ];
-      for (const urls of lists) {
-        if (Array.isArray(urls)) {
-          const source = urls.find((value) => typeof value === 'string' && value.length > 0);
-          if (source) return source;
-        }
-      }
-      return null;
-    }).filter(Boolean);
-    if (allSources.length > 0) {
-      const maxImages = 12;
-      const selectedIndexes = allSources.length <= maxImages
-        ? allSources.map((_, index) => index)
-        : Array.from({ length: maxImages }, (_, index) =>
-          Math.round(index * (allSources.length - 1) / (maxImages - 1))
-        );
-      return {
-        ok: true,
-        mediaType: 'image_post',
-        sources: selectedIndexes.map((index) => allSources[index]),
-        totalImageCount: allSources.length,
-        sampled: allSources.length > maxImages,
-      };
-    }
-    const coverLists = [
-      parsedContent?.cover_url_v2?.url_list,
-      parsedContent?.cover_url?.url_list,
-      parsedContent?.content_thumb?.url_list,
-    ];
-    for (const urls of coverLists) {
-      if (!Array.isArray(urls)) continue;
-      const source = urls.find((value) => typeof value === 'string' && value.length > 0);
-      if (source) {
-        return {
-          ok: true,
-          mediaType: 'shared_cover',
-          sources: [source],
-          totalImageCount: 1,
-          sampled: false,
-        };
-      }
-    }
-    return { ok: false, reason: 'compatible-aweme-media-not-found' };
+    return resolveManifest({ detail, parsedContent });
   })()`;
 }
 

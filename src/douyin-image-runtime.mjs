@@ -289,7 +289,7 @@ export async function prepareDouyinImagePost({
       || !Number.isSafeInteger(manifest.totalImageCount)
       || manifest.totalImageCount < manifest.sources.length
       || (manifest.mediaType === "shared_cover"
-        && (manifest.sources.length !== 1 || manifest.totalImageCount !== 1 || manifest.sampled))) {
+        && (manifest.sources.length !== 1 || manifest.sampled))) {
     throw new Error("Douyin image-post manifest is invalid.");
   }
   const boundedImageBytes = Math.max(64 * 1024, Math.min(

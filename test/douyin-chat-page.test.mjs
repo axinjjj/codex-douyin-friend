@@ -26,8 +26,10 @@ import {
   buildVisibleVideoStructureExpression,
   buildXgPlayerStructureExpression,
   DOUYIN_CHAT_INPUT_SELECTOR,
+  DOUYIN_SHARED_WORK_VARIANTS,
   isDouyinChatTarget,
   normalizeOutboundText,
+  resolveDouyinSharedWorkManifest,
 } from "../src/douyin-chat-page.mjs";
 
 test("recognizes only a debuggable Douyin chat page", () => {
@@ -148,6 +150,7 @@ test("video-card operations stay scoped to the visible page DOM", () => {
   const viewerExpression = buildVisibleVideoStructureExpression();
   const playerExpression = buildXgPlayerStructureExpression();
   assert.match(openExpression, /MessageItemShareAwemecontainer/);
+  assert.match(openExpression, /BulletBulletVideocontainer/u);
   assert.match(viewerExpression, /querySelectorAll\('video'\)/);
   assert.match(playerExpression, /data-xgplayerid/);
   for (const expression of [openExpression, viewerExpression, playerExpression]) {
@@ -161,6 +164,8 @@ test("direct-image operations classify and capture only visible incoming content
   const locator = buildLocateLatestIncomingChatImageExpression();
   const sourceReader = buildReadLatestIncomingChatImageSourceExpression();
   assert.match(classification, /shared_aweme/u);
+  assert.match(classification, /legacy-aweme/u);
+  assert.match(classification, /bullet-video/u);
   assert.match(classification, /comment_share/u);
   assert.match(classification, /chat_image/u);
   assert.match(locator, /scrollIntoView/u);
@@ -241,26 +246,29 @@ test("Aweme variant probe keeps response URLs and ids out of its result", () => 
   assert.match(expression, /codecType/);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/);
   assert.doesNotMatch(expression, /return \{[^}]*itemId/);
-  assert.doesNotMatch(expression, /urlList|source:/);
+  assert.doesNotMatch(expression, /source:/);
 });
 
 test("shared-work inspection distinguishes videos from ordered image posts", () => {
   const expression = buildReadCompatibleAwemeMediaExpression();
-  assert.match(expression, /mediaType: 'video'/u);
-  assert.match(expression, /mediaType: 'image_post'/u);
-  assert.match(expression, /mediaType: 'shared_cover'/u);
+  assert.match(expression, /mediaType: "video"/u);
+  assert.match(expression, /mediaType: "image_post"/u);
+  assert.match(expression, /mediaType: "shared_cover"/u);
   assert.match(expression, /cover_url_v2/u);
-  assert.match(expression, /image_post_info/u);
+  assert.match(expression, /imageList/u);
   assert.match(expression, /MessageItemCommentSharecontainer/u);
+  assert.match(expression, /BulletBulletVideocontainer/u);
+  assert.match(expression, /item_id/u);
+  assert.match(expression, /itemId/u);
   assert.match(expression, /selectedIndexes/u);
-  assert.match(expression, /maxImages = 12/u);
+  assert.match(expression, /MAX_SELECTED_IMAGES = 12/u);
   assert.match(expression, /attempt < 3/u);
   assert.match(expression, /attempt === 0 \? 250 : 500/u);
   assert.match(expression, /new AbortController\(\)/u);
   assert.match(expression, /controller\.abort\(\), 2000/u);
-  assert.match(expression, /video\?\.bit_rate/u);
-  assert.match(expression, /videoSources/u);
-  assert.match(expression, /slice\(0, 6\)/u);
+  assert.match(expression, /bit_rate/u);
+  assert.match(expression, /bitRate/u);
+  assert.match(expression, /MAX_VIDEO_SOURCES/u);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
   assert.doesNotMatch(expression, /return \{[^}]*itemId/u);
 
@@ -272,6 +280,87 @@ test("shared-work inspection distinguishes videos from ordered image posts", () 
   });
   assert.match(exactExpression, /incoming-shared-work-identity-changed/u);
   assert.match(exactExpression, /messageMessageBoxcontentBox/u);
+});
+
+test("registers legacy and bullet shared-work cards without runtime code mutation", () => {
+  assert.deepEqual(DOUYIN_SHARED_WORK_VARIANTS, [
+    { name: "legacy-aweme", selector: ".MessageItemShareAwemecontainer" },
+    { name: "bullet-video", selector: ".BulletBulletVideocontainer" },
+  ]);
+  const classification = buildClassifyLatestIncomingMediaExpression();
+  assert.match(classification, /registeredSharedWorkVariants/u);
+  assert.match(classification, /unsupported-media-type/u);
+  assert.match(classification, /diagnostic/u);
+  assert.match(classification, /SHA-256/u);
+  assert.doesNotMatch(classification, /outerHTML|innerHTML|\.href\b|\.src\b|getAttribute\(['"](?:href|src)/u);
+});
+
+test("resolves single-image, multi-image, video, and cover-only shared works", () => {
+  const single = resolveDouyinSharedWorkManifest({
+    parsedContent: {
+      item_id: "fixture-item",
+      awe_type: 68,
+      aweme_info: {
+        cover_url: { url_list: ["https://p3.douyinpic.com/single"] },
+      },
+      im_dynamic_patch: {
+        raw_data: JSON.stringify({ whole_card: { extra_info: { log_info: { has_pic: "1" } } } }),
+      },
+    },
+  });
+  assert.deepEqual(single, {
+    ok: true,
+    mediaType: "image_post",
+    sources: ["https://p3.douyinpic.com/single"],
+    totalImageCount: 1,
+    sampled: false,
+    sourceEvidence: "single-image-react",
+  });
+
+  const multiple = resolveDouyinSharedWorkManifest({
+    detail: {
+      imagePostInfo: {
+        imageList: [
+          { urlList: ["https://p3.douyinpic.com/first"] },
+          { downloadUrlList: ["https://p6.douyinpic.com/second"] },
+          { displayImage: { urlList: ["https://p9.douyinpic.com/third"] } },
+        ],
+      },
+    },
+  });
+  assert.equal(multiple.mediaType, "image_post");
+  assert.deepEqual(multiple.sources, [
+    "https://p3.douyinpic.com/first",
+    "https://p6.douyinpic.com/second",
+    "https://p9.douyinpic.com/third",
+  ]);
+  assert.equal(multiple.totalImageCount, 3);
+
+  const video = resolveDouyinSharedWorkManifest({
+    detail: {
+      videoInfo: {
+        playAddrH264: { urlList: ["https://v3.douyinvod.com/video"] },
+      },
+    },
+  });
+  assert.equal(video.mediaType, "video");
+  assert.equal(video.sources.length, 1);
+
+  const cover = resolveDouyinSharedWorkManifest({
+    parsedContent: {
+      aweType: 68,
+      imageCount: 4,
+      coverUrl: { urlList: ["https://p3.douyinpic.com/cover"] },
+    },
+  });
+  assert.deepEqual(cover, {
+    ok: true,
+    mediaType: "shared_cover",
+    sources: ["https://p3.douyinpic.com/cover"],
+    totalImageCount: 4,
+    sampled: false,
+    originalMediaType: "image_post",
+  });
 });
 
 test("message metadata gives media priority and preserves attached-text identity", () => {

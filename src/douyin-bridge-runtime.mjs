@@ -201,29 +201,74 @@ export function planDouyinIncomingQueue(messages) {
     return { ok: false, batches: [] };
   }
   const batches = [];
-  let textMessages = [];
-  for (const message of messages) {
-    if (message.kind === "text") {
-      textMessages.push(message);
-      continue;
+  let index = 0;
+  const leadingTextMessages = [];
+  while (index < messages.length && messages[index].kind === "text") {
+    leadingTextMessages.push(messages[index]);
+    index += 1;
+  }
+  if (index === messages.length) {
+    batches.push({
+      mode: "text",
+      textMessages: leadingTextMessages,
+      mediaMessage: null,
+      messages: [...leadingTextMessages],
+    });
+    return { ok: true, batches };
+  }
+  let textBeforeMedia = leadingTextMessages;
+  while (index < messages.length) {
+    const mediaMessage = messages[index];
+    if (mediaMessage.kind !== "media") return { ok: false, batches: [] };
+    index += 1;
+    const textAfterMedia = [];
+    while (index < messages.length && messages[index].kind === "text") {
+      textAfterMedia.push(messages[index]);
+      index += 1;
     }
+    const textMessages = [...textBeforeMedia, ...textAfterMedia];
     batches.push({
       mode: "media",
       textMessages,
-      mediaMessage: message,
-      messages: [...textMessages, message],
+      mediaMessage,
+      messages: [...textBeforeMedia, mediaMessage, ...textAfterMedia],
     });
-    textMessages = [];
-  }
-  if (textMessages.length > 0) {
-    batches.push({
-      mode: "text",
-      textMessages,
-      mediaMessage: null,
-      messages: [...textMessages],
-    });
+    textBeforeMedia = [];
   }
   return { ok: batches.length > 0, batches };
+}
+
+export function sanitizeDouyinMediaDiagnostic(diagnostic) {
+  if (!diagnostic || diagnostic.version !== 1
+      || !/^[0-9a-f]{64}$/u.test(diagnostic.signature)) return null;
+  const boundedCount = (value) => (
+    Number.isSafeInteger(value) && value >= 0 && value <= 100_000 ? value : 0
+  );
+  const structureHint = /(chat|message|conversation|content|item|card|video|aweme|image|media|bullet)/iu;
+  const classHints = [...new Set(Array.isArray(diagnostic.classHints)
+    ? diagnostic.classHints.filter((value) => (
+      typeof value === "string" && /^[A-Za-z0-9_-]{1,100}$/u.test(value)
+        && structureHint.test(value)
+    ))
+    : [])].slice(0, 24);
+  const attributeNames = [...new Set(Array.isArray(diagnostic.attributeNames)
+    ? diagnostic.attributeNames.filter((value) => (
+      typeof value === "string" && /^[A-Za-z_:][A-Za-z0-9_:.-]{0,99}$/u.test(value)
+        && !["id", "href", "src", "value"].includes(value)
+        && !value.startsWith("data-e2e-")
+    ))
+    : [])].slice(0, 24);
+  return {
+    version: 1,
+    signature: diagnostic.signature,
+    descendantCount: boundedCount(diagnostic.descendantCount),
+    imageCount: boundedCount(diagnostic.imageCount),
+    videoCount: boundedCount(diagnostic.videoCount),
+    canvasCount: boundedCount(diagnostic.canvasCount),
+    buttonCount: boundedCount(diagnostic.buttonCount),
+    classHints,
+    attributeNames,
+  };
 }
 
 export async function generateDouyinReply({
@@ -412,7 +457,10 @@ export async function generateDouyinImageReply({
     ? `原作品共有 ${totalImageCount} 张图，目前只提供了按时间均匀选取的 ${imagePaths.length} 张；不要声称看见了未提供的图片。`
     : null;
   const coverBoundary = mediaType === "shared_cover"
-    ? "只能根据封面作出有限回应，不要声称看过完整视频、图文、声音或正文；需要时自然说明自己只看到了封面。"
+    ? [
+      ...(totalImageCount > 1 ? [`已知原作品含 ${totalImageCount} 张图，但完整图片来源不可用。`] : []),
+      "只能根据封面作出有限回应，不要声称看过完整视频、图文、声音或正文；需要时自然说明自己只看到了封面。",
+    ].join("\n")
     : null;
   const boundedInboundText = String(inboundText || "").trim().slice(0, 4_000);
   const inboundTextLines = boundedInboundText
