@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
+import { validateDouyinAction } from "./douyin-action-journal.mjs";
 
 const STATE_VERSION = 1;
 const MAX_VISIBLE_MESSAGES = 12;
@@ -77,6 +78,8 @@ export function createBridgeState({
   pending = [],
   outboundFingerprint = null,
   blockedReason = null,
+  generation = 1,
+  action = null,
 }) {
   const candidate = {
     version: STATE_VERSION,
@@ -84,6 +87,7 @@ export function createBridgeState({
     threadId,
     model,
     effort,
+    generation,
     checkpoint: {
       phase,
       snapshot: normalizeBridgeSnapshot(snapshot),
@@ -94,13 +98,21 @@ export function createBridgeState({
       })),
       outboundFingerprint,
       blockedReason,
+      action,
     },
   };
   return validateBridgeState(candidate);
 }
 
 export function validateBridgeState(value, expectedChatKey = null) {
-  if (!hasExactKeys(value, ["version", "chatKey", "threadId", "model", "effort", "checkpoint"])) {
+  const legacyRoot = hasExactKeys(
+    value,
+    ["version", "chatKey", "threadId", "model", "effort", "checkpoint"],
+  );
+  if (!legacyRoot && !hasExactKeys(
+    value,
+    ["version", "chatKey", "threadId", "model", "effort", "generation", "checkpoint"],
+  )) {
     throw new Error("Bridge state has an invalid shape.");
   }
   if (value.version !== STATE_VERSION) throw new Error("Bridge state version is incompatible.");
@@ -110,9 +122,17 @@ export function validateBridgeState(value, expectedChatKey = null) {
   if (!THREAD_ID_PATTERN.test(value.threadId)) throw new Error("Bridge state thread id is invalid.");
   if (!MODEL_PATTERN.test(value.model)) throw new Error("Bridge state model is invalid.");
   if (!EFFORTS.has(value.effort)) throw new Error("Bridge state effort is invalid.");
-  if (!hasExactKeys(
+  const generation = legacyRoot ? 1 : value.generation;
+  if (!Number.isSafeInteger(generation) || generation < 1) {
+    throw new Error("Bridge state task generation is invalid.");
+  }
+  const legacyCheckpoint = hasExactKeys(
     value.checkpoint,
     ["phase", "snapshot", "pending", "outboundFingerprint", "blockedReason"],
+  );
+  if (!legacyCheckpoint && !hasExactKeys(
+    value.checkpoint,
+    ["phase", "snapshot", "pending", "outboundFingerprint", "blockedReason", "action"],
   )) {
     throw new Error("Bridge checkpoint has an invalid shape.");
   }
@@ -131,6 +151,12 @@ export function validateBridgeState(value, expectedChatKey = null) {
   const blockedReason = value.checkpoint.blockedReason;
   if (blockedReason !== null && !BLOCKED_REASON_PATTERN.test(blockedReason)) {
     throw new Error("Bridge checkpoint blocked reason is invalid.");
+  }
+  const action = legacyCheckpoint || value.checkpoint.action === null
+    ? null
+    : validateDouyinAction(value.checkpoint.action);
+  if (action && action.generation !== generation) {
+    throw new Error("Bridge action belongs to a different task generation.");
   }
 
   if (phase === "ready" && (pending.length !== 0 || blockedReason !== null)) {
@@ -152,6 +178,22 @@ export function validateBridgeState(value, expectedChatKey = null) {
   if (phase === "blocked" && (blockedReason === null || outboundFingerprint !== null)) {
     throw new Error("A blocked bridge checkpoint is inconsistent.");
   }
+  if (action) {
+    const allowedActionStages = {
+      ready: new Set(["send-verified", "reaction-attempted"]),
+      queued: new Set(["turn-started", "reply-ready", "send-verified", "reaction-attempted"]),
+      processing: new Set(["planned", "evidence-ready", "turn-starting", "turn-started"]),
+      "reply-ready": new Set(["reply-ready"]),
+      sending: new Set(["send-attempted", "send-verified", "reaction-attempted"]),
+      blocked: new Set([
+        "planned", "evidence-ready", "turn-starting", "turn-started", "reply-ready",
+        "send-attempted", "send-verified", "reaction-attempted",
+      ]),
+    };
+    if (!allowedActionStages[phase].has(action.stage)) {
+      throw new Error("Bridge checkpoint and action stages are inconsistent.");
+    }
+  }
 
   return {
     version: STATE_VERSION,
@@ -159,12 +201,14 @@ export function validateBridgeState(value, expectedChatKey = null) {
     threadId: value.threadId,
     model: value.model,
     effort: value.effort,
+    generation,
     checkpoint: {
       phase,
       snapshot,
       pending,
       outboundFingerprint,
       blockedReason,
+      action,
     },
   };
 }
@@ -385,8 +429,13 @@ export function computeTextMessageFingerprint(text, side = "right") {
 
 export function recoverBridgeStateForStartup(state, currentSnapshot) {
   const normalized = validateBridgeState(state);
+  const action = normalized.checkpoint.action;
   if (normalized.checkpoint.phase === "ready") {
-    return { state: normalized, recoveredVerifiedSend: false };
+    return {
+      state: normalized,
+      recoveredVerifiedSend: false,
+      resumeAction: action,
+    };
   }
   if (normalized.checkpoint.phase === "queued") {
     const current = normalizeBridgeSnapshot(currentSnapshot);
@@ -412,13 +461,70 @@ export function recoverBridgeStateForStartup(state, currentSnapshot) {
         threadId: normalized.threadId,
         model: normalized.model,
         effort: normalized.effort,
+        generation: normalized.generation,
         snapshot: current,
         phase: "queued",
         pending: queuedPending,
+        action,
       }),
       recoveredVerifiedSend: false,
       queuedPending,
+      resumeAction: action,
     };
+  }
+  if (action && normalized.checkpoint.phase !== "sending") {
+    const current = normalizeBridgeSnapshot(currentSnapshot);
+    const appended = findAppendedMessages(normalized.checkpoint.snapshot, current);
+    if (appended.some((message) => message.side === "right")) {
+      throw new Error("Unexpected outgoing activity appeared during action recovery.");
+    }
+    if (action.stage === "turn-starting") {
+      throw new Error("The persisted Codex turn start is ambiguous; refusing automatic recovery.");
+    }
+    const appendedIncoming = appended.filter((message) => (
+      message.side === "left" && (message.kind === "text" || message.kind === "media")
+    ));
+    if (appended.length !== appendedIncoming.length) {
+      throw new Error("Unsupported activity appeared during action recovery.");
+    }
+    const queuedPending = rebindPendingMessages(current, [
+      ...normalized.checkpoint.pending,
+      ...appendedIncoming,
+    ]);
+    if (action.stage === "planned" || action.stage === "evidence-ready") {
+      return {
+        state: createBridgeState({
+          chatKey: normalized.chatKey,
+          threadId: normalized.threadId,
+          model: normalized.model,
+          effort: normalized.effort,
+          generation: normalized.generation,
+          snapshot: current,
+          phase: "queued",
+          pending: queuedPending,
+        }),
+        recoveredVerifiedSend: false,
+        queuedPending,
+      };
+    }
+    if (action.stage === "turn-started" || action.stage === "reply-ready") {
+      return {
+        state: createBridgeState({
+          chatKey: normalized.chatKey,
+          threadId: normalized.threadId,
+          model: normalized.model,
+          effort: normalized.effort,
+          generation: normalized.generation,
+          snapshot: current,
+          phase: "queued",
+          pending: queuedPending,
+          action,
+        }),
+        recoveredVerifiedSend: false,
+        queuedPending,
+        resumeAction: action,
+      };
+    }
   }
   if (normalized.checkpoint.phase !== "sending") {
     throw new Error("The persisted bridge checkpoint is incomplete; refusing automatic recovery.");
@@ -450,18 +556,32 @@ export function recoverBridgeStateForStartup(state, currentSnapshot) {
     ? rebindPendingMessages(current, queuedMessages)
     : [];
 
+  let recoveredAction = action;
+  if (recoveredAction?.stage === "send-attempted") {
+    recoveredAction = validateDouyinAction({
+      ...recoveredAction,
+      stage: "send-verified",
+      reactionOrdinalShift: appended.length,
+    });
+  }
+  if (recoveredAction && !["send-verified", "reaction-attempted"].includes(recoveredAction.stage)) {
+    throw new Error("The persisted send action stage is inconsistent.");
+  }
   return {
     state: createBridgeState({
       chatKey: normalized.chatKey,
       threadId: normalized.threadId,
       model: normalized.model,
       effort: normalized.effort,
+      generation: normalized.generation,
       snapshot: current,
       phase: queuedPending.length > 0 ? "queued" : "ready",
       pending: queuedPending,
+      action: recoveredAction,
     }),
     recoveredVerifiedSend: true,
     queuedPending,
+    resumeAction: recoveredAction,
   };
 }
 
@@ -490,6 +610,7 @@ export function recoverBridgeStateForFreshThread(state, currentSnapshot) {
         threadId: normalized.threadId,
         model: normalized.model,
         effort: normalized.effort,
+        generation: normalized.generation,
         snapshot: current,
         phase: "queued",
         pending: queuedPending,
@@ -511,6 +632,7 @@ export function recoverBridgeStateForFreshThread(state, currentSnapshot) {
         threadId: normalized.threadId,
         model: normalized.model,
         effort: normalized.effort,
+        generation: normalized.generation,
         snapshot: current,
         phase: "queued",
         pending: queuedPending,
@@ -529,6 +651,7 @@ export function recoverBridgeStateForFreshThread(state, currentSnapshot) {
       threadId: normalized.threadId,
       model: normalized.model,
       effort: normalized.effort,
+      generation: normalized.generation,
       snapshot: baselineSnapshot,
     }),
     recoveredPendingCount: pending.length,

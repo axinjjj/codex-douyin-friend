@@ -22,6 +22,10 @@ import {
   removeVideoAnalysisJob,
   resolveVideoAnalysisRoot,
 } from "../src/douyin-video-runtime.mjs";
+import {
+  DouyinMediaEvidenceError,
+  DOUYIN_MEDIA_ERROR_CODES,
+} from "../src/douyin-media-evidence.mjs";
 
 function canvasPngFixture(width, height) {
   const bytes = Buffer.alloc(33);
@@ -131,7 +135,7 @@ test("builds sequential in-memory scene scanning and bounded final capture expre
   assert.match(modalCapture, /commonModalFullScreenModalFullScreen video/u);
 });
 
-test("rejects dimensionless or all-black video artifacts before Codex can see them", () => {
+test("distinguishes decoded black scenes from dimensionless video artifacts", () => {
   const black = {
     visual: {
       pixelCount: 160,
@@ -148,13 +152,19 @@ test("rejects dimensionless or all-black video artifacts before Codex can see th
       nonBlackRatio: 0.75,
     },
   };
-  assert.throws(
-    () => assertUsableVideoFrameVisuals([black, black]),
-    (error) => error instanceof DouyinVideoDecodeError && error.reason === "blank-video-frames",
-  );
+  assert.deepEqual(assertUsableVideoFrameVisuals([black, black]), {
+    blankFrameCount: 2,
+    usableFrameCount: 0,
+    decodedFrameCount: 2,
+    visualMode: "decoded-black",
+    diagnosticReason: "blank-video-frames",
+  });
   assert.deepEqual(assertUsableVideoFrameVisuals([black, visible]), {
     blankFrameCount: 1,
     usableFrameCount: 1,
+    decodedFrameCount: 2,
+    visualMode: "decoded-visible",
+    diagnosticReason: null,
   });
   assert.throws(
     () => assertCapturedVideoFrame({ width: 1, height: 1, visual: visible.visual }, canvasPngFixture(1, 1)),
@@ -397,7 +407,8 @@ test("tries bounded trusted video source candidates in order", async () => {
       destination: path.resolve("C:/bounded/video.mp4"),
       downloadFn: async () => ({ byteCount: 0 }),
     }),
-    /no trusted compatible source candidate/u,
+    (error) => error instanceof DouyinMediaEvidenceError
+      && error.code === DOUYIN_MEDIA_ERROR_CODES.SOURCE_UNAVAILABLE,
   );
 
   await assert.rejects(
@@ -409,7 +420,8 @@ test("tries bounded trusted video source candidates in order", async () => {
       },
     }),
     (error) => {
-      assert.match(error.message, /failed \(range-2-of-4-incomplete-range\)/u);
+      assert.ok(error instanceof DouyinVideoSourcesExhaustedError);
+      assert.deepEqual(error.failures, ["range-2-of-4-incomplete-range"]);
       assert.doesNotMatch(error.message, /private-media-name|zjcdn/u);
       return true;
     },
@@ -429,7 +441,7 @@ test("candidate fallback never deletes an unknown pre-existing destination", asy
       },
     }), (error) => (
       error instanceof DouyinVideoSourcesExhaustedError
-      && /Every compatible Douyin video source failed/u.test(error.message)
+      && error.code === DOUYIN_MEDIA_ERROR_CODES.SOURCE_UNAVAILABLE
     ));
     assert.equal(await readFile(destination, "utf8"), "keep");
   } finally {
@@ -530,7 +542,8 @@ test("shares one bounded wall-clock budget across video download and validation"
         return {};
       },
     }),
-    /failed \(wall-time\)/u,
+    (error) => error instanceof DouyinMediaEvidenceError
+      && error.code === DOUYIN_MEDIA_ERROR_CODES.BUDGET_EXCEEDED,
   );
   assert.equal(validationCalled, false);
 });

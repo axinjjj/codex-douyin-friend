@@ -32,7 +32,9 @@ test("captures only a bounded visible chat-image clip into an isolated job", asy
     projectRoot,
     cdp: {
       async evaluate(expression) {
-        if (expression.includes("currentSrc")) return { ok: false, reason: "source-unavailable" };
+        if (expression.includes("chat-image-source-not-found")) {
+          return { ok: false, reason: "source-unavailable" };
+        }
         assert.match(expression, /chat-image-not-found/u);
         return {
           ok: true,
@@ -60,7 +62,9 @@ test("refuses invalid clips, non-PNG captures, and paths outside the job root", 
     projectRoot,
     cdp: {
       async evaluate(expression) {
-        if (expression.includes("currentSrc")) return { ok: false, reason: "source-unavailable" };
+        if (expression.includes("chat-image-source-not-found")) {
+          return { ok: false, reason: "source-unavailable" };
+        }
         return { ok: true, clip: { x: -1, y: 0, width: 10, height: 10, scale: 1 } };
       },
       async request() {
@@ -72,7 +76,9 @@ test("refuses invalid clips, non-PNG captures, and paths outside the job root", 
     projectRoot,
     cdp: {
       async evaluate(expression) {
-        if (expression.includes("currentSrc")) return { ok: false, reason: "source-unavailable" };
+        if (expression.includes("chat-image-source-not-found")) {
+          return { ok: false, reason: "source-unavailable" };
+        }
         return { ok: true, clip: { x: 1, y: 1, width: 40, height: 40, scale: 1 } };
       },
       async request() {
@@ -143,7 +149,7 @@ test("rejects an embedded image whose declared type disagrees with its bytes", a
     projectRoot,
     cdp: {
       async evaluate(expression) {
-        if (expression.includes("currentSrc")) {
+        if (expression.includes("chat-image-source-not-found")) {
           return {
             ok: true,
             source: `data:image/jpeg;base64,${ONE_PIXEL_PNG.toString("base64")}`,
@@ -172,7 +178,7 @@ test("never passes an unnormalized WebP chat image to Codex", async (t) => {
     projectRoot,
     cdp: {
       async evaluate(expression) {
-        if (expression.includes("currentSrc")) {
+        if (expression.includes("chat-image-source-not-found")) {
           return {
             ok: true,
             source: `data:image/webp;base64,${MINIMAL_WEBP.toString("base64")}`,

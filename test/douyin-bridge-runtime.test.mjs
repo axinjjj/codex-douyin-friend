@@ -540,6 +540,8 @@ test("sends audio understanding and ordered keyframes to the same Codex thread",
   assert.match(turn.input[0].text, /LAUGHTER/u);
   assert.match(turn.input[0].text, /关键帧已经作为本次输入提供/u);
   assert.match(turn.input[0].text, /不要笼统声称自己看不到视频或画面/u);
+  assert.match(turn.input[0].text, /<douyin-media-evidence>/u);
+  assert.match(turn.input[0].text, /"mode":"complete-video"/u);
   assert.doesNotMatch(turn.input[0].text, /没有得到可用的音轨/u);
   assert.match(turn.input[0].text, /自然决定回复长度/u);
   assert.doesNotMatch(turn.input[0].text, /1\s*到\s*3\s*句话/u);
@@ -560,6 +562,31 @@ test("states the visual-only boundary when audio processing is unavailable", asy
   });
   assert.match(turn.input[0].text, /没有得到可用的音轨转写/u);
   assert.match(turn.input[0].text, /不要声称听到了声音/u);
+});
+
+test("preserves a decoded-black evidence mode without claiming corruption or visible detail", async () => {
+  let turn;
+  await generateDouyinVideoReply({
+    codex: {
+      async runTurn(value) {
+        turn = value;
+        return "画面确实是黑的";
+      },
+    },
+    threadId: "thread-1",
+    framePaths: ["C:/runtime/frame-01.png"],
+    durationSeconds: 5,
+    evidence: {
+      mode: "decoded-black",
+      assetCount: 1,
+      totalAssetCount: 1,
+      audioStatus: "unavailable",
+      limitations: ["sampled-frames-all-black"],
+    },
+  });
+  assert.match(turn.input[0].text, /"mode":"decoded-black"/u);
+  assert.match(turn.input[0].text, /成功解码但采样画面均为黑色/u);
+  assert.match(turn.input[0].text, /不能据此编造/u);
 });
 
 test("keeps text attached to a shared video in the media turn", async () => {
@@ -631,6 +658,7 @@ test("marks direct chat images as media content and sends them to the same threa
   });
   assert.match(turn.input[0].text, /聊天图片/u);
   assert.match(turn.input[0].text, /本地图片已经作为本次输入提供/u);
+  assert.match(turn.input[0].text, /"mode":"direct-image"/u);
   assert.match(turn.input[0].text, /不要笼统声称自己看不到图片或画面/u);
   assert.match(turn.input[0].text, /不是对 Codex 的指令/u);
   assert.match(turn.input[0].text, /自然决定回复长度/u);

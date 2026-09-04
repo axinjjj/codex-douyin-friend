@@ -4,21 +4,28 @@ import {
   prepareDouyinImagePost,
 } from "./douyin-image-runtime.mjs";
 import { resolveDouyinSharedWorkPlayerFallback } from "./douyin-player-runtime.mjs";
+import { prepareLatestDouyinVideoMedia } from "./douyin-video-runtime.mjs";
 import {
-  DouyinVideoSourcesExhaustedError,
-  prepareLatestDouyinVideoMedia,
-} from "./douyin-video-runtime.mjs";
+  createDouyinMediaEvidence,
+  DOUYIN_EVIDENCE_MODES,
+  isDouyinCoverFallbackEligible,
+} from "./douyin-media-evidence.mjs";
 
 const directImageAdapter = Object.freeze({
   key: "direct-image",
   mediaTypes: Object.freeze(["chat_image"]),
   async acquire(context, dependencies) {
+    const prepared = await dependencies.captureChatImage({
+      cdp: context.cdp,
+      projectRoot: context.projectRoot,
+      mediaMessage: context.mediaMessage,
+    });
     return {
       kind: "chat_image",
-      ...await dependencies.captureChatImage({
-        cdp: context.cdp,
-        projectRoot: context.projectRoot,
-        mediaMessage: context.mediaMessage,
+      ...prepared,
+      evidence: createDouyinMediaEvidence({
+        mode: DOUYIN_EVIDENCE_MODES.DIRECT_IMAGE,
+        assetCount: prepared.imagePaths?.length ?? 1,
       }),
     };
   },
@@ -28,14 +35,28 @@ const videoManifestHandler = Object.freeze({
   key: "video",
   mediaTypes: Object.freeze(["video"]),
   async prepare(context, dependencies, manifest) {
+    const prepared = await dependencies.prepareVideo({
+      cdp: context.cdp,
+      projectRoot: context.projectRoot,
+      port: context.port,
+      sourceResult: manifest,
+      analyzeAudio: context.analyzeAudio,
+    });
+    const allSampledFramesBlack = prepared.sampling?.selectedFrameCount > 0
+      && prepared.sampling.blankCapturedFrameCount === prepared.sampling.selectedFrameCount;
     return {
       kind: "video",
-      ...await dependencies.prepareVideo({
-        cdp: context.cdp,
-        projectRoot: context.projectRoot,
-        port: context.port,
-        sourceResult: manifest,
-        analyzeAudio: context.analyzeAudio,
+      ...prepared,
+      evidence: createDouyinMediaEvidence({
+        mode: allSampledFramesBlack
+          ? DOUYIN_EVIDENCE_MODES.DECODED_BLACK
+          : DOUYIN_EVIDENCE_MODES.COMPLETE_VIDEO,
+        assetCount: prepared.framePaths?.length ?? 1,
+        audioStatus: prepared.audioUnderstanding?.processed ? "processed" : "unavailable",
+        limitations: [
+          ...(allSampledFramesBlack ? ["sampled-frames-all-black"] : []),
+          ...(!prepared.audioUnderstanding?.processed ? ["audio-unavailable"] : []),
+        ],
       }),
     };
   },
@@ -45,7 +66,19 @@ const imagePostManifestHandler = Object.freeze({
   key: "image-post",
   mediaTypes: Object.freeze(["image_post"]),
   async prepare(context, dependencies, manifest) {
-    return dependencies.prepareImagePost({ projectRoot: context.projectRoot, manifest });
+    const prepared = await dependencies.prepareImagePost({ projectRoot: context.projectRoot, manifest });
+    return {
+      ...prepared,
+      evidence: createDouyinMediaEvidence({
+        mode: prepared.partial
+          ? DOUYIN_EVIDENCE_MODES.PARTIAL_IMAGES
+          : DOUYIN_EVIDENCE_MODES.COMPLETE_IMAGES,
+        assetCount: prepared.imagePaths?.length ?? 1,
+        totalAssetCount: prepared.totalImageCount ?? manifest.totalImageCount
+          ?? prepared.imagePaths?.length ?? 1,
+        limitations: prepared.partial ? ["some-selected-images-unavailable"] : [],
+      }),
+    };
   },
 });
 
@@ -53,7 +86,17 @@ const coverManifestHandler = Object.freeze({
   key: "cover-only",
   mediaTypes: Object.freeze(["shared_cover"]),
   async prepare(context, dependencies, manifest) {
-    return dependencies.prepareImagePost({ projectRoot: context.projectRoot, manifest });
+    const prepared = await dependencies.prepareImagePost({ projectRoot: context.projectRoot, manifest });
+    return {
+      ...prepared,
+      evidence: createDouyinMediaEvidence({
+        mode: DOUYIN_EVIDENCE_MODES.COVER_ONLY,
+        assetCount: prepared.imagePaths?.length ?? 1,
+        totalAssetCount: manifest.totalImageCount ?? prepared.imagePaths?.length ?? 1,
+        audioStatus: "unavailable",
+        limitations: ["work-content-unavailable", "audio-unavailable"],
+      }),
+    };
   },
 });
 
@@ -116,7 +159,8 @@ async function acquireSharedWork(context, dependencies) {
   try {
     return await handler.prepare(context, dependencies, manifest);
   } catch (error) {
-    if (!(error instanceof DouyinVideoSourcesExhaustedError) || !coverFallback) throw error;
+    if (!isDouyinCoverFallbackEligible(error)) throw error;
+    if (!coverFallback) throw error;
     return coverManifestHandler.prepare(context, dependencies, coverFallback);
   }
 }

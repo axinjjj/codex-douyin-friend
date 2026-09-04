@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import readline from "node:readline";
+import { validateDouyinSendCapability } from "./douyin-send-capability.mjs";
 
 const SAFETY_EXIT_CODES = new Set([3, 4, 5, 6, 7]);
 const DANGEROUS_PHASES = new Set(["processing", "reply-ready", "sending", "compacting"]);
@@ -17,6 +18,7 @@ const DEFAULT_CONFIG = Object.freeze({
   model: "gpt-5.6-sol",
   effort: "xhigh",
   sendEnabled: false,
+  sendCapability: null,
   mediaReactionEnabled: false,
   bridgeTimeoutMs: 86_400_000,
   debugPort: 9229,
@@ -32,6 +34,12 @@ function validateConfig(value) {
       || typeof config.mediaReactionEnabled !== "boolean"
       || typeof config.autoLaunchEdge !== "boolean") {
     throw new Error("Supervisor boolean config is invalid.");
+  }
+  if (config.sendCapability !== null) {
+    config.sendCapability = validateDouyinSendCapability(config.sendCapability);
+  }
+  if (config.sendEnabled && !config.sendCapability) {
+    config.sendEnabled = false;
   }
   if (!Number.isInteger(config.bridgeTimeoutMs) || config.bridgeTimeoutMs < 60_000) {
     throw new Error("Bridge timeout must be at least one minute.");
@@ -162,6 +170,7 @@ export class DouyinSupervisor extends EventEmitter {
     this.restartTimer = null;
     this.restartTimes = [];
     this.forceFreshThread = false;
+    this.currentChatBinding = null;
     this.models = [];
     this.status = {
       supervisor: "ready",
@@ -247,7 +256,14 @@ export class DouyinSupervisor extends EventEmitter {
   async setAutoSend(sendEnabled) {
     this.#requireAllowed("setAutoSend");
     if (typeof sendEnabled !== "boolean") throw new Error("sendEnabled must be boolean.");
-    this.config = await saveSupervisorConfig(this.configPath, { ...this.config, sendEnabled });
+    if (sendEnabled && !this.currentChatBinding) {
+      throw new Error("The current Douyin chat has not produced a verifiable send binding.");
+    }
+    this.config = await saveSupervisorConfig(this.configPath, {
+      ...this.config,
+      sendEnabled,
+      sendCapability: sendEnabled ? this.currentChatBinding : null,
+    });
     this.#update({ sendEnabled });
     if (this.child) await this.#restartBridge();
     return this.getStatus();
@@ -366,6 +382,9 @@ export class DouyinSupervisor extends EventEmitter {
         ...process.env,
         DOUYIN_SUPERVISED: "true",
         DOUYIN_SEND_ENABLED: String(this.config.sendEnabled),
+        DOUYIN_SEND_CAPABILITY: this.config.sendCapability
+          ? JSON.stringify(this.config.sendCapability)
+          : "",
         DOUYIN_MEDIA_REACTION_ENABLED: String(this.config.mediaReactionEnabled),
         DOUYIN_BRIDGE_TIMEOUT_MS: String(this.config.bridgeTimeoutMs),
         DOUYIN_DEBUG_PORT: String(this.config.debugPort),
@@ -397,6 +416,11 @@ export class DouyinSupervisor extends EventEmitter {
     }
     if (!event || typeof event.event !== "string") return;
     if (event.event === "bridge-ready") {
+      try {
+        this.currentChatBinding = validateDouyinSendCapability(event.sendBinding);
+      } catch {
+        this.currentChatBinding = null;
+      }
       this.restartTimes = [];
       this.#update({
         bridge: "running",
@@ -454,6 +478,7 @@ export class DouyinSupervisor extends EventEmitter {
     const wasPlanned = this.plannedStop;
     this.plannedStop = false;
     this.#update({ bridge: "offline", appServer: "offline" });
+    if (code === 4) this.#revokeSendCapability("binding-invalidated");
     if (!this.desiredRunning || wasPlanned) return;
     if (SAFETY_EXIT_CODES.has(code) || DANGEROUS_PHASES.has(this.status.phase)) {
       this.#block(`bridge-exit-${code ?? signal ?? "unknown"}`);
@@ -543,6 +568,21 @@ export class DouyinSupervisor extends EventEmitter {
   #cancelRestart() {
     if (this.restartTimer) this.clearTimer(this.restartTimer);
     this.restartTimer = null;
+  }
+
+  #revokeSendCapability(reason) {
+    if (!this.config.sendEnabled && !this.config.sendCapability) return;
+    const next = { ...this.config, sendEnabled: false, sendCapability: null };
+    this.config = validateConfig(next);
+    this.#update({
+      sendEnabled: false,
+      lastError: { event: "send-capability-revoked", reason },
+    });
+    saveSupervisorConfig(this.configPath, this.config).catch(() => {
+      this.#update({
+        lastError: { event: "send-capability-revocation-failed", reason: "config-write-failed" },
+      });
+    });
   }
 
   #update(patch) {

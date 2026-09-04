@@ -120,6 +120,7 @@ export class CodexContextCompactionManager {
   constructor({
     codex,
     threadId,
+    generation = null,
     highWatermark = DEFAULT_CONTEXT_COMPACTION_POLICY.highWatermark,
     lowWatermark = DEFAULT_CONTEXT_COMPACTION_POLICY.lowWatermark,
     cooldownMs = DEFAULT_CONTEXT_COMPACTION_POLICY.cooldownMs,
@@ -134,10 +135,14 @@ export class CodexContextCompactionManager {
       throw new Error("A notification-capable Codex client is required.");
     }
     if (!threadId) throw new Error("A Codex thread id is required.");
+    if (generation !== null && (!Number.isSafeInteger(generation) || generation < 1)) {
+      throw new Error("A valid Codex task generation is required.");
+    }
     validatePolicy({ highWatermark, lowWatermark, cooldownMs, timeoutMs });
 
     this.codex = codex;
     this.threadId = threadId;
+    this.generation = generation;
     this.highWatermark = highWatermark;
     this.lowWatermark = lowWatermark;
     this.cooldownMs = cooldownMs;
@@ -200,6 +205,10 @@ export class CodexContextCompactionManager {
   }
 
   async runTurn(params) {
+    if (this.generation !== null && params?.taskGeneration !== this.generation) {
+      throw new Error("A stale Codex task generation attempted to start a turn.");
+    }
+    const { taskGeneration: _taskGeneration, ...turnParams } = params || {};
     if (!(await this.waitForIdle())) {
       const diagnostic = this.#emitDiagnostic({
         ok: false,
@@ -209,7 +218,7 @@ export class CodexContextCompactionManager {
       });
       throw new CodexContextRecoveryError("thread-not-idle", diagnostic);
     }
-    const firstAttempt = await this.#executeObservedTurn(params);
+    const firstAttempt = await this.#executeObservedTurn(turnParams);
     if (firstAttempt.ok) return firstAttempt.reply;
     if (firstAttempt.codexErrorCode !== "contextWindowExceeded") {
       throw firstAttempt.error;
@@ -230,7 +239,7 @@ export class CodexContextCompactionManager {
       throw new CodexContextRecoveryError("thread-not-idle-after-compaction", diagnostic);
     }
 
-    const retry = await this.#executeObservedTurn(params);
+    const retry = await this.#executeObservedTurn(turnParams);
     if (retry.ok) {
       this.#emitDiagnostic({
         ok: true,

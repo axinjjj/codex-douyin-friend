@@ -436,3 +436,27 @@ test("does not retry the turn when recovery compaction fails", async () => {
   assert.equal(codex.compactCalls, 1);
   manager.close();
 });
+
+test("rejects stale task generations before starting a Codex turn", async () => {
+  const codex = new FakeCodex();
+  const manager = new CodexContextCompactionManager({
+    codex,
+    threadId: "thread-1",
+    generation: 3,
+  });
+  await assert.rejects(
+    manager.runTurn({ threadId: "thread-1", text: "fixture", taskGeneration: 2 }),
+    /stale Codex task generation/u,
+  );
+  assert.equal(codex.turnCalls, 0);
+  codex.emit("notification", {
+    method: "thread/status/changed",
+    params: { threadId: "thread-1", status: { type: "idle" } },
+  });
+  assert.equal(await manager.runTurn({
+    threadId: "thread-1",
+    text: "fixture",
+    taskGeneration: 3,
+  }), "reply");
+  manager.close();
+});

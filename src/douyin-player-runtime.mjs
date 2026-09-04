@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -20,6 +21,10 @@ import {
   getAdaptiveFramePlan,
   selectAdaptiveFrameSamples,
 } from "./video-frame-selection.mjs";
+import {
+  createDouyinMediaEvidence,
+  DOUYIN_EVIDENCE_MODES,
+} from "./douyin-media-evidence.mjs";
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const CHAT_FINGERPRINT_PATTERN = /^[0-9a-f]{64}$/u;
@@ -109,12 +114,13 @@ export async function prepareOpenDouyinPlayerVideo({
   maxDimension = 768,
   maxScanWallTimeMs = MAX_SCAN_WALL_TIME_MS,
   maxCaptureWallTimeMs = MAX_CAPTURE_WALL_TIME_MS,
+  actionMarker,
 } = {}) {
   if (!cdp || typeof cdp.evaluate !== "function") {
     throw new Error("A connected CDP client is required to capture the open Douyin player.");
   }
   const state = playerState?.ok ? playerState : await cdp.evaluate(
-    buildReadOpenSharedWorkVideoExpression(),
+    buildReadOpenSharedWorkVideoExpression(actionMarker),
   );
   if (state?.transport !== "mse" || !Number.isFinite(state.duration) || state.duration <= 0
       || !Number.isFinite(state.videoWidth) || state.videoWidth <= 0
@@ -212,6 +218,14 @@ export async function prepareOpenDouyinPlayerVideo({
         processed: false,
         reason: "open-player-mse-visual-only",
       },
+      evidence: createDouyinMediaEvidence({
+        mode: captureVisuals.visualMode === "decoded-black"
+          ? DOUYIN_EVIDENCE_MODES.DECODED_BLACK
+          : DOUYIN_EVIDENCE_MODES.VISUAL_ONLY,
+        assetCount: framePaths.length,
+        audioStatus: "unavailable",
+        limitations: ["open-player-mse-visual-only"],
+      }),
       sampling: {
         frameBudget: framePlan.frameBudget,
         scanBudget: framePlan.scanBudget,
@@ -265,54 +279,23 @@ export async function resolveDouyinSharedWorkPlayerFallback({
     Number.parseInt(intervalMs, 10) || OPEN_PLAYER_INTERVAL_MS,
   ));
 
-  const networkSources = [];
-  const observeNetworkSource = (message) => {
-    if (message?.method !== "Network.responseReceived") return;
-    const response = message.params?.response;
-    const source = response?.url;
-    const mimeType = String(response?.mimeType || "").toLowerCase();
-    const resourceType = String(message.params?.type || "").toLowerCase();
-    if ((resourceType === "media" || mimeType.startsWith("video/"))
-        && isTrustedDouyinMediaUrl(source)
-        && !networkSources.includes(source)
-        && networkSources.length < MAX_VIDEO_SOURCE_CANDIDATES) {
-      networkSources.push(source);
-    }
-  };
-  let networkObservationEnabled = false;
-  if (typeof cdp.on === "function" && typeof cdp.off === "function"
-      && typeof cdp.request === "function") {
-    cdp.on("notification", observeNetworkSource);
-    try {
-      await cdp.request("Network.enable", {}, 5_000);
-      networkObservationEnabled = true;
-    } catch {
-      cdp.off("notification", observeNetworkSource);
-    }
-  }
   let guard;
   try {
     guard = await cdp.evaluate(buildInstallDouyinSilentMediaGuardExpression());
   } catch (error) {
-    if (networkObservationEnabled) {
-      cdp.off("notification", observeNetworkSource);
-      await cdp.request("Network.disable", {}, 5_000).catch(() => {});
-    }
     throw error;
   }
   if (!guard?.ok) {
-    if (networkObservationEnabled) {
-      cdp.off("notification", observeNetworkSource);
-      await cdp.request("Network.disable", {}, 5_000).catch(() => {});
-    }
     return { kind: "manifest", manifest: initialManifest };
   }
+  const actionMarker = randomBytes(32).toString("hex");
   let opened = false;
   let closeRequired = false;
   try {
     const openResult = await cdp.evaluate(buildOpenIncomingSharedWorkExpression(
       mediaMessage,
       expectedChatFingerprint,
+      actionMarker,
     ));
     if (!openResult?.ok || openResult.chatFingerprint !== expectedChatFingerprint) {
       return { kind: "manifest", manifest: initialManifest };
@@ -321,23 +304,16 @@ export async function resolveDouyinSharedWorkPlayerFallback({
     closeRequired = true;
     for (let attempt = 0; attempt < boundedAttempts; attempt += 1) {
       if (attempt > 0) await sleepFn(boundedIntervalMs);
-      const player = await cdp.evaluate(buildReadOpenSharedWorkVideoExpression());
+      const player = await cdp.evaluate(buildReadOpenSharedWorkVideoExpression(actionMarker));
       if (!player?.ok) continue;
-      if (networkSources.length > 0) {
-        return {
-          kind: "manifest",
-          manifest: {
-            ok: true,
-            mediaType: "video",
-            source: networkSources[0],
-            sources: [...networkSources],
-            selectedCodec: "open-player-network",
-          },
-        };
-      }
       if (player.transport === "mse") {
         try {
-          const media = await preparePlayerVideo({ cdp, projectRoot, playerState: player });
+          const media = await preparePlayerVideo({
+            cdp,
+            projectRoot,
+            playerState: player,
+            actionMarker,
+          });
           return { kind: "media", media: { kind: "video", ...media } };
         } catch {
           return { kind: "manifest", manifest: initialManifest };
@@ -363,13 +339,15 @@ export async function resolveDouyinSharedWorkPlayerFallback({
   } finally {
     let cleanupError = null;
     if (opened) {
-      const closeResult = await cdp.evaluate(buildCloseOpenSharedWorkExpression());
+      const closeResult = await cdp.evaluate(buildCloseOpenSharedWorkExpression(actionMarker));
       if (!closeResult?.ok) {
         cleanupError = new Error("The Douyin shared-work viewer could not be closed safely.");
       } else {
         for (let attempt = 0; attempt < 4; attempt += 1) {
           await sleepFn(100);
-          const playerState = await cdp.evaluate(buildReadOpenSharedWorkStateExpression());
+          const playerState = await cdp.evaluate(
+            buildReadOpenSharedWorkStateExpression(actionMarker),
+          );
           if (playerState?.ok && playerState.open === false) {
             closeRequired = false;
             break;
@@ -386,10 +364,6 @@ export async function resolveDouyinSharedWorkPlayerFallback({
       .catch(() => null);
     if (!removal?.ok && !cleanupError) {
       cleanupError = new Error("The temporary Douyin media mute guard could not be removed.");
-    }
-    if (networkObservationEnabled) {
-      cdp.off("notification", observeNetworkSource);
-      await cdp.request("Network.disable", {}, 5_000).catch(() => {});
     }
     if (cleanupError) throw cleanupError;
   }

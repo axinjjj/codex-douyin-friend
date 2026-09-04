@@ -104,11 +104,13 @@ test("persists only non-sensitive allowlisted state with an atomic replacement",
       "chatKey",
       "checkpoint",
       "effort",
+      "generation",
       "model",
       "threadId",
       "version",
     ]);
     assert.deepEqual(Object.keys(parsed.checkpoint).sort(), [
+      "action",
       "blockedReason",
       "outboundFingerprint",
       "pending",

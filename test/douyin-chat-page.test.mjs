@@ -179,9 +179,14 @@ test("opens one exact shared work and distinguishes bounded HTTPS and MSE player
     kind: "media",
     side: "left",
   };
-  const open = buildOpenIncomingSharedWorkExpression(exactMessage, "c".repeat(64));
-  const read = buildReadOpenSharedWorkVideoExpression();
-  const close = buildCloseOpenSharedWorkExpression();
+  const actionMarker = "d".repeat(64);
+  const open = buildOpenIncomingSharedWorkExpression(
+    exactMessage,
+    "c".repeat(64),
+    actionMarker,
+  );
+  const read = buildReadOpenSharedWorkVideoExpression(actionMarker);
+  const close = buildCloseOpenSharedWorkExpression(actionMarker);
   assert.match(open, /ordinalFromEnd":2/u);
   assert.match(open, /incoming-media-identity-changed/u);
   assert.match(open, /chat-changed-before-shared-work-open/u);
@@ -189,6 +194,8 @@ test("opens one exact shared work and distinguishes bounded HTTPS and MSE player
   assert.match(open, /slice\(0, 63\)/u);
   assert.match(open, /__reactProps\$/u);
   assert.match(open, /clickTarget\.click\(\)/u);
+  assert.match(open, /preexistingVideos/u);
+  assert.match(open, /unowned-shared-work-viewer-already-open/u);
   assert.match(read, /commonModalFullScreenModalFullScreen/u);
   assert.match(read, /currentSrc/u);
   assert.match(read, /slice\(0, 4\)/u);
@@ -197,13 +204,16 @@ test("opens one exact shared work and distinguishes bounded HTTPS and MSE player
   assert.match(read, /source\.startsWith\('blob:'\)/u);
   assert.match(read, /video\.muted = true/u);
   assert.match(read, /video\.volume = 0/u);
+  assert.match(read, /player-action-binding-mismatch/u);
+  assert.match(read, /preexistingVideos\.has/u);
   assert.doesNotThrow(() => new Function(`return ${read}`));
-  const state = buildReadOpenSharedWorkStateExpression();
+  const state = buildReadOpenSharedWorkStateExpression(actionMarker);
   assert.match(state, /commonModalFullScreenModalFullScreen/u);
   assert.doesNotMatch(state, /currentSrc|getAttribute\('src'\)|textContent|innerText/u);
   assert.doesNotThrow(() => new Function(`return ${state}`));
   assert.match(close, /commonModalFullScreenclose/u);
   assert.match(close, /close\.click\(\)/u);
+  assert.match(close, /player-action-binding-mismatch/u);
   for (const expression of [open, read, state, close]) {
     assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
   }

@@ -114,6 +114,52 @@ test("starts a supervised hidden bridge and exposes sanitized live status", asyn
   assert.match(command, /"command":"compact"/u);
 });
 
+test("enables sending only from a live verified binding and revokes it on authority loss", async (t) => {
+  const root = await temporaryRoot(t);
+  const configPath = path.join(root, ".runtime", "supervisor", "config.json");
+  const children = [];
+  const calls = [];
+  const binding = {
+    version: 1,
+    chatFingerprint: "a".repeat(64),
+    targetId: "target-1",
+    pageEpoch: "b".repeat(64),
+    pageUrlHash: "c".repeat(64),
+  };
+  const supervisor = await createDouyinSupervisor({
+    projectRoot: root,
+    configPath,
+    nodePath: process.execPath,
+    fetchFn: readyFetch,
+    spawnProcess(executable, args, options) {
+      const child = new FakeChild({ exitOnStop: true });
+      children.push(child);
+      calls.push({ executable, args, options });
+      return child;
+    },
+  });
+  await assert.rejects(supervisor.setAutoSend(true), /has not produced/u);
+  await supervisor.start();
+  children[0].stdout.write(`${JSON.stringify({
+    event: "bridge-ready",
+    audioEnabled: true,
+    sendBinding: binding,
+  })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  await supervisor.setAutoSend(true);
+  assert.equal(calls[1].options.env.DOUYIN_SEND_ENABLED, "true");
+  assert.deepEqual(JSON.parse(calls[1].options.env.DOUYIN_SEND_CAPABILITY), binding);
+  assert.doesNotMatch(JSON.stringify(supervisor.getStatus()), /target-1|pageEpoch|chatFingerprint/u);
+
+  children[1].emit("exit", 4, null);
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (!(await loadSupervisorConfig(configPath)).sendEnabled) break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal((await loadSupervisorConfig(configPath)).sendEnabled, false);
+  assert.equal((await loadSupervisorConfig(configPath)).sendCapability, null);
+});
+
 test("blocks safely after an unknown media structure crashes during processing", async (t) => {
   const root = await temporaryRoot(t);
   const child = new FakeChild();

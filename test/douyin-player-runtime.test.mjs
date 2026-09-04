@@ -50,7 +50,7 @@ function expressionKind(expression) {
   if (expression.includes("clickTarget.click()")) return "open";
   if (expression.includes("const rawSources")) return "read";
   if (expression.includes("const close = modal.querySelector")) return "close";
-  if (expression.includes("open: Boolean")) return "state";
+  if (expression.includes("const open = Boolean")) return "state";
   return "other";
 }
 
@@ -144,7 +144,7 @@ test("captures MSE video frames from the muted open player instead of downgradin
   assert.deepEqual(calls, ["guard", "open", "read", "close", "state", "unguard"]);
 });
 
-test("prefers a trusted media response observed during silent player open for full audio processing", async () => {
+test("ignores unbound network video responses while capturing the exact MSE player", async () => {
   const requests = [];
   class FakeCdp extends EventEmitter {
     async request(method) {
@@ -188,14 +188,16 @@ test("prefers a trusted media response observed during silent player open for fu
     expectedChatFingerprint: chatFingerprint,
     initialManifest: coverManifest,
     sleepFn: async () => {},
-    preparePlayerVideo: async () => {
-      throw new Error("A downloadable source should retain the full audio pipeline.");
-    },
+    preparePlayerVideo: async () => ({
+      jobDirectory: "C:/runtime/video-analysis/job",
+      framePaths: ["C:/runtime/video-analysis/job/frame-01.png"],
+      duration: 6.1,
+      audioUnderstanding: { processed: false, reason: "open-player-mse-visual-only" },
+    }),
   });
-  assert.equal(result.kind, "manifest");
-  assert.equal(result.manifest.selectedCodec, "open-player-network");
-  assert.equal(result.manifest.source, "https://v3-dy.zjcdn.com/video.mp4");
-  assert.deepEqual(requests, ["Network.enable", "Network.disable"]);
+  assert.equal(result.kind, "media");
+  assert.equal(result.media.duration, 6.1);
+  assert.deepEqual(requests, []);
 });
 
 test("keeps an honest cover boundary when the bounded muted player has no video", async () => {

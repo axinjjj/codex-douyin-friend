@@ -233,3 +233,54 @@ test("runTurn consumes only notifications for the returned turn id", async () =>
   };
   assert.equal(await client.runTurn({ threadId: "thread-1", text: "fixture" }), "right");
 });
+
+test("persists the turn id callback before consuming buffered completion", async () => {
+  const events = [];
+  const client = new CodexAppServerClient();
+  client.request = async () => {
+    client.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: { threadId: "thread-1", turnId: "turn-1", delta: "reply" },
+    });
+    client.emit("notification", {
+      method: "turn/completed",
+      params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } },
+    });
+    return { turn: { id: "turn-1" } };
+  };
+  const reply = await client.runTurn({
+    threadId: "thread-1",
+    text: "fixture",
+    async onTurnStarted({ turnId }) {
+      events.push(`persist:${turnId}`);
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+  });
+  events.push(`reply:${reply}`);
+  assert.deepEqual(events, ["persist:turn-1", "reply:reply"]);
+});
+
+test("reads one completed turn by id without returning non-agent items", async () => {
+  const client = new CodexAppServerClient();
+  client.request = async (method, params) => {
+    assert.equal(method, "thread/read");
+    assert.deepEqual(params, { threadId: "thread-1", includeTurns: true });
+    return {
+      thread: {
+        turns: [{
+          id: "turn-1",
+          status: "completed",
+          items: [
+            { type: "commandExecution", text: "private tool output" },
+            { type: "agentMessage", content: [{ type: "outputText", text: "reply" }] },
+          ],
+        }],
+      },
+    };
+  };
+  assert.deepEqual(await client.readTurn({ threadId: "thread-1", turnId: "turn-1" }), {
+    found: true,
+    status: "completed",
+    text: "reply",
+  });
+});

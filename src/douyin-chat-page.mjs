@@ -251,11 +251,34 @@ const STABLE_MEDIA_FINGERPRINT_SOURCE = `
           return ['shared-work-v2', variant, String(identity)].join('|');
         }
       }
-      const directImages = mediaMessage.querySelectorAll(
+      const directImages = Array.from(mediaMessage.querySelectorAll(
         '.MessageItemImageImage, .MessageItemImageImageBox img'
-      ).length;
-      if (directImages > 0) {
-        return ['chat-image-v2', directImages].join('|');
+      )).slice(0, 4);
+      if (directImages.length > 0) {
+        const identities = directImages.map((image) => {
+          const source = String(image.currentSrc || '');
+          let stableSource = source;
+          if (source.startsWith('https://')) {
+            try {
+              const parsed = new URL(source);
+              stableSource = [parsed.origin, parsed.pathname].join('');
+            } catch {}
+          } else if (source.startsWith('data:')) {
+            stableSource = [
+              source.slice(0, 48),
+              source.length,
+              source.slice(-48),
+            ].join(':');
+          }
+          return [
+            stableSource.slice(0, 2_048),
+            image.naturalWidth || 0,
+            image.naturalHeight || 0,
+            image.getAttribute('width') || '',
+            image.getAttribute('height') || '',
+          ].join('|');
+        });
+        return ['chat-image-v3', directImages.length, ...identities].join('|');
       }
       return [
         'media-shape-v2',
@@ -821,11 +844,18 @@ export function buildLocateLatestIncomingAwemeExpression() {
   })()`;
 }
 
-export function buildOpenIncomingSharedWorkExpression(mediaMessage, expectedChatFingerprint) {
+export function buildOpenIncomingSharedWorkExpression(
+  mediaMessage,
+  expectedChatFingerprint,
+  actionMarker,
+) {
   const expected = normalizeExactIncomingMediaMessage(mediaMessage);
   if (!expected) throw new Error("Exact incoming shared-work metadata is required.");
   if (!/^[0-9a-f]{64}$/u.test(expectedChatFingerprint || "")) {
     throw new Error("A locked Douyin chat fingerprint is required to open shared work.");
+  }
+  if (!/^[0-9a-f]{64}$/u.test(actionMarker || "")) {
+    throw new Error("A bounded player action marker is required to open shared work.");
   }
   return `(async () => {
     ${CHAT_IDENTITY_CAPTURE_SOURCE}
@@ -838,23 +868,46 @@ export function buildOpenIncomingSharedWorkExpression(mediaMessage, expectedChat
     }
     const card = message.querySelector(${JSON.stringify(DOUYIN_SHARED_CARD_SELECTOR)});
     if (!card) return { ok: false, reason: 'incoming-shared-work-card-not-found' };
+    if (document.querySelector('.commonModalFullScreenModalFullScreen')) {
+      return { ok: false, reason: 'unowned-shared-work-viewer-already-open' };
+    }
     const boundedCardNodes = [card, ...Array.from(card.querySelectorAll('*')).slice(0, 63)];
     const reactClickTarget = boundedCardNodes.find((node) => {
       const propsKey = Object.keys(node).find((key) => key.startsWith('__reactProps$'));
       return Boolean(propsKey && typeof node[propsKey]?.onClick === 'function');
     });
     const clickTarget = card.querySelector('.BulletBulletVideoplayIcon') || reactClickTarget || card;
+    const bindingKey = '__codexDouyinPlayerActionV1';
+    if (window[bindingKey]) return { ok: false, reason: 'player-action-already-active' };
+    window[bindingKey] = {
+      marker: ${JSON.stringify(actionMarker)},
+      messageFingerprint: ${JSON.stringify(expected.fingerprint)},
+      preexistingVideos: new WeakSet(Array.from(document.querySelectorAll('video'))),
+    };
     clickTarget.scrollIntoView({ block: 'center', inline: 'center' });
-    clickTarget.click();
+    try {
+      clickTarget.click();
+    } catch {
+      delete window[bindingKey];
+      return { ok: false, reason: 'shared-work-click-failed' };
+    }
     return {
       ok: true,
       chatFingerprint,
+      actionMarker: ${JSON.stringify(actionMarker)},
     };
   })()`;
 }
 
-export function buildReadOpenSharedWorkVideoExpression() {
+export function buildReadOpenSharedWorkVideoExpression(actionMarker) {
+  if (!/^[0-9a-f]{64}$/u.test(actionMarker || "")) {
+    throw new Error("A bounded player action marker is required to read shared work.");
+  }
   return `(() => {
+    const binding = window.__codexDouyinPlayerActionV1;
+    if (!binding || binding.marker !== ${JSON.stringify(actionMarker)}) {
+      return { ok: false, reason: 'player-action-binding-mismatch' };
+    }
     const modal = document.querySelector('.commonModalFullScreenModalFullScreen');
     if (!modal) return { ok: false, reason: 'shared-work-viewer-not-open' };
     const visible = (element) => {
@@ -864,7 +917,7 @@ export function buildReadOpenSharedWorkVideoExpression() {
         style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
     };
     const videos = Array.from(modal.querySelectorAll('video'))
-      .filter(visible)
+      .filter((video) => !binding.preexistingVideos.has(video) && visible(video))
       .sort((left, right) => {
         const leftRect = left.getBoundingClientRect();
         const rightRect = right.getBoundingClientRect();
@@ -917,17 +970,36 @@ export function buildReadOpenSharedWorkVideoExpression() {
   })()`;
 }
 
-export function buildReadOpenSharedWorkStateExpression() {
-  return `(() => ({
-    ok: true,
-    open: Boolean(document.querySelector('.commonModalFullScreenModalFullScreen')),
-  }))()`;
+export function buildReadOpenSharedWorkStateExpression(actionMarker) {
+  if (!/^[0-9a-f]{64}$/u.test(actionMarker || "")) {
+    throw new Error("A bounded player action marker is required to inspect shared work.");
+  }
+  return `(() => {
+    const key = '__codexDouyinPlayerActionV1';
+    if (window[key]?.marker !== ${JSON.stringify(actionMarker)}) {
+      return { ok: false, reason: 'player-action-binding-mismatch' };
+    }
+    const open = Boolean(document.querySelector('.commonModalFullScreenModalFullScreen'));
+    if (!open) delete window[key];
+    return { ok: true, open };
+  })()`;
 }
 
-export function buildCloseOpenSharedWorkExpression() {
+export function buildCloseOpenSharedWorkExpression(actionMarker) {
+  if (!/^[0-9a-f]{64}$/u.test(actionMarker || "")) {
+    throw new Error("A bounded player action marker is required to close shared work.");
+  }
   return `(() => {
+    const key = '__codexDouyinPlayerActionV1';
+    const binding = window[key];
+    if (!binding || binding.marker !== ${JSON.stringify(actionMarker)}) {
+      return { ok: false, reason: 'player-action-binding-mismatch' };
+    }
     const modal = document.querySelector('.commonModalFullScreenModalFullScreen');
-    if (!modal) return { ok: true, wasOpen: false, closed: true };
+    if (!modal) {
+      delete window[key];
+      return { ok: true, wasOpen: false, closed: true };
+    }
     const close = modal.querySelector('.commonModalFullScreenclose');
     if (!close) return { ok: false, reason: 'shared-work-viewer-close-not-found' };
     close.click();

@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,12 +23,14 @@ import {
   buildReadIncomingMediaTextExpression,
   buildReadIncomingTextBatchExpression,
   isDouyinChatTarget,
+  normalizeOutboundText,
 } from "../src/douyin-chat-page.mjs";
 import {
   DouyinSendAbortedError,
   generateDouyinReply,
   generateDouyinImageReply,
   generateDouyinVideoReply,
+  parseDouyinMediaReply,
   preparePersistentBridgeSession,
   sanitizeDouyinMediaDiagnostic,
   sendAndVerifyDouyinReply,
@@ -60,6 +63,19 @@ import {
   resolveOptionalSenseVoiceRuntime,
   transcribeSenseVoiceAudio,
 } from "../src/sensevoice-runtime.mjs";
+import {
+  buildGetOrCreateDouyinPageEpochExpression,
+  createDouyinSendCapability,
+  douyinSendCapabilitiesMatch,
+  parseDouyinSendCapability,
+  selectDouyinChatTarget,
+} from "../src/douyin-send-capability.mjs";
+import {
+  computeDouyinReplyDigest,
+  computeDouyinTurnPromptDigest,
+  createDouyinAction,
+  transitionDouyinAction,
+} from "../src/douyin-action-journal.mjs";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(scriptDirectory, "..");
@@ -67,6 +83,9 @@ const expectedPersonaPath = path.join(os.homedir(), ".codex", "AGENTS.md");
 const port = Number.parseInt(process.env.DOUYIN_DEBUG_PORT || "9229", 10);
 const timeoutMs = Number.parseInt(process.env.DOUYIN_BRIDGE_TIMEOUT_MS || "3600000", 10);
 const sendEnabled = process.env.DOUYIN_SEND_ENABLED === "true";
+const configuredSendCapability = parseDouyinSendCapability(
+  process.env.DOUYIN_SEND_CAPABILITY || "",
+);
 const mediaReactionEnabled = process.env.DOUYIN_MEDIA_REACTION_ENABLED === "true";
 const model = process.env.CODEX_DOUYIN_MODEL || "gpt-5.6-sol";
 const effort = process.env.CODEX_DOUYIN_EFFORT || "xhigh";
@@ -90,8 +109,20 @@ const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
 });
 if (!response.ok) throw new Error(`Douyin debugger returned HTTP ${response.status}.`);
 const targets = await response.json();
-const target = (targets ?? []).find(isDouyinChatTarget);
-if (!target) throw new Error("No debuggable Douyin chat page was found.");
+if (sendEnabled && !configuredSendCapability) {
+  process.exitCode = 4;
+  throw new Error("Automatic sending requires a verified Douyin chat capability.");
+}
+let target;
+try {
+  target = selectDouyinChatTarget(targets ?? [], {
+    capability: configuredSendCapability,
+    isChatTarget: isDouyinChatTarget,
+  });
+} catch (error) {
+  process.exitCode = 4;
+  throw error;
+}
 
 const cdp = new CdpClient(target.webSocketDebuggerUrl);
 const codex = new CodexAppServerClient();
@@ -168,11 +199,38 @@ codex.on("stderr", () => {
 try {
   await cdp.connect();
   await repairCollapsedDouyinViewport({ cdp, targetId: target.id });
+  const pageBinding = await cdp.evaluate(buildGetOrCreateDouyinPageEpochExpression());
+  if (!pageBinding?.ok) throw new Error("The Douyin page epoch is unavailable.");
   const startupTail = await cdp.evaluate(buildEnsureChatTailVisibleExpression());
   if (!startupTail?.ok) throw new Error("The Douyin message tail is unavailable.");
   await sleep(150);
   const lockedChat = await cdp.evaluate(buildChatIdentityMetadataExpression());
   if (!lockedChat?.found) throw new Error("The current Douyin chat could not be locked.");
+  const sendBinding = createDouyinSendCapability({
+    chatFingerprint: lockedChat.fingerprint,
+    target,
+    pageEpoch: pageBinding.pageEpoch,
+  });
+  if (sendBinding.pageUrlHash !== pageBinding.pageUrlHash
+      || (configuredSendCapability
+        && !douyinSendCapabilitiesMatch(configuredSendCapability, sendBinding))) {
+    process.exitCode = 4;
+    throw new Error("The active Douyin page does not match its verified send capability.");
+  }
+  const verifyActiveSendCapability = async () => {
+    const [currentChat, currentPage] = await Promise.all([
+      cdp.evaluate(buildChatIdentityMetadataExpression()),
+      cdp.evaluate(buildGetOrCreateDouyinPageEpochExpression()),
+    ]);
+    if (!currentChat?.found || !currentPage?.ok) return false;
+    const currentBinding = createDouyinSendCapability({
+      chatFingerprint: currentChat.fingerprint,
+      target: { id: target.id, url: target.url },
+      pageEpoch: currentPage.pageEpoch,
+    });
+    return currentBinding.pageUrlHash === currentPage.pageUrlHash
+      && douyinSendCapabilitiesMatch(sendBinding, currentBinding);
+  };
   bridgeLock = await acquireBridgeRunLock(projectRoot, lockedChat.fingerprint);
 
   const startupView = await cdp.evaluate(buildBridgeStartupViewExpression());
@@ -189,6 +247,7 @@ try {
   let recoveredVerifiedSend = false;
   let recoveredForFreshThread = false;
   let startupQueuedPending = null;
+  let startupResumeAction = null;
   if (storedState) {
     const canAttemptFreshRecovery = forceFreshThread
       && storedState.checkpoint.phase !== "ready"
@@ -202,6 +261,7 @@ try {
     startupQueuedPending = recovery.queuedPending?.length > 0
       ? recovery.queuedPending
       : null;
+    startupResumeAction = recovery.resumeAction ?? null;
     if (recoveredVerifiedSend || recoveredForFreshThread || startupQueuedPending) {
       await saveBridgeState(projectRoot, storedState);
     }
@@ -223,10 +283,14 @@ try {
     pendingMessages: startupPendingMessages,
   });
   const runtime = session.runtime;
+  const taskGeneration = runtime.resumed
+    ? (storedState?.generation ?? 1)
+    : (storedState?.generation ?? 0) + 1;
   if (!runtime.resumed) uncommittedStartupThreadId = runtime.threadId;
   contextManager = new CodexContextCompactionManager({
     codex,
     threadId: runtime.threadId,
+    generation: taskGeneration,
     ...compactionPolicy,
     onDiagnostic: (diagnostic) => console.log(JSON.stringify(diagnostic)),
     onOperationStart: () => {
@@ -247,25 +311,128 @@ try {
   });
   let previous = normalizeBridgeSnapshot(session.baselineSnapshot);
   let queuedIncoming = startupQueuedPending;
-  let activeState = queuedIncoming
+  let resumedReply = null;
+  if (startupResumeAction
+      && ["turn-started", "reply-ready"].includes(startupResumeAction.stage)) {
+    const turnId = startupResumeAction.turnIds.at(-1);
+    const recoveredTurn = await codex.readTurn({ threadId: runtime.threadId, turnId });
+    if (!recoveredTurn.found || recoveredTurn.status !== "completed" || !recoveredTurn.text) {
+      throw new Error("The persisted Codex turn cannot be recovered without duplication.");
+    }
+    let recoveredReply;
+    let reactionDecision = "disabled";
+    let shouldLike = false;
+    if (startupResumeAction.replyKind === "text") {
+      recoveredReply = normalizeOutboundText(recoveredTurn.text);
+    } else {
+      const parsed = parseDouyinMediaReply(recoveredTurn.text, {
+        reactionEnabled: Boolean(startupResumeAction.reactionNonce),
+        nonce: startupResumeAction.reactionNonce,
+      });
+      recoveredReply = parsed.reply;
+      reactionDecision = parsed.reactionDecision;
+      shouldLike = parsed.shouldLike;
+    }
+    if (!recoveredReply) throw new Error("The persisted Codex reply is empty.");
+    const replyDigest = computeDouyinReplyDigest(recoveredReply);
+    if (startupResumeAction.replyDigest
+        && startupResumeAction.replyDigest !== replyDigest) {
+      throw new Error("The persisted Codex reply digest does not match the recovered turn.");
+    }
+    if (startupResumeAction.stage === "turn-started") {
+      startupResumeAction = transitionDouyinAction(startupResumeAction, "reply-ready", {
+        replyDigest,
+        reactionDecision,
+      });
+    }
+    resumedReply = {
+      action: startupResumeAction,
+      reply: recoveredReply,
+      replyKind: startupResumeAction.replyKind,
+      mediaShouldLike: shouldLike,
+    };
+  }
+  let activeState = resumedReply
     ? createBridgeState({
       chatKey: lockedChat.fingerprint,
       threadId: runtime.threadId,
       model: runtime.model,
       effort: runtime.effort,
+      generation: taskGeneration,
+      snapshot: previous,
+      phase: "reply-ready",
+      pending: queuedIncoming,
+      outboundFingerprint: computeTextMessageFingerprint(resumedReply.reply),
+      action: resumedReply.action,
+    })
+    : queuedIncoming
+    ? createBridgeState({
+      chatKey: lockedChat.fingerprint,
+      threadId: runtime.threadId,
+      model: runtime.model,
+      effort: runtime.effort,
+      generation: taskGeneration,
       snapshot: previous,
       phase: "queued",
       pending: queuedIncoming,
+      action: startupResumeAction,
     })
     : createBridgeState({
       chatKey: lockedChat.fingerprint,
       threadId: runtime.threadId,
       model: runtime.model,
       effort: runtime.effort,
+      generation: taskGeneration,
       snapshot: previous,
       outboundFingerprint: storedState?.checkpoint.outboundFingerprint ?? null,
+      action: startupResumeAction,
     });
   await saveBridgeState(projectRoot, activeState);
+  if (startupResumeAction
+      && ["send-verified", "reaction-attempted"].includes(startupResumeAction.stage)) {
+    if (startupResumeAction.stage === "send-verified"
+        && startupResumeAction.reactionDecision === "yes"
+        && startupResumeAction.reactionTarget) {
+      startupResumeAction = transitionDouyinAction(
+        startupResumeAction,
+        "reaction-attempted",
+      );
+      activeState = createBridgeState({
+        chatKey: lockedChat.fingerprint,
+        threadId: runtime.threadId,
+        model: runtime.model,
+        effort: runtime.effort,
+        generation: taskGeneration,
+        snapshot: previous,
+        phase: queuedIncoming?.length ? "queued" : "ready",
+        pending: queuedIncoming ?? [],
+        action: startupResumeAction,
+      });
+      await saveBridgeState(projectRoot, activeState);
+      try {
+        await likeIncomingDouyinMediaMessage({
+          cdp,
+          message: startupResumeAction.reactionTarget,
+          expectedChatFingerprint: lockedChat.fingerprint,
+          ordinalShift: startupResumeAction.reactionOrdinalShift,
+        });
+      } catch {
+        // The journal is already reaction-attempted, so restart will not repeat the click.
+      }
+    }
+    startupResumeAction = null;
+    activeState = createBridgeState({
+      chatKey: lockedChat.fingerprint,
+      threadId: runtime.threadId,
+      model: runtime.model,
+      effort: runtime.effort,
+      generation: taskGeneration,
+      snapshot: previous,
+      phase: queuedIncoming?.length ? "queued" : "ready",
+      pending: queuedIncoming ?? [],
+    });
+    await saveBridgeState(projectRoot, activeState);
+  }
   uncommittedStartupThreadId = null;
   if (session.replacedStoredThread && storedState?.threadId
       && storedState.threadId !== runtime.threadId) {
@@ -277,6 +444,7 @@ try {
     personaLoaded: true,
     chatLocked: true,
     sendEnabled,
+    ...(supervised ? { sendBinding } : {}),
     mediaReactionEnabled,
     model: runtime.model,
     effort: runtime.effort,
@@ -403,6 +571,7 @@ try {
         threadId: runtime.threadId,
         model: runtime.model,
         effort: runtime.effort,
+        generation: taskGeneration,
         snapshot: current,
         phase: "blocked",
         pending: incoming,
@@ -425,6 +594,7 @@ try {
         threadId: runtime.threadId,
         model: runtime.model,
         effort: runtime.effort,
+        generation: taskGeneration,
         snapshot: current,
       });
       await saveBridgeState(projectRoot, activeState);
@@ -447,6 +617,7 @@ try {
         threadId: runtime.threadId,
         model: runtime.model,
         effort: runtime.effort,
+        generation: taskGeneration,
         snapshot: current,
         phase: "blocked",
         pending: incoming,
@@ -464,27 +635,81 @@ try {
     }
     const incomingBatch = queuePlan.batches[0];
     const remainingAfterBatch = incoming.slice(incomingBatch.messages.length);
-
-    activeState = createBridgeState({
+    let currentAction = resumedReply?.action ?? createDouyinAction({
       chatKey: lockedChat.fingerprint,
-      threadId: runtime.threadId,
-      model: runtime.model,
-      effort: runtime.effort,
-      snapshot: current,
-      phase: "processing",
-      pending: incoming,
+      generation: taskGeneration,
+      pending: incomingBatch.messages,
+      replyKind: incomingBatch.mode === "text" ? "text" : null,
     });
-    await saveBridgeState(projectRoot, activeState);
-    setBridgePhase("processing");
+    if (!resumedReply) {
+      activeState = createBridgeState({
+        chatKey: lockedChat.fingerprint,
+        threadId: runtime.threadId,
+        model: runtime.model,
+        effort: runtime.effort,
+        generation: taskGeneration,
+        snapshot: current,
+        phase: "processing",
+        pending: incoming,
+        action: currentAction,
+      });
+      await saveBridgeState(projectRoot, activeState);
+      setBridgePhase("processing");
+    }
     const turnStartedAt = Date.now();
 
     let media = null;
     let contextRecoveryFailed = false;
     try {
-      let reply;
-      let replyKind;
-      let mediaShouldLike = false;
-      if (incomingBatch.mode === "text") {
+      let reply = resumedReply?.reply ?? null;
+      let replyKind = resumedReply?.replyKind ?? null;
+      let mediaShouldLike = resumedReply?.mediaShouldLike ?? false;
+      let reactionDecision = resumedReply?.action?.reactionDecision ?? null;
+      const recoveringReply = Boolean(resumedReply);
+      resumedReply = null;
+      const journaledCodex = {
+        runTurn: async (params) => {
+          const promptDigest = computeDouyinTurnPromptDigest(params);
+          if (currentAction.promptDigest && currentAction.promptDigest !== promptDigest) {
+            throw new Error("The persisted Codex prompt digest changed before turn start.");
+          }
+          currentAction = transitionDouyinAction(currentAction, "turn-starting", {
+            promptDigest,
+          });
+          activeState = createBridgeState({
+            chatKey: lockedChat.fingerprint,
+            threadId: runtime.threadId,
+            model: runtime.model,
+            effort: runtime.effort,
+            generation: taskGeneration,
+            snapshot: current,
+            phase: "processing",
+            pending: incoming,
+            action: currentAction,
+          });
+          await saveBridgeState(projectRoot, activeState);
+          return contextManager.runTurn({
+            ...params,
+            onTurnStarted: async ({ turnId }) => {
+              const turnIds = [...new Set([...currentAction.turnIds, turnId])].slice(-2);
+              currentAction = transitionDouyinAction(currentAction, "turn-started", { turnIds });
+              activeState = createBridgeState({
+                chatKey: lockedChat.fingerprint,
+                threadId: runtime.threadId,
+                model: runtime.model,
+                effort: runtime.effort,
+                generation: taskGeneration,
+                snapshot: current,
+                phase: "processing",
+                pending: incoming,
+                action: currentAction,
+              });
+              await saveBridgeState(projectRoot, activeState);
+            },
+          });
+        },
+      };
+      if (!recoveringReply && incomingBatch.mode === "text") {
         const inbound = await cdp.evaluate(buildReadIncomingTextBatchExpression(incomingBatch.textMessages));
         if (inbound?.chatFingerprint !== lockedChat.fingerprint) {
           throw new Error("The Douyin chat changed before text capture; refusing the wrong conversation.");
@@ -494,16 +719,18 @@ try {
           throw new Error("New incoming messages were detected but could not be read exactly.");
         }
         reply = await generateDouyinReply({
-          codex: contextManager,
+          codex: journaledCodex,
           threadId: runtime.threadId,
           inboundText: inbound.texts.length === 1
             ? inbound.texts[0]
             : inbound.texts.map((text, index) => `连续消息 ${index + 1}：${text}`).join("\n"),
           model: runtime.model,
           effort: runtime.effort,
+          taskGeneration,
         });
         replyKind = "text";
-      } else {
+        reactionDecision = "disabled";
+      } else if (!recoveringReply) {
         const mediaCheckMetadata = await cdp.evaluate(buildChatMessageMetadataExpression());
         if (mediaCheckMetadata.chatFingerprint !== lockedChat.fingerprint) {
           throw new Error("The Douyin chat changed before video capture; refusing the wrong conversation.");
@@ -579,25 +806,64 @@ try {
             || currentChatAfterCapture.fingerprint !== lockedChat.fingerprint) {
           throw new Error("The Douyin chat changed during media capture; refusing the wrong conversation.");
         }
+        const reactionNonce = mediaReactionEnabled ? randomBytes(12).toString("hex") : null;
         if (media.kind === "chat_image" || media.kind === "image_post" || media.kind === "shared_cover") {
+          currentAction = transitionDouyinAction(currentAction, "evidence-ready", {
+            replyKind: "image",
+            reactionNonce,
+            reactionTarget: incomingBatch.mediaMessage,
+          });
+          activeState = createBridgeState({
+            chatKey: lockedChat.fingerprint,
+            threadId: runtime.threadId,
+            model: runtime.model,
+            effort: runtime.effort,
+            generation: taskGeneration,
+            snapshot: current,
+            phase: "processing",
+            pending: incoming,
+            action: currentAction,
+          });
+          await saveBridgeState(projectRoot, activeState);
           const decision = await generateDouyinImageReply({
-            codex: contextManager,
+            codex: journaledCodex,
             threadId: runtime.threadId,
             imagePaths: media.imagePaths,
             mediaType: media.kind,
             totalImageCount: media.totalImageCount ?? media.imagePaths.length,
             requestedImageCount: media.requestedImageCount ?? media.imagePaths.length,
             partial: Boolean(media.partial),
+            evidence: media.evidence,
             inboundText,
             sharedComment,
             mediaReactionEnabled,
+            reactionNonce,
             model: runtime.model,
             effort: runtime.effort,
+            taskGeneration,
           });
           reply = decision.reply;
           mediaShouldLike = decision.shouldLike;
+          reactionDecision = decision.reactionDecision;
           replyKind = "image";
         } else {
+          currentAction = transitionDouyinAction(currentAction, "evidence-ready", {
+            replyKind: "video",
+            reactionNonce,
+            reactionTarget: incomingBatch.mediaMessage,
+          });
+          activeState = createBridgeState({
+            chatKey: lockedChat.fingerprint,
+            threadId: runtime.threadId,
+            model: runtime.model,
+            effort: runtime.effort,
+            generation: taskGeneration,
+            snapshot: current,
+            phase: "processing",
+            pending: incoming,
+            action: currentAction,
+          });
+          await saveBridgeState(projectRoot, activeState);
           const audioUnderstanding = media.audioUnderstanding || {
             processed: false,
             reason: media.audioReason || "audio-track-unavailable",
@@ -610,34 +876,47 @@ try {
             }));
           }
           const decision = await generateDouyinVideoReply({
-            codex: contextManager,
+            codex: journaledCodex,
             threadId: runtime.threadId,
             framePaths: media.framePaths,
             durationSeconds: media.duration,
             audioUnderstanding,
+            evidence: media.evidence,
             inboundText,
             sharedComment,
             mediaReactionEnabled,
+            reactionNonce,
             model: runtime.model,
             effort: runtime.effort,
+            taskGeneration,
           });
           reply = decision.reply;
           mediaShouldLike = decision.shouldLike;
+          reactionDecision = decision.reactionDecision;
           media.audioUnderstanding = audioUnderstanding;
           replyKind = "video";
         }
       }
 
       const outboundFingerprint = computeTextMessageFingerprint(reply);
+      if (currentAction.stage === "turn-started") {
+        currentAction = transitionDouyinAction(currentAction, "reply-ready", {
+          replyDigest: computeDouyinReplyDigest(reply),
+          replyKind,
+          reactionDecision: reactionDecision ?? "disabled",
+        });
+      }
       activeState = createBridgeState({
         chatKey: lockedChat.fingerprint,
         threadId: runtime.threadId,
         model: runtime.model,
         effort: runtime.effort,
+        generation: taskGeneration,
         snapshot: current,
         phase: "reply-ready",
         pending: incoming,
         outboundFingerprint,
+        action: currentAction,
       });
       await saveBridgeState(projectRoot, activeState);
       lastLatencyMs = Date.now() - turnStartedAt;
@@ -646,18 +925,6 @@ try {
         throw new Error("Bridge stop requested after reply generation; refusing to send.");
       }
 
-      activeState = createBridgeState({
-        chatKey: lockedChat.fingerprint,
-        threadId: runtime.threadId,
-        model: runtime.model,
-        effort: runtime.effort,
-        snapshot: current,
-        phase: "sending",
-        pending: incoming,
-        outboundFingerprint,
-      });
-      await saveBridgeState(projectRoot, activeState);
-      setBridgePhase("sending");
       const currentChatBeforeSend = await cdp.evaluate(buildChatIdentityMetadataExpression());
       if (!currentChatBeforeSend?.found || currentChatBeforeSend.fingerprint !== lockedChat.fingerprint) {
         throw new Error("The active Douyin chat changed while generating a reply; refusing to send.");
@@ -671,10 +938,24 @@ try {
           expectedChatFingerprint: lockedChat.fingerprint,
           shouldStop: () => stopRequested,
           canSend: async () => {
-            const currentChat = await cdp.evaluate(buildChatIdentityMetadataExpression());
-            return Boolean(
-              currentChat?.found && currentChat.fingerprint === lockedChat.fingerprint,
-            );
+            return verifyActiveSendCapability();
+          },
+          onSendAttempted: async () => {
+            currentAction = transitionDouyinAction(currentAction, "send-attempted");
+            activeState = createBridgeState({
+              chatKey: lockedChat.fingerprint,
+              threadId: runtime.threadId,
+              model: runtime.model,
+              effort: runtime.effort,
+              generation: taskGeneration,
+              snapshot: current,
+              phase: "sending",
+              pending: incoming,
+              outboundFingerprint,
+              action: currentAction,
+            });
+            await saveBridgeState(projectRoot, activeState);
+            setBridgePhase("sending");
           },
         });
       } catch (error) {
@@ -684,10 +965,12 @@ try {
           threadId: runtime.threadId,
           model: runtime.model,
           effort: runtime.effort,
+          generation: taskGeneration,
           snapshot: current,
           phase: "reply-ready",
           pending: incoming,
           outboundFingerprint,
+          action: currentAction,
         });
         await saveBridgeState(projectRoot, activeState);
         if (error.reason === "chat-changed" || error.reason === "editor-authority-lost") {
@@ -756,12 +1039,14 @@ try {
           threadId: runtime.threadId,
           model: runtime.model,
           effort: runtime.effort,
+          generation: taskGeneration,
           snapshot: afterSendSnapshot,
           phase: "blocked",
           pending: reboundRemaining,
           blockedReason: unsupportedDuringSend.length > 0
             ? "unsupported-incoming-batch"
             : "concurrent-outgoing-ambiguous",
+          action: currentAction,
         });
         await saveBridgeState(projectRoot, activeState);
         console.log(JSON.stringify({
@@ -771,17 +1056,37 @@ try {
         process.exitCode = 6;
         break;
       }
+      currentAction = transitionDouyinAction(currentAction, "send-verified", {
+        reactionOrdinalShift: appendedDuringSend.length,
+      });
       activeState = createBridgeState({
         chatKey: lockedChat.fingerprint,
         threadId: runtime.threadId,
         model: runtime.model,
         effort: runtime.effort,
-        snapshot: afterSendSnapshot,
-        phase: reboundRemaining.length > 0 ? "queued" : "ready",
-        pending: reboundRemaining,
+        generation: taskGeneration,
+        snapshot: current,
+        phase: "sending",
+        pending: incoming,
+        outboundFingerprint,
+        action: currentAction,
       });
       await saveBridgeState(projectRoot, activeState);
       if (mediaReactionEnabled && mediaShouldLike && incomingBatch.mediaMessage) {
+        currentAction = transitionDouyinAction(currentAction, "reaction-attempted");
+        activeState = createBridgeState({
+          chatKey: lockedChat.fingerprint,
+          threadId: runtime.threadId,
+          model: runtime.model,
+          effort: runtime.effort,
+          generation: taskGeneration,
+          snapshot: current,
+          phase: "sending",
+          pending: incoming,
+          outboundFingerprint,
+          action: currentAction,
+        });
+        await saveBridgeState(projectRoot, activeState);
         try {
           const reaction = await likeIncomingDouyinMediaMessage({
             cdp,
@@ -802,6 +1107,17 @@ try {
           }));
         }
       }
+      activeState = createBridgeState({
+        chatKey: lockedChat.fingerprint,
+        threadId: runtime.threadId,
+        model: runtime.model,
+        effort: runtime.effort,
+        generation: taskGeneration,
+        snapshot: afterSendSnapshot,
+        phase: reboundRemaining.length > 0 ? "queued" : "ready",
+        pending: reboundRemaining,
+      });
+      await saveBridgeState(projectRoot, activeState);
       queuedIncoming = reboundRemaining.length > 0 ? reboundRemaining : null;
       previous = afterSendSnapshot;
       setBridgePhase(queuedIncoming ? "queued" : "listening");
@@ -813,10 +1129,12 @@ try {
         threadId: runtime.threadId,
         model: runtime.model,
         effort: runtime.effort,
+        generation: taskGeneration,
         snapshot: current,
         phase: "blocked",
         pending: incoming,
         blockedReason: "context-recovery-failed",
+        action: currentAction,
       });
       await saveBridgeState(projectRoot, activeState);
       setBridgePhase("blocked");

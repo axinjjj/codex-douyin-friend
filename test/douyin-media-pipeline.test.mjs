@@ -7,6 +7,10 @@ import {
   matchDouyinMediaAdapter,
 } from "../src/douyin-media-pipeline.mjs";
 import { DouyinVideoSourcesExhaustedError } from "../src/douyin-video-runtime.mjs";
+import {
+  DouyinMediaEvidenceError,
+  DOUYIN_MEDIA_ERROR_CODES,
+} from "../src/douyin-media-evidence.mjs";
 
 const baseContext = Object.freeze({
   cdp: { async evaluate() { throw new Error("Unexpected real CDP read."); } },
@@ -68,6 +72,15 @@ test("keeps direct chat image acquisition isolated from shared-work dependencies
     kind: "chat_image",
     jobDirectory: "C:/runtime/image-job",
     imagePaths: ["C:/runtime/image.png"],
+    evidence: {
+      version: 1,
+      mode: "direct-image",
+      assetCount: 1,
+      totalAssetCount: 1,
+      audioStatus: "not-applicable",
+      limitations: [],
+      orderedAssets: [{ type: "image", ordinal: 1 }],
+    },
   });
 });
 
@@ -207,6 +220,40 @@ test("degrades an undecodable full video to its explicit cover instead of passin
   assert.equal(result.kind, "shared_cover");
   assert.equal(preparedCover.originalMediaType, "video");
   assert.deepEqual(preparedCover.sources, ["https://p3.douyinpic.com/video-cover"]);
+});
+
+test("never disguises budget, identity, resource, canvas, abort, or internal failures as a cover", async () => {
+  for (const code of [
+    DOUYIN_MEDIA_ERROR_CODES.BUDGET_EXCEEDED,
+    DOUYIN_MEDIA_ERROR_CODES.IDENTITY_MISMATCH,
+    DOUYIN_MEDIA_ERROR_CODES.RESOURCE_LIMIT,
+    DOUYIN_MEDIA_ERROR_CODES.CANVAS_SECURITY,
+    DOUYIN_MEDIA_ERROR_CODES.ABORTED,
+    DOUYIN_MEDIA_ERROR_CODES.INTERNAL,
+  ]) {
+    let coverPrepared = false;
+    await assert.rejects(acquireDouyinMedia({
+      ...baseContext,
+      mediaType: "shared_aweme",
+      dependencies: {
+        readSharedWorkManifest: async () => ({
+          ok: true,
+          mediaType: "video",
+          source: "https://v3-dy.zjcdn.com/video.mp4",
+          sources: ["https://v3-dy.zjcdn.com/video.mp4"],
+          coverSources: ["https://p3.douyinpic.com/video-cover"],
+        }),
+        prepareVideo: async () => {
+          throw new DouyinMediaEvidenceError(code, "fixture-failure");
+        },
+        prepareImagePost: async () => {
+          coverPrepared = true;
+          return { kind: "shared_cover", imagePaths: ["C:/runtime/video-cover.png"] };
+        },
+      },
+    }), (error) => error instanceof DouyinMediaEvidenceError && error.code === code);
+    assert.equal(coverPrepared, false);
+  }
 });
 
 test("fails closed on an unregistered media type without touching acquisition dependencies", async () => {

@@ -239,12 +239,28 @@ export class CodexAppServerClient extends EventEmitter {
     return this.request("thread/inject_items", { threadId, items });
   }
 
+  async readTurn({ threadId, turnId }) {
+    const result = await this.request("thread/read", { threadId, includeTurns: true });
+    const turn = result?.thread?.turns?.find((candidate) => candidate?.id === turnId);
+    if (!turn) return { found: false, status: null, text: "" };
+    const text = (turn.items ?? [])
+      .map(extractAgentText)
+      .filter(Boolean)
+      .join("");
+    return {
+      found: true,
+      status: String(turn.status || ""),
+      text,
+    };
+  }
+
   async runTurn({
     threadId,
     text,
     input,
     model,
     effort,
+    onTurnStarted = null,
     timeoutMs = DEFAULT_TURN_TIMEOUT_MS,
   }) {
     const chunks = [];
@@ -318,10 +334,14 @@ export class CodexAppServerClient extends EventEmitter {
           finish(reject, new Error("turn/start did not return a turn id."));
           return;
         }
-        for (const message of bufferedNotifications.splice(0)) {
-          if (settled) break;
-          consumeNotification(message);
-        }
+        Promise.resolve(typeof onTurnStarted === "function"
+          ? onTurnStarted({ threadId, turnId: expectedTurnId })
+          : null).then(() => {
+          for (const message of bufferedNotifications.splice(0)) {
+            if (settled) break;
+            consumeNotification(message);
+          }
+        }, (error) => finish(reject, error));
       }, (error) => finish(reject, error));
     });
   }
