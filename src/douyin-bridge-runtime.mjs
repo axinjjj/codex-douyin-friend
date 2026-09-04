@@ -24,6 +24,7 @@ const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, mil
 const MEDIA_REACTION_NONCE_PATTERN = /^[0-9a-f]{24}$/u;
 const TRAILING_MEDIA_REACTION_PATTERN = /(?:\r?\n)?<douyin-media-like nonce="([0-9a-f]{24})">(yes|no)<\/douyin-media-like>\s*$/u;
 const TRAILING_MEDIA_REACTION_CONTROL_PATTERN = /(?:\r?\n)?<douyin-media-like\b[\s\S]*$/u;
+export const DOUYIN_BRIDGE_THREAD_NAME = "抖音桥 · 当前聊天";
 
 class IncompatiblePersistedThreadError extends Error {}
 
@@ -45,6 +46,17 @@ function canSafelyReplacePersistedThread(error) {
 async function archiveUncommittedThread(codex, threadId) {
   if (!threadId || typeof codex?.request !== "function") return;
   await codex.request("thread/archive", { threadId }).catch(() => {});
+}
+
+async function setPersistentBridgeThreadName(codex, threadId) {
+  if (typeof codex?.setThreadName === "function") {
+    await codex.setThreadName({ threadId, name: DOUYIN_BRIDGE_THREAD_NAME });
+    return;
+  }
+  await codex.request("thread/name/set", {
+    threadId,
+    name: DOUYIN_BRIDGE_THREAD_NAME,
+  });
 }
 
 export async function startVerifiedPersonaThread({
@@ -90,6 +102,7 @@ export async function startVerifiedPersonaThread({
           "The private global AGENTS.md was not loaded on resume.",
         );
       }
+      await setPersistentBridgeThreadName(codex, threadId);
       return {
         threadId,
         model,
@@ -113,6 +126,9 @@ export async function startVerifiedPersonaThread({
     }
     if (!instructionSourcesContain(threadResult.instructionSources, expectedPersonaPath)) {
       throw new Error("The private global AGENTS.md was not loaded; refusing to reply.");
+    }
+    if (!ephemeral) {
+      await setPersistentBridgeThreadName(codex, startedThreadId);
     }
   } catch (error) {
     await archiveUncommittedThread(codex, startedThreadId);

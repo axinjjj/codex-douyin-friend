@@ -235,6 +235,10 @@ export class CodexAppServerClient extends EventEmitter {
     return this.request("thread/resume", params);
   }
 
+  async setThreadName({ threadId, name }) {
+    return this.request("thread/name/set", { threadId, name });
+  }
+
   async injectItems({ threadId, items }) {
     return this.request("thread/inject_items", { threadId, items });
   }

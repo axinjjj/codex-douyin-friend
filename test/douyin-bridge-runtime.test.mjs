@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { CodexAppServerRequestError } from "../src/codex-app-server-client.mjs";
 import {
   DouyinSendAbortedError,
+  DOUYIN_BRIDGE_THREAD_NAME,
   generateDouyinImageReply,
   generateDouyinReply,
   generateDouyinVideoReply,
@@ -181,6 +182,7 @@ const snapshot = {
 
 test("pins an available model and reasoning effort", async () => {
   const calls = [];
+  const names = [];
   const codex = {
     async start() {},
     async request(method) {
@@ -200,6 +202,9 @@ test("pins an available model and reasoning effort", async () => {
         instructionSources: [{ path: "C:/persona/AGENTS.md" }],
       };
     },
+    async setThreadName(params) {
+      names.push(params);
+    },
   };
 
   const runtime = await startVerifiedPersonaThread({
@@ -218,6 +223,47 @@ test("pins an available model and reasoning effort", async () => {
   });
   assert.equal(calls[0].model, "gpt-5.6-sol");
   assert.equal(calls[0].ephemeral, false);
+  assert.deepEqual(names, [{
+    threadId: "thread-1",
+    name: DOUYIN_BRIDGE_THREAD_NAME,
+  }]);
+});
+
+test("renames a resumed persistent bridge task before accepting new turns", async () => {
+  const names = [];
+  const runtime = await startVerifiedPersonaThread({
+    codex: {
+      async start() {},
+      async request(method) {
+        assert.equal(method, "model/list");
+        return {
+          data: [{
+            id: "gpt-5.6-sol",
+            supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+          }],
+        };
+      },
+      async resumeThread() {
+        return {
+          thread: { id: "thread-1", ephemeral: false },
+          model: "gpt-5.6-sol",
+          instructionSources: [{ path: "C:/persona/AGENTS.md" }],
+        };
+      },
+      async setThreadName(params) {
+        names.push(params);
+      },
+    },
+    cwd: "C:/project",
+    expectedPersonaPath: "C:/persona/AGENTS.md",
+    threadId: "thread-1",
+    ephemeral: false,
+  });
+  assert.equal(runtime.resumed, true);
+  assert.deepEqual(names, [{
+    threadId: "thread-1",
+    name: DOUYIN_BRIDGE_THREAD_NAME,
+  }]);
 });
 
 test("archives a newly created task when persona verification fails", async () => {

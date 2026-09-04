@@ -84,6 +84,7 @@ test("starts persistent threads and resumes them with the same safety overrides"
     cwd: "C:/project",
     model: "gpt-5.6-sol",
   });
+  await client.setThreadName({ threadId: "thread-1", name: "bridge task" });
 
   assert.deepEqual(calls[0], {
     method: "thread/start",
@@ -104,6 +105,13 @@ test("starts persistent threads and resumes them with the same safety overrides"
       approvalPolicy: "never",
       sandbox: "read-only",
       model: "gpt-5.6-sol",
+    },
+  });
+  assert.deepEqual(calls[2], {
+    method: "thread/name/set",
+    params: {
+      threadId: "thread-1",
+      name: "bridge task",
     },
   });
 });
