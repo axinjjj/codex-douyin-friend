@@ -9,6 +9,7 @@ import {
   assertCapturedVideoFrame,
   assertUsableVideoFrameVisuals,
   assertVideoAnalysisJobPath,
+  buildLocalVideoTargetOptions,
   buildCaptureFrameExpression,
   buildExtractAudioExpression,
   buildScanFrameSignaturesExpression,
@@ -17,6 +18,7 @@ import {
   DouyinVideoSourcesExhaustedError,
   downloadCompatibleDouyinVideo,
   downloadDouyinVideo,
+  enableLocalVideoBackgroundDecoding,
   isTrustedDouyinMediaUrl,
   prepareLatestDouyinVideoMedia,
   removeVideoAnalysisJob,
@@ -26,6 +28,29 @@ import {
   DouyinMediaEvidenceError,
   DOUYIN_MEDIA_ERROR_CODES,
 } from "../src/douyin-media-evidence.mjs";
+
+test("creates local video extractor targets in the background", () => {
+  assert.deepEqual(buildLocalVideoTargetOptions("http://127.0.0.1:63550/player.html"), {
+    url: "http://127.0.0.1:63550/player.html",
+    background: true,
+    hidden: true,
+  });
+});
+
+test("emulates focus only inside a background video extractor target", async () => {
+  const requests = [];
+  await enableLocalVideoBackgroundDecoding({
+    async request(...args) {
+      requests.push(args);
+      return {};
+    },
+  }, 5_000);
+  assert.deepEqual(requests, [[
+    "Emulation.setFocusEmulationEnabled",
+    { enabled: true },
+    5_000,
+  ]]);
+});
 
 function canvasPngFixture(width, height) {
   const bytes = Buffer.alloc(33);

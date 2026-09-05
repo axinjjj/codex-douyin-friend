@@ -624,6 +624,22 @@ async function waitForTarget(port, targetId, timeoutMs = 10_000) {
   throw new Error("Timed out waiting for the temporary video target.");
 }
 
+export function buildLocalVideoTargetOptions(url) {
+  return {
+    url,
+    background: true,
+    hidden: true,
+  };
+}
+
+export async function enableLocalVideoBackgroundDecoding(pageCdp, timeoutMs) {
+  await pageCdp.request(
+    "Emulation.setFocusEmulationEnabled",
+    { enabled: true },
+    timeoutMs,
+  );
+}
+
 async function closeTemporaryTarget(browserCdp, port, targetId, timeoutMs = 5_000) {
   const listTargets = async () => {
     const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
@@ -1375,15 +1391,17 @@ export async function extractVideoMedia({
   let pageCdp;
   try {
     await browserCdp.connect(remainingTimeout(5_000));
-    const created = await browserCdp.request("Target.createTarget", {
-      url: mediaServer.url,
-      background: false,
-    }, remainingTimeout(10_000));
+    const created = await browserCdp.request(
+      "Target.createTarget",
+      buildLocalVideoTargetOptions(mediaServer.url),
+      remainingTimeout(10_000),
+    );
     targetId = created?.targetId;
     if (!targetId) throw new Error("Browser did not create a temporary video target.");
     const target = await waitForTarget(port, targetId, remainingTimeout(10_000));
     pageCdp = new CdpClient(target.webSocketDebuggerUrl);
     await pageCdp.connect(remainingTimeout(5_000));
+    await enableLocalVideoBackgroundDecoding(pageCdp, remainingTimeout(5_000));
     const state = await waitForLocalVideo(pageCdp, remainingTimeout(20_000));
     let audio = { ok: false, reason: "audio-extraction-unavailable" };
     if (extractAudio) {
@@ -1399,15 +1417,17 @@ export async function extractVideoMedia({
         pageCdp = undefined;
         await closeTemporaryTarget(browserCdp, port, targetId);
         targetId = undefined;
-        const recreated = await browserCdp.request("Target.createTarget", {
-          url: mediaServer.url,
-          background: false,
-        }, remainingTimeout(10_000));
+        const recreated = await browserCdp.request(
+          "Target.createTarget",
+          buildLocalVideoTargetOptions(mediaServer.url),
+          remainingTimeout(10_000),
+        );
         targetId = recreated?.targetId;
         if (!targetId) throw new Error("Browser did not recreate the temporary video target.");
         const recreatedTarget = await waitForTarget(port, targetId, remainingTimeout(10_000));
         pageCdp = new CdpClient(recreatedTarget.webSocketDebuggerUrl);
         await pageCdp.connect(remainingTimeout(5_000));
+        await enableLocalVideoBackgroundDecoding(pageCdp, remainingTimeout(5_000));
         await waitForLocalVideo(pageCdp, remainingTimeout(20_000));
       }
       if (audio?.ok) await stat(audioPath);
