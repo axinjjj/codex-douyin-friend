@@ -3,7 +3,26 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-const DEFAULT_TURN_TIMEOUT_MS = 120_000;
+const DEFAULT_TURN_TIMEOUT_MS = 30 * 60_000;
+const MIN_TURN_TIMEOUT_MS = 5 * 60_000;
+const MAX_TURN_TIMEOUT_MS = 60 * 60_000;
+
+export function resolveCodexTurnTimeoutMs(environment = process.env) {
+  const raw = environment.CODEX_DOUYIN_TURN_TIMEOUT_MS;
+  if (raw === undefined || raw === "") return DEFAULT_TURN_TIMEOUT_MS;
+  if (typeof raw !== "string" || !/^[1-9][0-9]*$/u.test(raw)) {
+    throw new Error("CODEX_DOUYIN_TURN_TIMEOUT_MS must be an integer number of milliseconds.");
+  }
+  const timeoutMs = Number(raw);
+  if (!Number.isSafeInteger(timeoutMs)
+      || timeoutMs < MIN_TURN_TIMEOUT_MS
+      || timeoutMs > MAX_TURN_TIMEOUT_MS) {
+    throw new Error(
+      `CODEX_DOUYIN_TURN_TIMEOUT_MS must be between ${MIN_TURN_TIMEOUT_MS} and ${MAX_TURN_TIMEOUT_MS}.`,
+    );
+  }
+  return timeoutMs;
+}
 
 export class CodexAppServerRequestError extends Error {
   constructor({ method, code, message, data }) {
@@ -265,7 +284,7 @@ export class CodexAppServerClient extends EventEmitter {
     model,
     effort,
     onTurnStarted = null,
-    timeoutMs = DEFAULT_TURN_TIMEOUT_MS,
+    timeoutMs = resolveCodexTurnTimeoutMs(),
   }) {
     const chunks = [];
     const bufferedNotifications = [];

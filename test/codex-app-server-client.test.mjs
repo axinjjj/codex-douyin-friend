@@ -7,8 +7,22 @@ import {
   CodexAppServerClient,
   extractAgentText,
   instructionSourcesContain,
+  resolveCodexTurnTimeoutMs,
 } from "../src/codex-app-server-client.mjs";
 import { summarizeTargets } from "../src/cdp-client.mjs";
+
+test("uses a long bounded timeout for Douyin Codex turns", () => {
+  assert.equal(resolveCodexTurnTimeoutMs({}), 30 * 60_000);
+  assert.equal(resolveCodexTurnTimeoutMs({ CODEX_DOUYIN_TURN_TIMEOUT_MS: "600000" }), 600_000);
+  assert.throws(
+    () => resolveCodexTurnTimeoutMs({ CODEX_DOUYIN_TURN_TIMEOUT_MS: "120000" }),
+    /between 300000 and 3600000/u,
+  );
+  assert.throws(
+    () => resolveCodexTurnTimeoutMs({ CODEX_DOUYIN_TURN_TIMEOUT_MS: "ten-minutes" }),
+    /integer number of milliseconds/u,
+  );
+});
 
 class FakeCodexProcess extends EventEmitter {
   constructor({ initializeError = null, respondToInitialize = true } = {}) {

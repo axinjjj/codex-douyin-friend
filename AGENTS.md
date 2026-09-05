@@ -30,6 +30,7 @@ Build a locally controlled bridge between one dedicated Douyin account, one trus
 
 - Codex App Server startup and `AGENTS.md` loading are verified.
 - The App Server client treats its child process and stdin as a restartable transport: spawn errors, initialization failures, stdin write errors, and exits reject pending requests, tear down the stale child, and permit a fresh start. A turn consumes lifecycle notifications only for the exact `turn.id` returned by `turn/start`.
+- Codex turns use a separate 30-minute default completion deadline, configurable from five to sixty minutes with `CODEX_DOUYIN_TURN_TIMEOUT_MS`; the former 120-second client deadline is not used for live text or media replies. Request, context-compaction, and media acquisition budgets remain independent.
 - Douyin 8.3.0 Electron rejects the safe bootstrap path; Windows UI Automation is also insufficient.
 - The active route is a dedicated Edge profile on localhost CDP port 9229.
 - The CDP client clears failed or remotely closed sockets, rejects every pending request on transport loss, and can reconnect using the same client instance without retaining a ghost connection.

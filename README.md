@@ -294,10 +294,17 @@ Chat 页的 Slate 输入框选择器参考并在当前页面实测了 MIT 许可
 ```powershell
 $env:DOUYIN_SEND_ENABLED = "true"
 $env:DOUYIN_BRIDGE_TIMEOUT_MS = "3600000"
+$env:CODEX_DOUYIN_TURN_TIMEOUT_MS = "1800000"
 $env:CODEX_DOUYIN_MODEL = "gpt-5.6-sol"
 $env:CODEX_DOUYIN_EFFORT = "xhigh"
 npm run bridge:douyin-chat
 ```
+
+Codex 单个 turn 默认等待 30 分钟，而不是旧版的 120 秒；可通过
+`CODEX_DOUYIN_TURN_TIMEOUT_MS` 在 5 到 60 分钟之间覆盖。这个上限只从
+`turn/start` 成功后开始计算，视频下载、解码、抽帧和本地转写仍使用各自的媒体预算。
+桥会持续读取 App Server 事件，直到收到该 turn 的 `turn/completed`，避免较慢的
+多模态输入或 `xhigh` 推理被本地客户端提前中断。
 
 上下文压缩默认参数可按需覆盖：
 
