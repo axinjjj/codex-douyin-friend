@@ -133,6 +133,20 @@ test("builds sequential in-memory scene scanning and bounded final capture expre
     videoSelector: ".commonModalFullScreenModalFullScreen video",
   });
   assert.match(modalCapture, /commonModalFullScreenModalFullScreen video/u);
+
+  const actionMarker = "d".repeat(64);
+  const ownedScan = buildScanFrameSignaturesExpression([0, 1], { playerActionMarker: actionMarker });
+  const ownedCapture = buildCaptureFrameExpression(1, 768, 2_500, { playerActionMarker: actionMarker });
+  for (const expression of [ownedScan, ownedCapture]) {
+    assert.match(expression, /__codexDouyinPlayerActionV1/u);
+    assert.match(expression, /actionBinding\.video/u);
+    assert.match(expression, /player-action-video-mismatch/u);
+    assert.doesNotMatch(expression, /document\.querySelector\("video"\)/u);
+  }
+  assert.throws(
+    () => buildCaptureFrameExpression(1, 768, 2_500, { playerActionMarker: "invalid" }),
+    /bounded player action marker/u,
+  );
 });
 
 test("distinguishes decoded black scenes from dimensionless video artifacts", () => {

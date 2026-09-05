@@ -195,6 +195,7 @@ test("opens one exact shared work and distinguishes bounded HTTPS and MSE player
   assert.match(open, /__reactProps\$/u);
   assert.match(open, /clickTarget\.click\(\)/u);
   assert.match(open, /preexistingVideos/u);
+  assert.match(open, /preexistingModals/u);
   assert.match(open, /unowned-shared-work-viewer-already-open/u);
   assert.match(read, /commonModalFullScreenModalFullScreen/u);
   assert.match(read, /currentSrc/u);
@@ -206,14 +207,21 @@ test("opens one exact shared work and distinguishes bounded HTTPS and MSE player
   assert.match(read, /video\.volume = 0/u);
   assert.match(read, /player-action-binding-mismatch/u);
   assert.match(read, /preexistingVideos\.has/u);
+  assert.match(read, /binding\.modal = modal/u);
+  assert.match(read, /binding\.video = video/u);
+  assert.match(read, /owned-open-video-disappeared/u);
+  assert.doesNotMatch(read, /rawSources = \[\.\.\.new Set\(videos/u);
   assert.doesNotThrow(() => new Function(`return ${read}`));
   const state = buildReadOpenSharedWorkStateExpression(actionMarker);
-  assert.match(state, /commonModalFullScreenModalFullScreen/u);
+  assert.match(state, /document\.contains\(binding\.modal\)/u);
+  assert.match(state, /shared-work-viewer-ownership-lost/u);
   assert.doesNotMatch(state, /currentSrc|getAttribute\('src'\)|textContent|innerText/u);
   assert.doesNotThrow(() => new Function(`return ${state}`));
   assert.match(close, /commonModalFullScreenclose/u);
   assert.match(close, /close\.click\(\)/u);
   assert.match(close, /player-action-binding-mismatch/u);
+  assert.match(close, /binding\.preexistingModals\.has/u);
+  assert.match(close, /shared-work-viewer-ownership-lost/u);
   for (const expression of [open, read, state, close]) {
     assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
   }

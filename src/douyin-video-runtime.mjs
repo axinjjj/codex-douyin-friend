@@ -1001,6 +1001,7 @@ export function buildScanFrameSignaturesExpression(times, {
   seekTimeoutMs = 2_500,
   maxWallTimeMs = DEFAULT_MAX_SCAN_WALL_TIME_MS,
   videoSelector = "video",
+  playerActionMarker = null,
 } = {}) {
   const sortedTimes = (Array.isArray(times) ? times : [])
     .filter((time) => Number.isFinite(time))
@@ -1022,8 +1023,21 @@ export function buildScanFrameSignaturesExpression(times, {
   const safeVideoSelector = typeof videoSelector === "string" && videoSelector.length <= 200
     ? videoSelector
     : "video";
+  if (playerActionMarker !== null && !/^[0-9a-f]{64}$/u.test(playerActionMarker)) {
+    throw new Error("A bounded player action marker is required for owned frame scanning.");
+  }
+  const videoLookup = playerActionMarker === null
+    ? `const video = document.querySelector(${JSON.stringify(safeVideoSelector)});`
+    : `const actionBinding = window.__codexDouyinPlayerActionV1;
+    if (!actionBinding || actionBinding.marker !== ${JSON.stringify(playerActionMarker)}
+        || !actionBinding.modal || !document.contains(actionBinding.modal)
+        || !actionBinding.video || !document.contains(actionBinding.video)
+        || !actionBinding.modal.contains(actionBinding.video)) {
+      return { ok: false, reason: 'player-action-video-mismatch', samples: [] };
+    }
+    const video = actionBinding.video;`;
   return `(async () => {
-    const video = document.querySelector(${JSON.stringify(safeVideoSelector)});
+    ${videoLookup}
     if (!video || !Number.isFinite(video.duration) || video.duration <= 0
         || !Number.isFinite(video.videoWidth) || video.videoWidth < 2
         || !Number.isFinite(video.videoHeight) || video.videoHeight < 2) {
@@ -1172,15 +1186,28 @@ export function buildCaptureFrameExpression(
   timeSeconds,
   maxDimension,
   seekTimeoutMs = 2_500,
-  { videoSelector = "video" } = {},
+  { videoSelector = "video", playerActionMarker = null } = {},
 ) {
   const safeMaxDimension = boundedLimit(maxDimension, 768, 768, 128);
   const safeSeekTimeoutMs = Math.max(250, Math.min(5_000, Math.trunc(seekTimeoutMs) || 2_500));
   const safeVideoSelector = typeof videoSelector === "string" && videoSelector.length <= 200
     ? videoSelector
     : "video";
+  if (playerActionMarker !== null && !/^[0-9a-f]{64}$/u.test(playerActionMarker)) {
+    throw new Error("A bounded player action marker is required for owned frame capture.");
+  }
+  const videoLookup = playerActionMarker === null
+    ? `const video = document.querySelector(${JSON.stringify(safeVideoSelector)});`
+    : `const actionBinding = window.__codexDouyinPlayerActionV1;
+    if (!actionBinding || actionBinding.marker !== ${JSON.stringify(playerActionMarker)}
+        || !actionBinding.modal || !document.contains(actionBinding.modal)
+        || !actionBinding.video || !document.contains(actionBinding.video)
+        || !actionBinding.modal.contains(actionBinding.video)) {
+      return { ok: false, reason: 'player-action-video-mismatch' };
+    }
+    const video = actionBinding.video;`;
   return `(async () => {
-    const video = document.querySelector(${JSON.stringify(safeVideoSelector)});
+    ${videoLookup}
     if (!video || !Number.isFinite(video.duration) || video.duration <= 0
         || !Number.isFinite(video.videoWidth) || video.videoWidth < 2
         || !Number.isFinite(video.videoHeight) || video.videoHeight < 2) {

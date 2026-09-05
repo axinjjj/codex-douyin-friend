@@ -883,6 +883,11 @@ export function buildOpenIncomingSharedWorkExpression(
       marker: ${JSON.stringify(actionMarker)},
       messageFingerprint: ${JSON.stringify(expected.fingerprint)},
       preexistingVideos: new WeakSet(Array.from(document.querySelectorAll('video'))),
+      preexistingModals: new WeakSet(
+        Array.from(document.querySelectorAll('.commonModalFullScreenModalFullScreen'))
+      ),
+      modal: null,
+      video: null,
     };
     clickTarget.scrollIntoView({ block: 'center', inline: 'center' });
     try {
@@ -908,14 +913,32 @@ export function buildReadOpenSharedWorkVideoExpression(actionMarker) {
     if (!binding || binding.marker !== ${JSON.stringify(actionMarker)}) {
       return { ok: false, reason: 'player-action-binding-mismatch' };
     }
-    const modal = document.querySelector('.commonModalFullScreenModalFullScreen');
-    if (!modal) return { ok: false, reason: 'shared-work-viewer-not-open' };
     const visible = (element) => {
       const rect = element.getBoundingClientRect();
       const style = getComputedStyle(element);
       return rect.width >= 64 && rect.height >= 64 && style.display !== 'none' &&
         style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
     };
+    let modal = binding.modal;
+    if (modal) {
+      if (!document.contains(modal) || !visible(modal)) {
+        return { ok: false, reason: 'owned-shared-work-viewer-disappeared' };
+      }
+    } else {
+      const newModals = Array.from(
+        document.querySelectorAll('.commonModalFullScreenModalFullScreen')
+      ).filter((candidate) => !binding.preexistingModals.has(candidate) && visible(candidate));
+      if (newModals.length !== 1) {
+        return {
+          ok: false,
+          reason: newModals.length === 0
+            ? 'shared-work-viewer-not-open'
+            : 'shared-work-viewer-ambiguous',
+        };
+      }
+      modal = newModals[0];
+      binding.modal = modal;
+    }
     const videos = Array.from(modal.querySelectorAll('video'))
       .filter((video) => !binding.preexistingVideos.has(video) && visible(video))
       .sort((left, right) => {
@@ -923,13 +946,24 @@ export function buildReadOpenSharedWorkVideoExpression(actionMarker) {
         const rightRect = right.getBoundingClientRect();
         return rightRect.width * rightRect.height - leftRect.width * leftRect.height;
       });
-    const video = videos[0];
+    let video = binding.video;
+    if (video) {
+      if (!document.contains(video) || !modal.contains(video) || !visible(video)) {
+        return { ok: false, reason: 'owned-open-video-disappeared' };
+      }
+    } else {
+      video = videos[0];
+      if (video) binding.video = video;
+    }
     if (!video) return { ok: false, reason: 'open-video-not-ready' };
     video.muted = true;
     video.volume = 0;
-    const rawSources = [...new Set(videos
-      .map((candidate) => candidate.currentSrc || candidate.getAttribute('src') || '')
-      .filter(Boolean))];
+    const rawSources = [...new Set([
+      video.currentSrc,
+      video.getAttribute('src') || '',
+      ...Array.from(video.querySelectorAll('source'))
+        .map((source) => source.getAttribute('src') || ''),
+    ].filter(Boolean))];
     const sources = rawSources.filter((source) => source.startsWith('https://')).slice(0, 4);
     const duration = Number.isFinite(video.duration) && video.duration > 0
       ? video.duration
@@ -979,7 +1013,16 @@ export function buildReadOpenSharedWorkStateExpression(actionMarker) {
     if (window[key]?.marker !== ${JSON.stringify(actionMarker)}) {
       return { ok: false, reason: 'player-action-binding-mismatch' };
     }
-    const open = Boolean(document.querySelector('.commonModalFullScreenModalFullScreen'));
+    const binding = window[key];
+    const unexpectedModals = Array.from(
+      document.querySelectorAll('.commonModalFullScreenModalFullScreen')
+    ).filter((candidate) => (
+      candidate !== binding.modal && !binding.preexistingModals.has(candidate)
+    ));
+    if (unexpectedModals.length > 0) {
+      return { ok: false, reason: 'shared-work-viewer-ownership-lost' };
+    }
+    const open = Boolean(binding.modal && document.contains(binding.modal));
     if (!open) delete window[key];
     return { ok: true, open };
   })()`;
@@ -995,10 +1038,27 @@ export function buildCloseOpenSharedWorkExpression(actionMarker) {
     if (!binding || binding.marker !== ${JSON.stringify(actionMarker)}) {
       return { ok: false, reason: 'player-action-binding-mismatch' };
     }
-    const modal = document.querySelector('.commonModalFullScreenModalFullScreen');
+    const newModals = Array.from(
+      document.querySelectorAll('.commonModalFullScreenModalFullScreen')
+    ).filter((candidate) => !binding.preexistingModals.has(candidate));
+    let modal = binding.modal;
+    if (!modal) {
+      if (newModals.length > 1) {
+        return { ok: false, reason: 'shared-work-viewer-ambiguous' };
+      }
+      modal = newModals[0] || null;
+      if (modal) binding.modal = modal;
+    }
     if (!modal) {
       delete window[key];
       return { ok: true, wasOpen: false, closed: true };
+    }
+    if (newModals.some((candidate) => candidate !== modal)) {
+      return { ok: false, reason: 'shared-work-viewer-ownership-lost' };
+    }
+    if (!document.contains(modal)) {
+      delete window[key];
+      return { ok: true, wasOpen: true, closed: true };
     }
     const close = modal.querySelector('.commonModalFullScreenclose');
     if (!close) return { ok: false, reason: 'shared-work-viewer-close-not-found' };

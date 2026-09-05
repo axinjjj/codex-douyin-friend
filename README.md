@@ -250,14 +250,15 @@ npm run autostart:install
 npm run autostart:remove
 ```
 
-`smoke:codex` 会创建临时持久 Codex thread、关闭首个 App Server 客户端再恢复它，并确认
-测试目录里的 `AGENTS.md` 同时满足：
+`smoke:codex` 会创建临时持久 Codex thread、设置并核对固定无内容名称、读取已完成 turn、
+关闭首个 App Server 客户端再恢复它，并确认测试目录里的 `AGENTS.md` 同时满足：
 
 1. 出现在 App Server 返回的 `instructionSources` 中；
 2. 实际改变模型回复；
 3. 恢复后的同一 thread 仍加载该指令并能继续对话。
 
-冒烟结束会删除该测试 thread。
+冒烟结束会删除该测试 thread。这个检查同时覆盖桥在崩溃恢复中依赖的 `thread/read`，以及
+持久桥任务避免泄露首条聊天内容所依赖的 `thread/name/set`。
 
 首次启用视频音轨前运行 `npm run setup:sensevoice`。它会把官方 SenseVoice llama.cpp
 Windows CPU 运行包、SenseVoiceSmall Q8 和 FSMN-VAD 下载到 `.runtime` 并逐一校验

@@ -247,10 +247,13 @@ test("builds content-free mute guard expressions", () => {
 test("writes bounded open-player MSE keyframes into a removable video job", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "codex-douyin-open-player-"));
   let captureIndex = 0;
+  const actionMarker = "e".repeat(64);
   try {
     const result = await prepareOpenDouyinPlayerVideo({
       cdp: {
         async evaluate(expression) {
+          assert.match(expression, new RegExp(actionMarker, "u"));
+          assert.match(expression, /actionBinding\.video/u);
           if (expression.includes("const requestedTimes")) {
             return {
               ok: true,
@@ -287,6 +290,7 @@ test("writes bounded open-player MSE keyframes into a removable video job", asyn
         videoWidth: 720,
         videoHeight: 1280,
       },
+      actionMarker,
     });
     assert.ok(result.framePaths.length >= 2);
     assert.equal(result.audioReason, "open-player-mse-visual-only");

@@ -141,6 +141,7 @@ export async function prepareOpenDouyinPlayerVideo({
     const scan = await cdp.evaluate(buildScanFrameSignaturesExpression(scanTimes, {
       maxWallTimeMs: boundedScanWallTimeMs,
       videoSelector: OPEN_PLAYER_VIDEO_SELECTOR,
+      playerActionMarker: actionMarker ?? null,
     }), boundedScanWallTimeMs + 10_000);
     if (!scan?.ok || !Array.isArray(scan.samples) || scan.samples.length === 0) {
       throw new Error(`Could not scan the open Douyin player: ${scan?.reason || "unknown"}.`);
@@ -173,7 +174,10 @@ export async function prepareOpenDouyinPlayerVideo({
         selected.time,
         maxDimension,
         2_500,
-        { videoSelector: OPEN_PLAYER_VIDEO_SELECTOR },
+        {
+          videoSelector: OPEN_PLAYER_VIDEO_SELECTOR,
+          playerActionMarker: actionMarker ?? null,
+        },
       ), Math.min(5_000, Math.max(1_000, captureDeadline - Date.now() + 500)));
       if (!frame?.ok || !frame.dataUrl?.startsWith("data:image/png;base64,")) {
         throw new Error(`Could not capture an open-player keyframe: ${frame?.reason || "unknown"}.`);
