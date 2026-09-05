@@ -22,6 +22,21 @@ test("uses CDP native text insertion and returns only comparison metadata", asyn
   assert.equal(result.ok, true);
   assert.equal(calls.at(-1).method, "Input.insertText");
   assert.equal(calls.at(-1).params.text, "hello");
+  assert.equal(calls.some(({ params }) => params?.key === "Backspace"), false);
+});
+
+test("does not replace a pre-existing editor draft", async () => {
+  let requestCount = 0;
+  const result = await replaceChatEditorText({
+    async evaluate() {
+      return { ok: false, reason: "chat-input-not-empty" };
+    },
+    async request() {
+      requestCount += 1;
+    },
+  }, "bridge reply");
+  assert.deepEqual(result, { ok: false, reason: "chat-input-not-empty" });
+  assert.equal(requestCount, 0);
 });
 
 test("builds one atomic chat and editor authority preflight", async () => {
@@ -42,5 +57,39 @@ test("builds one atomic chat and editor authority preflight", async () => {
   assert.match(expression, /ownsInsertedText = actual === expected/u);
   assert.match(expression, /canClear: ownsInsertedText/u);
   assert.match(expression, /aria-disabled/u);
+  assert.match(expression, /unexpected-quote-draft/u);
   assert.doesNotMatch(expression, /private chat/u);
+});
+
+test("binds the exact media quote into the atomic editor preflight", async () => {
+  let expression = "";
+  const result = await verifyChatEditorReady({
+    async evaluate(value) {
+      expression = value;
+      return { ok: true, actualLength: 5, expectedLength: 5 };
+    },
+  }, {
+    expectedText: "hello",
+    expectedChatFingerprint: "a".repeat(64),
+    quoteBinding: {
+      nonce: "b".repeat(24),
+      quoteTargetFingerprint: "d".repeat(64),
+      message: {
+        ordinalFromEnd: 2,
+        fingerprint: "c".repeat(64),
+        kind: "media",
+        side: "left",
+      },
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.match(expression, /incoming-media-identity-changed/u);
+  assert.match(expression, /MessageItemShareAwemecontainer/u);
+  assert.match(expression, /quoteBinding\.message !== message/u);
+  assert.match(expression, /quoteBinding\.preview !== quotePreviews\[0\]/u);
+  assert.match(expression, /quoteBinding\.editor !== editor/u);
+  assert.match(expression, /quoteBinding\.inputColumn\?\.contains\(quotePreviews\[0\]\)/u);
+  assert.match(expression, /quotePreviewTargetFingerprint/u);
+  assert.match(expression, /media-quote-binding-lost/u);
+  assert.doesNotThrow(() => new Function(`return ${expression}`));
 });

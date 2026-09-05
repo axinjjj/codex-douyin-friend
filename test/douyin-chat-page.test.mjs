@@ -11,6 +11,12 @@ import {
   buildLocateLatestIncomingChatImageExpression,
   buildLocateIncomingMediaReactionTargetExpression,
   buildInspectOpenMediaLikeMenuExpression,
+  buildBindDouyinMediaQuoteExpression,
+  buildCancelDouyinMediaQuoteExpression,
+  buildInspectOpenMediaReplyMenuExpression,
+  buildPrepareDouyinMediaQuoteExpression,
+  buildReleaseDouyinMediaQuoteExpression,
+  buildVerifyDouyinMediaQuoteClearedExpression,
   buildReadLatestIncomingChatImageSourceExpression,
   buildLocateLatestIncomingAwemeExpression,
   buildOpenIncomingSharedWorkExpression,
@@ -68,9 +74,102 @@ test("message metadata hashes content without returning it", () => {
   assert.match(expression, /fingerprint/);
   assert.match(expression, /stableContent/u);
   assert.match(expression, /MessageBoxContentactiveClickArea/u);
+  assert.match(expression, /MessageBoxRefContainerrefContainer/u);
+  assert.match(expression, /quoted-text-v1/u);
+  assert.match(expression, /MessageItemShareAwemerefContainer/u);
   assert.doesNotMatch(expression, /slice\(0, 16\)/u);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/);
   assert.doesNotMatch(expression, /messages\.push\(\{[\s\S]*?\bsource,?\s*\}/);
+});
+
+test("builds bounded shared-work quote actions and page-local ownership", () => {
+  const message = {
+    ordinalFromEnd: 2,
+    fingerprint: "a".repeat(64),
+    kind: "media",
+    side: "left",
+  };
+  const chatFingerprint = "b".repeat(64);
+  const quoteNonce = "c".repeat(24);
+  const quoteTargetFingerprint = "d".repeat(64);
+  const expectedText = "quoted reply";
+  const prepare = buildPrepareDouyinMediaQuoteExpression({
+    message,
+    expectedChatFingerprint: chatFingerprint,
+    quoteNonce,
+    quoteTargetFingerprint,
+    expectedText,
+  });
+  const inspect = buildInspectOpenMediaReplyMenuExpression();
+  const activate = buildInspectOpenMediaReplyMenuExpression({ activate: true });
+  const bind = buildBindDouyinMediaQuoteExpression({
+    message,
+    expectedChatFingerprint: chatFingerprint,
+    quoteNonce,
+    quoteTargetFingerprint,
+    expectedText,
+  });
+  const cancel = buildCancelDouyinMediaQuoteExpression({
+    expectedChatFingerprint: chatFingerprint,
+    quoteNonce,
+    quoteTargetFingerprint,
+  });
+  const release = buildReleaseDouyinMediaQuoteExpression({
+    expectedChatFingerprint: chatFingerprint,
+    quoteNonce,
+    quoteTargetFingerprint,
+  });
+  const recoveredRelease = buildReleaseDouyinMediaQuoteExpression({
+    expectedChatFingerprint: chatFingerprint,
+    quoteNonce,
+    quoteTargetFingerprint,
+    allowMissing: true,
+  });
+  const cleared = buildVerifyDouyinMediaQuoteClearedExpression({
+    expectedChatFingerprint: chatFingerprint,
+    quoteNonce,
+    quoteTargetFingerprint,
+  });
+
+  assert.match(prepare, /state: 'armed'/u);
+  assert.match(prepare, /state: 'bound'/u);
+  assert.match(prepare, /quote-draft-already-present/u);
+  assert.match(inspect, /textContent \|\| ''\)\.trim\(\) === '回复'/u);
+  assert.match(activate, /closest\('\.MessageOperatePopBodybuttonItem'\)/u);
+  assert.match(activate, /button\.click\(\)/u);
+  assert.match(bind, /incoming-media-identity-changed/u);
+  assert.match(bind, /media-quote-target-is-not-shared-work/u);
+  assert.match(bind, /MsgInputReferencewrapper/u);
+  assert.match(bind, /__codexDouyinMediaQuoteBindingV1/u);
+  assert.match(bind, /binding\.inputColumn = inputColumn/u);
+  assert.match(bind, /previewTargetFingerprint !==/u);
+  assert.match(prepare, /binding\.ordinalFromEnd !== expected\.ordinalFromEnd && binding\.message !== message/u);
+  assert.match(prepare, /binding\.ordinalFromEnd = expected\.ordinalFromEnd/u);
+  assert.match(prepare, /draftPresent = body === expectedText/u);
+  assert.match(prepare, /document\.activeElement !== editor/u);
+  assert.match(cancel, /MsgInputReferenceclose/u);
+  assert.match(cancel, /previewTargetFingerprint !==/u);
+  assert.doesNotMatch(cancel, /close\[0\]\.click/u);
+  assert.match(cleared, /media-quote-cleanup-unverified/u);
+  assert.match(cleared, /delete window\[key\]/u);
+  assert.match(release, /delete window\[key\]/u);
+  assert.equal(
+    recoveredRelease.indexOf("const visiblePreviews")
+      < recoveredRelease.indexOf("if (!binding && true)"),
+    true,
+  );
+  assert.match(recoveredRelease, /media-quote-unowned-preview-present/u);
+  for (const expression of [prepare, inspect, activate, bind, cancel, release, recoveredRelease, cleared]) {
+    assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
+    assert.doesNotThrow(() => new Function(`return ${expression}`));
+  }
+  assert.throws(() => buildBindDouyinMediaQuoteExpression({
+    message,
+    expectedChatFingerprint: chatFingerprint,
+    quoteNonce: "short",
+    quoteTargetFingerprint,
+    expectedText,
+  }));
 });
 
 test("chat identity returns only a hash", () => {

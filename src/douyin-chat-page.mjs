@@ -13,8 +13,13 @@ const DOUYIN_SHARED_CARD_SELECTOR = DOUYIN_SHARED_WORK_VARIANTS
   .join(", ");
 const DOUYIN_SHARED_WORK_SELECTOR =
   `${DOUYIN_COMMENT_SHARE_SELECTOR}, ${DOUYIN_SHARED_CARD_SELECTOR}`;
+const DOUYIN_EDITOR_QUOTE_SELECTOR = ".MsgInputReferencewrapper";
+const DOUYIN_OUTGOING_QUOTE_SELECTOR = ".MessageBoxRefContainerrefContainer";
+const DOUYIN_OUTGOING_SHARED_WORK_REFERENCE_SELECTOR =
+  ".MessageItemShareAwemerefContainer";
 const DOUYIN_MEDIA_CONTENT_SELECTOR =
   `${DOUYIN_SHARED_WORK_SELECTOR}, .MessageItemImageImageBox, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]`;
+const DOUYIN_QUOTE_BINDING_KEY = "__codexDouyinMediaQuoteBindingV1";
 
 export function resolveDouyinSharedWorkManifest({ detail = null, parsedContent = null } = {}) {
   const MAX_VISITED_OBJECTS = 1_200;
@@ -227,6 +232,68 @@ function normalizeExactIncomingMediaMessage(message) {
 }
 
 const STABLE_MEDIA_FINGERPRINT_SOURCE = `
+    const resolveSharedWorkIdentitySource = (sharedCard) => {
+      if (!sharedCard) return null;
+      const identityKeys = new Set([
+        ['item', 'Id'].join(''), 'item_id',
+      ]);
+      const skippedKeys = new Set(['store', 'storeRef', 'storeState', 'children', 'emojiStore']);
+      const identities = new Set();
+      const seen = new WeakSet();
+      let visited = 0;
+      const inspectObjectGraph = (root) => {
+        if (!root || typeof root !== 'object') return;
+        const queue = [{ value: root, depth: 0 }];
+        while (queue.length > 0 && visited < 700) {
+          const current = queue.shift();
+          const value = current.value;
+          if (!value || typeof value !== 'object' || seen.has(value)) continue;
+          seen.add(value);
+          visited += 1;
+          const keys = Object.keys(value).slice(0, 120);
+          for (const key of keys) {
+            let child;
+            try {
+              child = value[key];
+            } catch {
+              continue;
+            }
+            if (identityKeys.has(key)
+                && (typeof child === 'string' || typeof child === 'number')) {
+              const identity = String(child).trim();
+              if (identity.length > 0 && identity.length <= 2_048) identities.add(identity);
+            }
+            if (current.depth < 7 && !skippedKeys.has(key)
+                && child && typeof child === 'object') {
+              queue.push({ value: child, depth: current.depth + 1 });
+            }
+          }
+        }
+      };
+      let element = sharedCard;
+      for (let elementDepth = 0; element && elementDepth < 6;
+        elementDepth += 1, element = element.parentElement) {
+        const reactKeys = Object.keys(element)
+          .filter((key) => key.startsWith('__reactProps$') || key.startsWith('__reactFiber$'))
+          .slice(0, 4);
+        for (const reactKey of reactKeys) {
+          const reactValue = element[reactKey];
+          if (reactKey.startsWith('__reactProps$')) {
+            inspectObjectGraph(reactValue);
+            continue;
+          }
+          let fiber = reactValue;
+          for (let fiberDepth = 0; fiber && fiberDepth < 16;
+            fiberDepth += 1, fiber = fiber.return) {
+            inspectObjectGraph(fiber.memoizedProps);
+            inspectObjectGraph(fiber.memoizedState);
+          }
+        }
+      }
+      return identities.size === 1
+        ? ['shared-work-identity-v1', [...identities][0]].join('|')
+        : null;
+    };
     const resolveStableMediaFingerprintSource = (mediaMessage) => {
       const sharedCard = mediaMessage.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)});
       if (sharedCard) {
@@ -505,26 +572,76 @@ export function buildChatMessageMetadataExpression() {
       ${MESSAGE_SIDE_CAPTURE_SOURCE}
       const content = message.querySelector('.messageMessageBoxcontentBox');
       const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
-      const source = (textBubble?.textContent || stableContent?.textContent || '').trim();
+      const outgoingReference = side === 'right'
+        ? message.querySelector(${JSON.stringify(DOUYIN_OUTGOING_QUOTE_SELECTOR)})
+        : null;
+      const outgoingQuoteBody = outgoingReference
+        ? message.querySelector('.TextMessageTextpureText')
+        : null;
+      const outgoingQuoteKind = outgoingReference?.querySelector(
+        ${JSON.stringify(DOUYIN_OUTGOING_SHARED_WORK_REFERENCE_SELECTOR)}
+      ) ? 'shared-work' : 'unknown';
+      const outgoingQuoteIdentitySource = outgoingQuoteKind === 'shared-work'
+        ? resolveSharedWorkIdentitySource(
+          outgoingReference.querySelector(
+            ${JSON.stringify(DOUYIN_OUTGOING_SHARED_WORK_REFERENCE_SELECTOR)}
+          ) || outgoingReference
+        )
+        : null;
+      const isOutgoingQuote = Boolean(outgoingReference && outgoingQuoteBody);
+      const legacySource = (textBubble?.textContent || stableContent?.textContent || '').trim();
+      const source = (isOutgoingQuote
+        ? outgoingQuoteBody.textContent
+        : legacySource).trim();
       const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
-      const kind = hasMedia ? 'media' : textBubble ? 'text' : centered ? 'system' : 'unknown';
-      const fingerprintSource = kind === 'media'
+      const stableMediaFingerprintSource = hasMedia
         ? resolveStableMediaFingerprintSource(message, textBubble, stableContent)
+        : null;
+      const kind = isOutgoingQuote ? 'text'
+        : hasMedia ? 'media' : textBubble ? 'text' : centered ? 'system' : 'unknown';
+      const fingerprintSource = kind === 'media'
+        ? stableMediaFingerprintSource
         : source;
-      const structuralKey = kind === 'media' || kind === 'text'
-        ? [kind, side, fingerprintSource].join('|')
-        : [kind, side, source, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|');
-      return { kind, side, textLength: source.length, structuralKey };
+      const structuralKey = isOutgoingQuote
+        ? ['quoted-text-v1', side, outgoingQuoteKind, source].join('|')
+        : kind === 'media' || kind === 'text'
+          ? [kind, side, fingerprintSource].join('|')
+          : [kind, side, source, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|');
+      const legacyKind = hasMedia ? 'media' : textBubble ? 'text' : centered ? 'system' : 'unknown';
+      const legacyFingerprintSource = legacyKind === 'media'
+        ? stableMediaFingerprintSource
+        : legacySource;
+      const legacyStructuralKey = isOutgoingQuote
+        ? (legacyKind === 'media' || legacyKind === 'text'
+          ? [legacyKind, side, legacyFingerprintSource].join('|')
+          : [legacyKind, side, legacySource, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|'))
+        : null;
+      return {
+        kind,
+        side,
+        textLength: source.length,
+        structuralKey,
+        outgoingQuoteIdentitySource,
+        legacyStructuralKey,
+      };
     });
     const messages = [];
     for (let index = 0; index < captured.length; index += 1) {
       const message = captured[index];
+      const quoteTargetFingerprint = message.outgoingQuoteIdentitySource
+        ? await digest(message.outgoingQuoteIdentitySource)
+        : null;
+      const legacyFingerprint = message.legacyStructuralKey
+        ? await digest(message.legacyStructuralKey)
+        : null;
       messages.push({
         ordinalFromEnd: captured.length - index,
         kind: message.kind,
         side: message.side,
         textLength: message.textLength,
         fingerprint: await digest(message.structuralKey),
+        ...(quoteTargetFingerprint ? { quoteTargetFingerprint } : {}),
+        ...(legacyFingerprint ? { legacyFingerprint } : {}),
       });
     }
 
@@ -587,20 +704,57 @@ export function buildBridgeStartupViewExpression(limit = 12) {
         ${MESSAGE_SIDE_CAPTURE_SOURCE}
         const content = message.querySelector('.messageMessageBoxcontentBox');
         const stableContent = message.querySelector('.MessageBoxContentactiveClickArea') || content;
-        const source = (bubble?.textContent || stableContent?.textContent || '').trim();
+        const outgoingReference = side === 'right'
+          ? message.querySelector(${JSON.stringify(DOUYIN_OUTGOING_QUOTE_SELECTOR)})
+          : null;
+        const outgoingQuoteBody = outgoingReference
+          ? message.querySelector('.TextMessageTextpureText')
+          : null;
+        const outgoingQuoteKind = outgoingReference?.querySelector(
+          ${JSON.stringify(DOUYIN_OUTGOING_SHARED_WORK_REFERENCE_SELECTOR)}
+        ) ? 'shared-work' : 'unknown';
+        const outgoingQuoteIdentitySource = outgoingQuoteKind === 'shared-work'
+          ? resolveSharedWorkIdentitySource(
+            outgoingReference.querySelector(
+              ${JSON.stringify(DOUYIN_OUTGOING_SHARED_WORK_REFERENCE_SELECTOR)}
+            ) || outgoingReference
+          )
+          : null;
+        const isOutgoingQuote = Boolean(outgoingReference && outgoingQuoteBody);
+        const legacySource = (bubble?.textContent || stableContent?.textContent || '').trim();
+        const source = (isOutgoingQuote
+          ? outgoingQuoteBody.textContent
+          : legacySource).trim();
         const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
-        const kind = hasMedia ? 'media' : bubble ? 'text' : centered ? 'system' : 'unknown';
-        const fingerprintSource = kind === 'media'
+        const stableMediaFingerprintSource = hasMedia
           ? resolveStableMediaFingerprintSource(message, bubble, stableContent)
+          : null;
+        const kind = isOutgoingQuote ? 'text'
+          : hasMedia ? 'media' : bubble ? 'text' : centered ? 'system' : 'unknown';
+        const fingerprintSource = kind === 'media'
+          ? stableMediaFingerprintSource
           : source;
-        const structuralKey = kind === 'media' || kind === 'text'
-          ? [kind, side, fingerprintSource].join('|')
-          : [kind, side, source, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|');
+        const structuralKey = isOutgoingQuote
+          ? ['quoted-text-v1', side, outgoingQuoteKind, source].join('|')
+          : kind === 'media' || kind === 'text'
+            ? [kind, side, fingerprintSource].join('|')
+            : [kind, side, source, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|');
+        const legacyKind = hasMedia ? 'media' : bubble ? 'text' : centered ? 'system' : 'unknown';
+        const legacyFingerprintSource = legacyKind === 'media'
+          ? stableMediaFingerprintSource
+          : legacySource;
+        const legacyStructuralKey = isOutgoingQuote
+          ? (legacyKind === 'media' || legacyKind === 'text'
+            ? [legacyKind, side, legacyFingerprintSource].join('|')
+            : [legacyKind, side, legacySource, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|'))
+          : null;
         return {
           source,
           side,
           kind,
           structuralKey,
+          outgoingQuoteIdentitySource,
+          legacyStructuralKey,
           role: side === 'left' ? 'user' : side === 'right' ? 'assistant' : null,
         };
       });
@@ -609,11 +763,19 @@ export function buildBridgeStartupViewExpression(limit = 12) {
     const messages = [];
     for (let index = 0; index < recent.length; index += 1) {
       const message = recent[index];
+      const quoteTargetFingerprint = message.outgoingQuoteIdentitySource
+        ? await digest(message.outgoingQuoteIdentitySource)
+        : null;
+      const legacyFingerprint = message.legacyStructuralKey
+        ? await digest(message.legacyStructuralKey)
+        : null;
       messages.push({
         ordinalFromEnd: recent.length - index,
         kind: message.kind,
         side: message.side,
         fingerprint: await digest(message.structuralKey),
+        ...(quoteTargetFingerprint ? { quoteTargetFingerprint } : {}),
+        ...(legacyFingerprint ? { legacyFingerprint } : {}),
       });
     }
     const conversation = [];
@@ -624,7 +786,7 @@ export function buildBridgeStartupViewExpression(limit = 12) {
       conversation.push({
         role: message.role,
         text: message.source,
-        fingerprint: await digest(['text', message.side, message.source].join('|')),
+        fingerprint: await digest(message.structuralKey),
       });
     }
     return {
@@ -705,6 +867,11 @@ export function buildClassifyLatestIncomingMediaExpression(mediaMessage = null) 
   const expected = normalizeExactIncomingMediaMessage(mediaMessage);
   return `(async () => {
     ${buildExactIncomingMediaLookupSource(expected)}
+    const quoteDigest = async (value) => {
+      const bytes = new TextEncoder().encode(value);
+      const hash = await crypto.subtle.digest('SHA-256', bytes);
+      return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    };
     if (message.querySelector(${JSON.stringify(DOUYIN_COMMENT_SHARE_SELECTOR)})) {
       return { ok: true, mediaType: 'comment_share' };
     }
@@ -713,7 +880,17 @@ export function buildClassifyLatestIncomingMediaExpression(mediaMessage = null) 
       Boolean(message.querySelector(variant.selector))
     ));
     if (matchedSharedWorkVariant) {
-      return { ok: true, mediaType: 'shared_aweme', variant: matchedSharedWorkVariant.name };
+      const card = message.querySelector(matchedSharedWorkVariant.selector);
+      const quoteTargetSource = resolveSharedWorkIdentitySource(card);
+      const quoteTargetFingerprint = quoteTargetSource
+        ? await quoteDigest(quoteTargetSource)
+        : null;
+      return {
+        ok: true,
+        mediaType: 'shared_aweme',
+        variant: matchedSharedWorkVariant.name,
+        quoteTargetFingerprint,
+      };
     }
     const visibleImage = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
       .find((image) => {
@@ -1555,6 +1732,431 @@ export function buildInspectOpenMediaLikeMenuExpression({ activate = false } = {
   })()`;
 }
 
+export function buildPrepareDouyinMediaQuoteExpression(options) {
+  const expectedChatFingerprint = options?.expectedChatFingerprint;
+  const expected = normalizeExactIncomingMediaMessage(options?.message);
+  const quoteNonce = options?.quoteNonce;
+  const quoteTargetFingerprint = options?.quoteTargetFingerprint;
+  const expectedText = String(options?.expectedText ?? "").trim();
+  if (!/^[0-9a-f]{64}$/u.test(expectedChatFingerprint || "")
+      || !expected || !/^[0-9a-f]{24}$/u.test(quoteNonce || "")
+      || !/^[0-9a-f]{64}$/u.test(quoteTargetFingerprint || "")
+      || expectedText.length === 0 || expectedText.length > 20_000) {
+    throw new Error("Expected Douyin chat fingerprint is invalid.");
+  }
+  const ownershipSource = `
+    ${buildExactIncomingMediaLookupSource(expected)}
+    if (!message.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)})) {
+      return { ok: false, reason: 'media-quote-target-is-not-shared-work' };
+    }
+    const inputColumn = editor.closest('.messageMsgInputinputColumn');
+    if (!inputColumn) return { ok: false, reason: 'media-quote-input-column-unavailable' };
+    const key = ${JSON.stringify(DOUYIN_QUOTE_BINDING_KEY)};
+    const binding = window[key];
+    const expectedText = ${JSON.stringify(expectedText)};
+    if (binding) {
+      if (binding.nonce !== ${JSON.stringify(quoteNonce)}
+          || binding.fingerprint !== expected.fingerprint
+          || (binding.ordinalFromEnd !== expected.ordinalFromEnd && binding.message !== message)
+          || (binding.message?.isConnected && binding.message !== message)
+          || binding.quoteTargetFingerprint !== ${JSON.stringify(quoteTargetFingerprint)}
+          || binding.expectedText !== expectedText
+          || (body && body !== expectedText)) {
+        return { ok: false, reason: 'quote-draft-already-present' };
+      }
+      if (previews.length > 1) {
+        return { ok: false, reason: 'media-quote-editor-structure-ambiguous' };
+      }
+      if (previews.length === 1) {
+        const preview = previews[0];
+        const previewTargetSource = resolveSharedWorkIdentitySource(preview);
+        const previewTargetFingerprint = previewTargetSource
+          ? await digest(previewTargetSource)
+          : null;
+        if (!inputColumn.contains(preview)
+            || preview.querySelectorAll('.MsgInputReferenceclose').length !== 1
+            || previewTargetFingerprint !== ${JSON.stringify(quoteTargetFingerprint)}
+            || (binding.preview && binding.preview !== preview && binding.preview.isConnected)) {
+          return { ok: false, reason: 'media-quote-editor-ownership-unavailable' };
+        }
+        binding.preview = preview;
+        binding.message = message;
+        binding.ordinalFromEnd = expected.ordinalFromEnd;
+        binding.editor = editor;
+        binding.inputColumn = inputColumn;
+        const draftPresent = body === expectedText;
+        if (draftPresent) {
+          editor.focus();
+          editor.click();
+          if (document.activeElement !== editor) {
+            return { ok: false, reason: 'media-quote-editor-focus-unavailable' };
+          }
+        }
+        return { ok: true, reason: null, state: 'bound', resumed: true, draftPresent };
+      }
+      if (binding.preview?.isConnected) {
+        return { ok: false, reason: 'media-quote-preview-identity-lost' };
+      }
+      binding.preview = null;
+      binding.message = message;
+      binding.ordinalFromEnd = expected.ordinalFromEnd;
+      binding.editor = editor;
+      binding.inputColumn = inputColumn;
+      return { ok: true, reason: null, state: 'armed', resumed: true };
+    }
+    if (body || previews.length !== 0) {
+      return { ok: false, reason: 'quote-draft-already-present' };
+    }
+    window[key] = {
+      nonce: ${JSON.stringify(quoteNonce)},
+      preview: null,
+      message,
+      editor,
+      inputColumn,
+      expectedText,
+      quoteTargetFingerprint: ${JSON.stringify(quoteTargetFingerprint)},
+      fingerprint: expected.fingerprint,
+      ordinalFromEnd: expected.ordinalFromEnd,
+    };
+    return { ok: true, reason: null, state: 'armed', resumed: false, draftPresent: false };
+  `;
+  return `(async () => {
+    ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    if (!title || !opaqueId) return { ok: false, reason: 'chat-identity-unavailable' };
+    const bytes = new TextEncoder().encode(['douyin-opponent-v1', opaqueId].join('|'));
+    const hash = await crypto.subtle.digest('SHA-256', bytes);
+    const chatFingerprint = Array.from(new Uint8Array(hash), (byte) => (
+      byte.toString(16).padStart(2, '0')
+    )).join('');
+    if (chatFingerprint !== ${JSON.stringify(expectedChatFingerprint)}) {
+      return { ok: false, reason: 'chat-changed-before-media-quote' };
+    }
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none'
+        && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+    };
+    const editors = Array.from(document.querySelectorAll(
+      ${JSON.stringify(DOUYIN_CHAT_INPUT_SELECTOR)}
+    )).filter(visible);
+    if (editors.length !== 1) return { ok: false, reason: 'visible-editor-count' };
+    const editor = editors[0];
+    const body = (editor.textContent || '').replace(/[\u200B\uFEFF]/gu, '').trim();
+    const previews = Array.from(document.querySelectorAll(
+      ${JSON.stringify(DOUYIN_EDITOR_QUOTE_SELECTOR)}
+    )).filter(visible);
+    ${ownershipSource}
+  })()`;
+}
+
+export function buildInspectOpenMediaReplyMenuExpression({ activate = false } = {}) {
+  if (typeof activate !== "boolean") throw new Error("Media-reply menu activation must be boolean.");
+  const activationSource = activate
+    ? `const button = replyEntries[0].closest('.MessageOperatePopBodybuttonItem');
+       if (!button || !visible(button)) {
+         return { ok: false, reason: 'media-reply-button-unavailable', activated: false };
+       }
+       button.click();
+       return { ok: true, activated: true };`
+    : "return { ok: true, activated: false };";
+  return `(() => {
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none'
+        && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+    };
+    const entries = Array.from(document.querySelectorAll('.MessageOperatePopBodydesc')).filter(visible);
+    if (entries.length === 0) return { ok: false, reason: 'media-message-menu-not-open' };
+    const replyEntries = entries.filter((entry) => (entry.textContent || '').trim() === '回复');
+    if (replyEntries.length !== 1) {
+      return { ok: false, reason: 'media-reply-action-unavailable-or-ambiguous' };
+    }
+    ${activationSource}
+  })()`;
+}
+
+export function buildBindDouyinMediaQuoteExpression({
+  message,
+  expectedChatFingerprint,
+  quoteNonce,
+  quoteTargetFingerprint,
+  expectedText,
+}) {
+  const expected = normalizeExactIncomingMediaMessage(message);
+  const normalizedExpectedText = String(expectedText ?? "").trim();
+  if (!expected || !/^[0-9a-f]{64}$/u.test(expectedChatFingerprint || "")
+      || !/^[0-9a-f]{24}$/u.test(quoteNonce || "")
+      || !/^[0-9a-f]{64}$/u.test(quoteTargetFingerprint || "")
+      || normalizedExpectedText.length === 0 || normalizedExpectedText.length > 20_000) {
+    throw new Error("Douyin media quote binding metadata is invalid.");
+  }
+  return `(async () => {
+    ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    if (!title || !opaqueId) return { ok: false, reason: 'chat-identity-unavailable' };
+    const identityBytes = new TextEncoder().encode(['douyin-opponent-v1', opaqueId].join('|'));
+    const identityHash = await crypto.subtle.digest('SHA-256', identityBytes);
+    const chatFingerprint = Array.from(new Uint8Array(identityHash), (byte) => (
+      byte.toString(16).padStart(2, '0')
+    )).join('');
+    if (chatFingerprint !== ${JSON.stringify(expectedChatFingerprint)}) {
+      return { ok: false, reason: 'chat-changed-before-media-quote-binding' };
+    }
+    ${buildExactIncomingMediaLookupSource(expected)}
+    if (!message.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)})) {
+      return { ok: false, reason: 'media-quote-target-is-not-shared-work' };
+    }
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none'
+        && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+    };
+    const editors = Array.from(document.querySelectorAll(
+      ${JSON.stringify(DOUYIN_CHAT_INPUT_SELECTOR)}
+    )).filter(visible);
+    const previews = Array.from(document.querySelectorAll(
+      ${JSON.stringify(DOUYIN_EDITOR_QUOTE_SELECTOR)}
+    )).filter(visible);
+    if (editors.length !== 1 || previews.length !== 1) {
+      return { ok: false, reason: 'media-quote-editor-structure-ambiguous' };
+    }
+    const editor = editors[0];
+    const preview = previews[0];
+    const previewTargetSource = resolveSharedWorkIdentitySource(preview);
+    const previewTargetFingerprint = previewTargetSource
+      ? await digest(previewTargetSource)
+      : null;
+    const inputColumn = editor.closest('.messageMsgInputinputColumn');
+    const body = (editor.textContent || '').replace(/[\u200B\uFEFF]/gu, '').trim();
+    const expectedText = ${JSON.stringify(normalizedExpectedText)};
+    if (!inputColumn || !inputColumn.contains(preview)
+        || (body && body !== expectedText)
+        || previewTargetFingerprint !== ${JSON.stringify(quoteTargetFingerprint)}) {
+      return { ok: false, reason: 'media-quote-editor-ownership-unavailable' };
+    }
+    if (preview.querySelectorAll('.MsgInputReferenceclose').length !== 1) {
+      return { ok: false, reason: 'media-quote-close-control-ambiguous' };
+    }
+    const key = ${JSON.stringify(DOUYIN_QUOTE_BINDING_KEY)};
+    const binding = window[key];
+    if (!binding || binding.nonce !== ${JSON.stringify(quoteNonce)}
+        || binding.fingerprint !== expected.fingerprint
+        || binding.ordinalFromEnd !== expected.ordinalFromEnd
+        || binding.quoteTargetFingerprint !== ${JSON.stringify(quoteTargetFingerprint)}
+        || binding.expectedText !== expectedText
+        || (binding.preview && binding.preview !== preview && binding.preview.isConnected)) {
+      return { ok: false, reason: 'media-quote-binding-identity-changed' };
+    }
+    binding.preview = preview;
+    binding.message = message;
+    binding.editor = editor;
+    binding.inputColumn = inputColumn;
+    return { ok: true, reason: null, draftPresent: body === expectedText };
+  })()`;
+}
+
+export function buildCancelDouyinMediaQuoteExpression({
+  expectedChatFingerprint,
+  quoteNonce,
+  quoteTargetFingerprint,
+  requireBoundPreview = false,
+}) {
+  if (!/^[0-9a-f]{64}$/u.test(expectedChatFingerprint || "")
+      || !/^[0-9a-f]{24}$/u.test(quoteNonce || "")
+      || !/^[0-9a-f]{64}$/u.test(quoteTargetFingerprint || "")
+      || typeof requireBoundPreview !== "boolean") {
+    throw new Error("Douyin media quote cancellation metadata is invalid.");
+  }
+  return `(async () => {
+    ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    if (!title || !opaqueId) return { ok: false, reason: 'chat-identity-unavailable' };
+    const bytes = new TextEncoder().encode(['douyin-opponent-v1', opaqueId].join('|'));
+    const hash = await crypto.subtle.digest('SHA-256', bytes);
+    const chatFingerprint = Array.from(new Uint8Array(hash), (byte) => (
+      byte.toString(16).padStart(2, '0')
+    )).join('');
+    if (chatFingerprint !== ${JSON.stringify(expectedChatFingerprint)}) {
+      return { ok: false, reason: 'chat-changed-before-media-quote-cancel' };
+    }
+    ${STABLE_MEDIA_FINGERPRINT_SOURCE}
+    const digest = async (value) => {
+      const bytes = new TextEncoder().encode(value);
+      const valueHash = await crypto.subtle.digest('SHA-256', bytes);
+      return Array.from(new Uint8Array(valueHash), (byte) => (
+        byte.toString(16).padStart(2, '0')
+      )).join('');
+    };
+    const key = ${JSON.stringify(DOUYIN_QUOTE_BINDING_KEY)};
+    const binding = window[key];
+    if (!binding || binding.nonce !== ${JSON.stringify(quoteNonce)}
+        || binding.quoteTargetFingerprint !== ${JSON.stringify(quoteTargetFingerprint)}) {
+      return { ok: false, reason: 'media-quote-binding-lost' };
+    }
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none'
+        && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+    };
+    const editors = Array.from(document.querySelectorAll(
+      ${JSON.stringify(DOUYIN_CHAT_INPUT_SELECTOR)}
+    )).filter(visible);
+    if (editors.length !== 1) {
+      return { ok: false, reason: 'media-quote-cancel-editor-ambiguous' };
+    }
+    const editor = editors[0];
+    const body = (editor?.textContent || '').replace(/[\u200B\uFEFF]/gu, '').trim();
+    const inputColumn = editor.closest('.messageMsgInputinputColumn');
+    const previews = Array.from(document.querySelectorAll(
+      ${JSON.stringify(DOUYIN_EDITOR_QUOTE_SELECTOR)}
+    )).filter(visible);
+    if (body || !inputColumn || binding.editor !== editor || binding.inputColumn !== inputColumn) {
+      return { ok: false, reason: 'media-quote-cancel-authority-lost' };
+    }
+    if (previews.length === 0 && !binding.preview?.isConnected) {
+      delete window[key];
+      const editorRect = editor.getBoundingClientRect();
+      return {
+        ok: true,
+        reason: null,
+        armedOnly: true,
+        point: {
+          x: Math.round(editorRect.left + Math.min(editorRect.width / 2, 24)),
+          y: Math.round(editorRect.top + editorRect.height / 2),
+        },
+      };
+    }
+    if (previews.length !== 1 || !inputColumn.contains(previews[0])
+        || (binding.preview && binding.preview !== previews[0] && binding.preview.isConnected)) {
+      return { ok: false, reason: 'media-quote-cancel-authority-lost' };
+    }
+    const previewTargetSource = resolveSharedWorkIdentitySource(previews[0]);
+    const previewTargetFingerprint = previewTargetSource
+      ? await digest(previewTargetSource)
+      : null;
+    if (previewTargetFingerprint !== ${JSON.stringify(quoteTargetFingerprint)}
+        || (${JSON.stringify(requireBoundPreview)}
+          && (binding.preview !== previews[0] || !binding.preview?.isConnected))) {
+      return { ok: false, reason: 'media-quote-cancel-authority-lost' };
+    }
+    binding.preview = previews[0];
+    const close = binding.preview.querySelectorAll('.MsgInputReferenceclose');
+    if (close.length !== 1) {
+      return { ok: false, reason: 'media-quote-cancel-authority-lost' };
+    }
+    const rect = close[0].getBoundingClientRect();
+    if (rect.width < 8 || rect.height < 8 || rect.left < 0 || rect.top < 0
+        || rect.right > window.innerWidth || rect.bottom > window.innerHeight) {
+      return { ok: false, reason: 'media-quote-close-control-invalid' };
+    }
+    return {
+      ok: true,
+      reason: null,
+      point: {
+        x: Math.round(rect.left + rect.width / 2),
+        y: Math.round(rect.top + rect.height / 2),
+      },
+    };
+  })()`;
+}
+
+export function buildVerifyDouyinMediaQuoteClearedExpression({
+  expectedChatFingerprint,
+  quoteNonce,
+  quoteTargetFingerprint,
+}) {
+  if (!/^[0-9a-f]{64}$/u.test(expectedChatFingerprint || "")
+      || !/^[0-9a-f]{24}$/u.test(quoteNonce || "")
+      || !/^[0-9a-f]{64}$/u.test(quoteTargetFingerprint || "")) {
+    throw new Error("Douyin media quote cleanup metadata is invalid.");
+  }
+  return `(async () => {
+    ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    if (!title || !opaqueId) return { ok: false, reason: 'chat-identity-unavailable' };
+    const bytes = new TextEncoder().encode(['douyin-opponent-v1', opaqueId].join('|'));
+    const hash = await crypto.subtle.digest('SHA-256', bytes);
+    const chatFingerprint = Array.from(new Uint8Array(hash), (byte) => (
+      byte.toString(16).padStart(2, '0')
+    )).join('');
+    if (chatFingerprint !== ${JSON.stringify(expectedChatFingerprint)}) {
+      return { ok: false, reason: 'chat-changed-before-media-quote-cleanup-verification' };
+    }
+    const key = ${JSON.stringify(DOUYIN_QUOTE_BINDING_KEY)};
+    const binding = window[key];
+    if (binding && (binding.nonce !== ${JSON.stringify(quoteNonce)}
+        || binding.quoteTargetFingerprint !== ${JSON.stringify(quoteTargetFingerprint)})) {
+      return { ok: false, reason: 'media-quote-binding-lost' };
+    }
+    const editor = document.querySelector(${JSON.stringify(DOUYIN_CHAT_INPUT_SELECTOR)});
+    const body = (editor?.textContent || '').replace(/[\u200B\uFEFF]/gu, '').trim();
+    const visiblePreviews = Array.from(document.querySelectorAll(
+      ${JSON.stringify(DOUYIN_EDITOR_QUOTE_SELECTOR)}
+    )).filter((candidate) => {
+      const rect = candidate.getBoundingClientRect();
+      const style = getComputedStyle(candidate);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none'
+        && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+    });
+    if (!editor || body || binding?.preview?.isConnected || visiblePreviews.length !== 0) {
+      return { ok: false, reason: 'media-quote-cleanup-unverified' };
+    }
+    if (binding) delete window[key];
+    return { ok: true, reason: null };
+  })()`;
+}
+
+export function buildReleaseDouyinMediaQuoteExpression({
+  expectedChatFingerprint,
+  quoteNonce,
+  quoteTargetFingerprint,
+  allowMissing = false,
+}) {
+  if (!/^[0-9a-f]{64}$/u.test(expectedChatFingerprint || "")
+      || !/^[0-9a-f]{24}$/u.test(quoteNonce || "")
+      || !/^[0-9a-f]{64}$/u.test(quoteTargetFingerprint || "")
+      || typeof allowMissing !== "boolean") {
+    throw new Error("Douyin media quote release nonce is invalid.");
+  }
+  return `(async () => {
+    ${CHAT_IDENTITY_CAPTURE_SOURCE}
+    if (!title || !opaqueId) return { ok: false, reason: 'chat-identity-unavailable' };
+    const bytes = new TextEncoder().encode(['douyin-opponent-v1', opaqueId].join('|'));
+    const hash = await crypto.subtle.digest('SHA-256', bytes);
+    const chatFingerprint = Array.from(new Uint8Array(hash), (byte) => (
+      byte.toString(16).padStart(2, '0')
+    )).join('');
+    if (chatFingerprint !== ${JSON.stringify(expectedChatFingerprint)}) {
+      return { ok: false, reason: 'chat-changed-before-media-quote-release' };
+    }
+    const key = ${JSON.stringify(DOUYIN_QUOTE_BINDING_KEY)};
+    const binding = window[key];
+    const visiblePreviews = Array.from(document.querySelectorAll(
+      ${JSON.stringify(DOUYIN_EDITOR_QUOTE_SELECTOR)}
+    )).filter((candidate) => {
+      const rect = candidate.getBoundingClientRect();
+      const style = getComputedStyle(candidate);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none'
+        && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+    });
+    if (!binding && ${JSON.stringify(allowMissing)}) {
+      return visiblePreviews.length === 0
+        ? { ok: true, reason: null, alreadyReleased: true }
+        : { ok: false, reason: 'media-quote-unowned-preview-present' };
+    }
+    if (binding?.nonce !== ${JSON.stringify(quoteNonce)}
+        || binding.quoteTargetFingerprint !== ${JSON.stringify(quoteTargetFingerprint)}) {
+      return { ok: false, reason: 'media-quote-binding-lost' };
+    }
+    if (visiblePreviews.length !== 0) {
+      return { ok: false, reason: 'media-quote-send-cleanup-unverified' };
+    }
+    delete window[key];
+    return { ok: true, reason: null };
+  })()`;
+}
+
 export function buildReadIncomingCommentShareExpression(message) {
   if (!Number.isSafeInteger(message?.ordinalFromEnd) || message.ordinalFromEnd < 1 || message.ordinalFromEnd > 12
       || !/^[0-9a-f]{64}$/u.test(message?.fingerprint)
@@ -1763,10 +2365,71 @@ export function buildChatIdentityMetadataExpression() {
 export function buildVerifyChatEditorReadyExpression({
   expectedText,
   expectedChatFingerprint,
+  quoteBinding = null,
 }) {
   if (!/^[0-9a-f]{64}$/u.test(expectedChatFingerprint)) {
     throw new Error("Expected Douyin chat fingerprint is invalid.");
   }
+  let expectedQuote = null;
+  if (quoteBinding !== null) {
+    const message = normalizeExactIncomingMediaMessage(quoteBinding?.message);
+    if (!message || !/^[0-9a-f]{24}$/u.test(quoteBinding?.nonce || "")
+        || !/^[0-9a-f]{64}$/u.test(quoteBinding?.quoteTargetFingerprint || "")) {
+      throw new Error("Expected Douyin media quote binding is invalid.");
+    }
+    expectedQuote = {
+      message,
+      nonce: quoteBinding.nonce,
+      quoteTargetFingerprint: quoteBinding.quoteTargetFingerprint,
+    };
+  }
+  const quoteAuthoritySource = expectedQuote
+    ? `
+    ${buildExactIncomingMediaLookupSource(expectedQuote.message)}
+    if (!message.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)})) {
+      return { ok: false, reason: 'media-quote-target-changed', chatMatches: true, canClear: ownsInsertedText };
+    }
+    const quotePreviews = Array.from(document.querySelectorAll(
+      ${JSON.stringify(DOUYIN_EDITOR_QUOTE_SELECTOR)}
+    )).filter((candidate) => {
+      const rectangle = candidate.getBoundingClientRect();
+      const style = getComputedStyle(candidate);
+      return rectangle.width > 0 && rectangle.height > 0
+        && style.display !== 'none' && style.visibility !== 'hidden';
+    });
+    const quoteBinding = window[${JSON.stringify(DOUYIN_QUOTE_BINDING_KEY)}];
+    const quotePreviewTargetSource = quotePreviews.length === 1
+      ? resolveSharedWorkIdentitySource(quotePreviews[0])
+      : null;
+    const quotePreviewTargetFingerprint = quotePreviewTargetSource
+      ? await digest(quotePreviewTargetSource)
+      : null;
+    if (quotePreviews.length !== 1 || !quoteBinding
+        || quoteBinding.nonce !== ${JSON.stringify(expectedQuote.nonce)}
+        || quoteBinding.preview !== quotePreviews[0]
+        || quoteBinding.message !== message
+        || quoteBinding.fingerprint !== expected.fingerprint
+        || quoteBinding.ordinalFromEnd !== expected.ordinalFromEnd
+        || quoteBinding.quoteTargetFingerprint !== ${JSON.stringify(expectedQuote.quoteTargetFingerprint)}
+        || quotePreviewTargetFingerprint !== ${JSON.stringify(expectedQuote.quoteTargetFingerprint)}
+        || quoteBinding.editor !== editor
+        || quoteBinding.inputColumn !== editor.closest('.messageMsgInputinputColumn')
+        || !quoteBinding.inputColumn?.contains(quotePreviews[0])
+        || !quoteBinding.preview?.isConnected) {
+      return { ok: false, reason: 'media-quote-binding-lost', chatMatches: true, canClear: ownsInsertedText };
+    }`
+    : `
+    const unexpectedQuotePreviews = Array.from(document.querySelectorAll(
+      ${JSON.stringify(DOUYIN_EDITOR_QUOTE_SELECTOR)}
+    )).filter((candidate) => {
+      const rectangle = candidate.getBoundingClientRect();
+      const style = getComputedStyle(candidate);
+      return rectangle.width > 0 && rectangle.height > 0
+        && style.display !== 'none' && style.visibility !== 'hidden';
+    });
+    if (unexpectedQuotePreviews.length !== 0) {
+      return { ok: false, reason: 'unexpected-quote-draft', chatMatches: true, canClear: ownsInsertedText };
+    }`;
   return `(async () => {
     ${CHAT_IDENTITY_CAPTURE_SOURCE}
     if (!title || !opaqueId) {
@@ -1774,9 +2437,9 @@ export function buildVerifyChatEditorReadyExpression({
     }
     const bytes = new TextEncoder().encode(['douyin-opponent-v1', opaqueId].join('|'));
     const hash = await crypto.subtle.digest('SHA-256', bytes);
-    const fingerprint = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0'))
+    const chatFingerprint = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0'))
       .join('');
-    const chatMatches = fingerprint === ${JSON.stringify(expectedChatFingerprint)};
+    const chatMatches = chatFingerprint === ${JSON.stringify(expectedChatFingerprint)};
     if (!chatMatches) {
       return { ok: false, reason: 'chat-changed', chatMatches: false, canClear: false };
     }
@@ -1797,9 +2460,9 @@ export function buildVerifyChatEditorReadyExpression({
       };
     }
     const editor = visibleEditors[0];
-    const expected = ${JSON.stringify(expectedText)};
+    const expectedEditorText = ${JSON.stringify(expectedText)};
     const actual = (editor.textContent || '').replace(/[\u200B\uFEFF]/gu, '').trim();
-    const ownsInsertedText = actual === expected;
+    const ownsInsertedText = actual === expectedEditorText;
     if (editor.matches(':disabled') || editor.getAttribute('aria-disabled') === 'true') {
       return { ok: false, reason: 'editor-disabled', chatMatches: true, canClear: false };
     }
@@ -1818,16 +2481,17 @@ export function buildVerifyChatEditorReadyExpression({
         chatMatches: true,
         canClear: false,
         actualLength: actual.length,
-        expectedLength: expected.length,
+        expectedLength: expectedEditorText.length,
       };
     }
+    ${quoteAuthoritySource}
     return {
       ok: true,
       reason: null,
       chatMatches: true,
       canClear: true,
       actualLength: actual.length,
-      expectedLength: expected.length,
+      expectedLength: expectedEditorText.length,
     };
   })()`;
 }

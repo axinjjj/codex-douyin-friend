@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { CodexAppServerRequestError } from "../src/codex-app-server-client.mjs";
+import { computeQuotedTextMessageFingerprint } from "../src/douyin-bridge-state.mjs";
 import {
   DouyinSendAbortedError,
   DOUYIN_BRIDGE_THREAD_NAME,
@@ -173,6 +174,268 @@ test("send refuses Enter when atomic editor authority is lost", async () => {
     requests.some(({ params }) => params?.key === "Enter"),
     false,
   );
+});
+
+test("rechecks full editor authority after journaling and rolls back before Enter", async () => {
+  const requests = [];
+  let authorityChecks = 0;
+  let attempted = false;
+  let rolledBack = false;
+  const cdp = {
+    async evaluate(expression) {
+      if (expression.includes("chat-input-not-empty")) return { ok: true };
+      if (expression.includes("const editor = document.querySelector")
+          && !expression.includes("visibleEditors")) return { ok: true };
+      if (expression.includes("visibleEditors.length !== 1")) {
+        authorityChecks += 1;
+        return authorityChecks === 1
+          ? { ok: true, chatMatches: true, canClear: true }
+          : { ok: false, reason: "editor-text-changed", chatMatches: true, canClear: false };
+      }
+      throw new Error("unexpected expression");
+    },
+    async request(method, params) {
+      requests.push({ method, params });
+    },
+  };
+  await assert.rejects(() => sendAndVerifyDouyinReply({
+    cdp,
+    reply: "journaled reply",
+    beforeSend: { messageCount: 0, messages: [] },
+    expectedChatFingerprint: "a".repeat(64),
+    canSend: async () => true,
+    onSendAttempted: async () => { attempted = true; },
+    onSendCancelledBeforeEnter: async () => { rolledBack = true; },
+    sleepFn: async () => {},
+  }), (error) => error instanceof DouyinSendAbortedError
+      && error.reason === "editor-authority-lost");
+  assert.equal(attempted, true);
+  assert.equal(rolledBack, true);
+  assert.equal(authorityChecks >= 2, true);
+  assert.equal(requests.some(({ params }) => params?.key === "Enter"), false);
+  assert.equal(requests.some(({ params }) => params?.key === "Backspace"), false);
+});
+
+test("sends a shared-work reply only with its exact quote binding and quoted fingerprint", async () => {
+  const reply = "quoted reply";
+  const chatFingerprint = "b".repeat(64);
+  const mediaMessage = {
+    ordinalFromEnd: 1,
+    fingerprint: "c".repeat(64),
+    kind: "media",
+    side: "left",
+  };
+  const expectedFingerprint = computeQuotedTextMessageFingerprint(reply);
+  const quoteTargetFingerprint = "d".repeat(64);
+  const quoteNonce = "e".repeat(24);
+  const requests = [];
+  let attemptedFingerprint = null;
+  let attemptedQuoteTargetFingerprint = null;
+  let quoteBound = false;
+  let outgoingObserved = false;
+  let releasedAfterOutgoing = false;
+  const cdp = {
+    async evaluate(expression) {
+      if (expression.includes("chat-input-not-empty")) return { ok: true };
+      if (expression.includes("state: 'armed'")) {
+        return { ok: true, state: "armed", resumed: false };
+      }
+      if (expression.includes("incoming-media-reaction-target-changed")) {
+        return { ok: true, chatFingerprint, point: { x: 120, y: 240 } };
+      }
+      if (expression.includes("media-reply-action-unavailable-or-ambiguous")) {
+        return expression.includes("button.click()")
+          ? { ok: true, activated: true }
+          : { ok: true, activated: false };
+      }
+      if (expression.includes("media-quote-binding-identity-changed")) {
+        quoteBound = true;
+        return { ok: true };
+      }
+      if (expression.includes("const editor = document.querySelector")
+          && !expression.includes("visibleEditors")) return { ok: true };
+      if (expression.includes("visibleEditors.length !== 1")) {
+        assert.equal(quoteBound, true);
+        return { ok: true, chatMatches: true, canClear: true };
+      }
+      if (expression.includes("media-quote-binding-lost")
+          && expression.includes("media-quote-send-cleanup-unverified")) {
+        releasedAfterOutgoing = outgoingObserved;
+        return { ok: true };
+      }
+      if (expression.includes("atBottom:")) return { ok: true };
+      if (expression.includes("const captured =")) {
+        outgoingObserved = true;
+        return {
+          chatFingerprint,
+          messageCount: 1,
+          messages: [{
+            ordinalFromEnd: 1,
+            fingerprint: expectedFingerprint,
+            kind: "text",
+            side: "right",
+            quoteTargetFingerprint,
+          }],
+        };
+      }
+      throw new Error("unexpected expression");
+    },
+    async request(method, params) {
+      requests.push({ method, params });
+    },
+  };
+  const result = await sendAndVerifyDouyinReply({
+    cdp,
+    reply,
+    beforeSend: { messageCount: 0, messages: [] },
+    expectedChatFingerprint: chatFingerprint,
+    quoteTarget: mediaMessage,
+    quoteTargetFingerprint,
+    quoteNonce,
+    canSend: async () => true,
+    onSendAttempted: async ({
+      expectedFingerprint: fingerprint,
+      expectedQuoteTargetFingerprint,
+    }) => {
+      attemptedFingerprint = fingerprint;
+      attemptedQuoteTargetFingerprint = expectedQuoteTargetFingerprint;
+    },
+    sleepFn: async () => {},
+  });
+  assert.equal(attemptedFingerprint, expectedFingerprint);
+  assert.equal(attemptedQuoteTargetFingerprint, quoteTargetFingerprint);
+  assert.equal(result.outgoing?.fingerprint, expectedFingerprint);
+  assert.equal(releasedAfterOutgoing, true);
+  assert.equal(requests.filter(({ params }) => params?.key === "Enter").length, 2);
+});
+
+test("resumes an exact pre-journal quoted draft without inserting the text twice", async () => {
+  const reply = "quoted reply";
+  const chatFingerprint = "b".repeat(64);
+  const quoteTargetFingerprint = "d".repeat(64);
+  const quoteNonce = "e".repeat(24);
+  const expectedFingerprint = computeQuotedTextMessageFingerprint(reply);
+  const mediaMessage = {
+    ordinalFromEnd: 1,
+    fingerprint: "c".repeat(64),
+    kind: "media",
+    side: "left",
+  };
+  const requests = [];
+  let authorityChecks = 0;
+  const result = await sendAndVerifyDouyinReply({
+    cdp: {
+      async evaluate(expression) {
+        if (expression.includes("state: 'bound'")) {
+          return { ok: true, state: "bound", resumed: true, draftPresent: true };
+        }
+        if (expression.includes("visibleEditors.length !== 1")) {
+          authorityChecks += 1;
+          return { ok: true, chatMatches: true, canClear: true };
+        }
+        if (expression.includes("atBottom:")) return { ok: true };
+        if (expression.includes("const captured =")) {
+          return {
+            chatFingerprint,
+            messageCount: 1,
+            messages: [{
+              ordinalFromEnd: 1,
+              fingerprint: expectedFingerprint,
+              kind: "text",
+              side: "right",
+              quoteTargetFingerprint,
+            }],
+          };
+        }
+        if (expression.includes("media-quote-send-cleanup-unverified")) return { ok: true };
+        throw new Error("unexpected expression");
+      },
+      async request(method, params) {
+        requests.push({ method, params });
+      },
+    },
+    reply,
+    beforeSend: { messageCount: 0, messages: [] },
+    expectedChatFingerprint: chatFingerprint,
+    quoteTarget: mediaMessage,
+    quoteTargetFingerprint,
+    quoteNonce,
+    canSend: async () => true,
+    sleepFn: async () => {},
+  });
+  assert.equal(result.outgoing?.fingerprint, expectedFingerprint);
+  assert.equal(authorityChecks >= 3, true);
+  assert.equal(requests.some(({ method }) => method === "Input.insertText"), false);
+  assert.equal(requests.filter(({ params }) => params?.key === "Enter").length, 2);
+});
+
+test("keeps quote ownership through Enter verification and cleans an exact no-op draft", async () => {
+  const reply = "quoted reply";
+  const chatFingerprint = "b".repeat(64);
+  const quoteTargetFingerprint = "d".repeat(64);
+  const quoteNonce = "e".repeat(24);
+  const mediaMessage = {
+    ordinalFromEnd: 1,
+    fingerprint: "c".repeat(64),
+    kind: "media",
+    side: "left",
+  };
+  const requests = [];
+  let metadataReads = 0;
+  let cleanupVerified = false;
+  const result = await sendAndVerifyDouyinReply({
+    cdp: {
+      async evaluate(expression) {
+        if (expression.includes("chat-input-not-empty")) return { ok: true };
+        if (expression.includes("state: 'armed'")) {
+          return { ok: true, state: "armed", resumed: false };
+        }
+        if (expression.includes("incoming-media-reaction-target-changed")) {
+          return { ok: true, chatFingerprint, point: { x: 120, y: 240 } };
+        }
+        if (expression.includes("media-reply-action-unavailable-or-ambiguous")) {
+          return expression.includes("button.click()")
+            ? { ok: true, activated: true }
+            : { ok: true, activated: false };
+        }
+        if (expression.includes("media-quote-binding-identity-changed")) return { ok: true };
+        if (expression.includes("visibleEditors.length !== 1")) {
+          return { ok: true, chatMatches: true, canClear: true };
+        }
+        if (expression.includes("media-quote-cleanup-unverified")) {
+          cleanupVerified = true;
+          return { ok: true };
+        }
+        if (expression.includes("const editor = document.querySelector")
+            && !expression.includes("visibleEditors")) return { ok: true };
+        if (expression.includes("atBottom:")) return { ok: true };
+        if (expression.includes("const captured =")) {
+          metadataReads += 1;
+          return { chatFingerprint, messageCount: 0, messages: [] };
+        }
+        if (expression.includes("media-quote-cancel-authority-lost")) {
+          return { ok: true, point: { x: 20, y: 20 } };
+        }
+        throw new Error("unexpected expression");
+      },
+      async request(method, params) {
+        requests.push({ method, params });
+      },
+    },
+    reply,
+    beforeSend: { messageCount: 0, messages: [] },
+    expectedChatFingerprint: chatFingerprint,
+    quoteTarget: mediaMessage,
+    quoteTargetFingerprint,
+    quoteNonce,
+    canSend: async () => true,
+    sleepFn: async () => {},
+  });
+  assert.equal(result.outgoing, null);
+  assert.equal(metadataReads, 10);
+  assert.equal(cleanupVerified, true);
+  assert.equal(requests.filter(({ params }) => params?.key === "Enter").length, 2);
+  assert.equal(requests.filter(({ params }) => params?.button === "left").length, 2);
 });
 
 const snapshot = {

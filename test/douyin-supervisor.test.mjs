@@ -9,6 +9,7 @@ import {
   createDouyinSupervisor,
   findInstalledEdge,
   loadSupervisorConfig,
+  saveSupervisorConfig,
 } from "../src/douyin-supervisor.mjs";
 
 class FakeChild extends EventEmitter {
@@ -48,6 +49,20 @@ async function temporaryRoot(t) {
 function readyFetch() {
   return Promise.resolve({ ok: true });
 }
+
+test("uses isolated temporary files for overlapping atomic config writes", async (t) => {
+  const root = await temporaryRoot(t);
+  const configPath = path.join(root, ".runtime", "supervisor", "config.json");
+  const base = await loadSupervisorConfig(configPath);
+  const writes = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => (
+    saveSupervisorConfig(configPath, {
+      ...base,
+      mediaReactionEnabled: Boolean(index % 2),
+    })
+  )));
+  assert.equal(writes.every(({ status }) => status === "fulfilled"), true);
+  assert.equal((await loadSupervisorConfig(configPath)).version, 1);
+});
 
 test("finds Edge in Windows Program Files without duplicate candidates", () => {
   assert.deepEqual(findInstalledEdge({

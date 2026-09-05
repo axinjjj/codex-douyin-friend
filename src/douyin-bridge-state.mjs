@@ -29,7 +29,15 @@ function hasExactKeys(value, expectedKeys) {
 }
 
 function normalizeMessageMetadata(message) {
-  if (!hasExactKeys(message, ["fingerprint", "kind", "side"])) {
+  const baseKeys = ["fingerprint", "kind", "side"];
+  const hasQuoteTarget = Object.hasOwn(message ?? {}, "quoteTargetFingerprint");
+  const hasLegacyFingerprint = Object.hasOwn(message ?? {}, "legacyFingerprint");
+  const expectedKeys = [
+    ...baseKeys,
+    ...(hasQuoteTarget ? ["quoteTargetFingerprint"] : []),
+    ...(hasLegacyFingerprint ? ["legacyFingerprint"] : []),
+  ];
+  if (!hasExactKeys(message, expectedKeys)) {
     throw new Error("Bridge state contains unsupported message metadata.");
   }
   if (!MESSAGE_FINGERPRINT_PATTERN.test(message.fingerprint)) {
@@ -38,10 +46,35 @@ function normalizeMessageMetadata(message) {
   if (!KINDS.has(message.kind) || !SIDES.has(message.side)) {
     throw new Error("Bridge state contains invalid message metadata.");
   }
-  return {
+  if (hasQuoteTarget && (!MESSAGE_FINGERPRINT_PATTERN.test(message.quoteTargetFingerprint)
+      || message.kind !== "text" || message.side !== "right")) {
+    throw new Error("Bridge state contains an invalid quote target fingerprint.");
+  }
+  if (hasLegacyFingerprint && (!MESSAGE_FINGERPRINT_PATTERN.test(message.legacyFingerprint)
+      || message.kind !== "text" || message.side !== "right")) {
+    throw new Error("Bridge state contains an invalid legacy message fingerprint.");
+  }
+  const normalized = {
     fingerprint: message.fingerprint,
     kind: message.kind,
     side: message.side,
+  };
+  if (hasQuoteTarget) normalized.quoteTargetFingerprint = message.quoteTargetFingerprint;
+  if (hasLegacyFingerprint) normalized.legacyFingerprint = message.legacyFingerprint;
+  return normalized;
+}
+
+function messageMetadataInput(message) {
+  return {
+    fingerprint: message?.fingerprint,
+    kind: message?.kind,
+    side: message?.side,
+    ...(message?.quoteTargetFingerprint
+      ? { quoteTargetFingerprint: message.quoteTargetFingerprint }
+      : {}),
+    ...(message?.legacyFingerprint
+      ? { legacyFingerprint: message.legacyFingerprint }
+      : {}),
   };
 }
 
@@ -60,11 +93,9 @@ export function normalizeBridgeSnapshot(snapshot) {
   }
   return {
     messageCount: snapshot.messageCount,
-    messages: snapshot.messages.map((message) => normalizeMessageMetadata({
-      fingerprint: message?.fingerprint,
-      kind: message?.kind,
-      side: message?.side,
-    })),
+    messages: snapshot.messages.map((message) => normalizeMessageMetadata(
+      messageMetadataInput(message),
+    )),
   };
 }
 
@@ -91,11 +122,7 @@ export function createBridgeState({
     checkpoint: {
       phase,
       snapshot: normalizeBridgeSnapshot(snapshot),
-      pending: pending.map((message) => normalizeMessageMetadata({
-        fingerprint: message?.fingerprint,
-        kind: message?.kind,
-        side: message?.side,
-      })),
+      pending: pending.map((message) => normalizeMessageMetadata(messageMetadataInput(message))),
       outboundFingerprint,
       blockedReason,
       action,
@@ -321,9 +348,19 @@ export async function saveBridgeState(projectRoot, state) {
 }
 
 function sameMessage(left, right) {
-  return left.fingerprint === right.fingerprint
-    && left.kind === right.kind
-    && left.side === right.side;
+  if (left.side !== right.side) return false;
+  const directIdentity = left.fingerprint === right.fingerprint && left.kind === right.kind;
+  const legacyIdentity = left.legacyFingerprint === right.fingerprint
+    || right.legacyFingerprint === left.fingerprint;
+  const sameBase = directIdentity || legacyIdentity;
+  if (!sameBase) return false;
+  const leftQuoteTarget = left.quoteTargetFingerprint ?? null;
+  const rightQuoteTarget = right.quoteTargetFingerprint ?? null;
+  if (leftQuoteTarget === null && rightQuoteTarget === null) return true;
+  if (leftQuoteTarget !== null && rightQuoteTarget !== null) {
+    return leftQuoteTarget === rightQuoteTarget;
+  }
+  return legacyIdentity;
 }
 
 export function rebindPendingMessages(snapshot, pendingMessages) {
@@ -332,11 +369,9 @@ export function rebindPendingMessages(snapshot, pendingMessages) {
       || pendingMessages.length > MAX_VISIBLE_MESSAGES) {
     throw new Error("A bounded pending-message queue is required.");
   }
-  const pending = pendingMessages.map((message) => normalizeMessageMetadata({
-    fingerprint: message?.fingerprint,
-    kind: message?.kind,
-    side: message?.side,
-  }));
+  const pending = pendingMessages.map((message) => normalizeMessageMetadata(
+    messageMetadataInput(message),
+  ));
   const rebound = new Array(pending.length);
   let currentIndex = current.messages.length - 1;
   for (let pendingIndex = pending.length - 1; pendingIndex >= 0; pendingIndex -= 1) {
@@ -424,6 +459,24 @@ export function findAppendedMessages(previousSnapshot, currentSnapshot) {
 export function computeTextMessageFingerprint(text, side = "right") {
   if (side !== "left" && side !== "right") throw new Error("Text message side is invalid.");
   const structuralKey = ["text", side, String(text ?? "").trim()].join("|");
+  return createHash("sha256").update(structuralKey, "utf8").digest("hex");
+}
+
+export function computeQuotedTextMessageFingerprint(
+  text,
+  side = "right",
+  quoteKind = "shared-work",
+) {
+  if (side !== "left" && side !== "right") throw new Error("Quoted text message side is invalid.");
+  if (quoteKind !== "shared-work" && quoteKind !== "unknown") {
+    throw new Error("Quoted text message reference kind is invalid.");
+  }
+  const structuralKey = [
+    "quoted-text-v1",
+    side,
+    quoteKind,
+    String(text ?? "").trim(),
+  ].join("|");
   return createHash("sha256").update(structuralKey, "utf8").digest("hex");
 }
 
@@ -533,9 +586,12 @@ export function recoverBridgeStateForStartup(state, currentSnapshot) {
   const current = normalizeBridgeSnapshot(currentSnapshot);
   const appended = findAppendedMessages(normalized.checkpoint.snapshot, current);
   const outgoing = appended.filter((message) => message.side === "right");
+  const expectedQuoteTarget = action?.quoteTargetFingerprint ?? null;
   const sent = outgoing.length === 1
     && outgoing[0].kind === "text"
-    && outgoing[0].fingerprint === normalized.checkpoint.outboundFingerprint;
+    && outgoing[0].fingerprint === normalized.checkpoint.outboundFingerprint
+    && (expectedQuoteTarget === null
+      || outgoing[0].quoteTargetFingerprint === expectedQuoteTarget);
   if (!sent) {
     throw new Error("The previous Douyin send cannot be verified; refusing to resend.");
   }

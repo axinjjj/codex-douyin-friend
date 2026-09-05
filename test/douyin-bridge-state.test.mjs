@@ -8,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   acquireBridgeRunLock,
+  computeQuotedTextMessageFingerprint,
   computeTextMessageFingerprint,
   createBridgeState,
   findAppendedMessages,
@@ -28,6 +29,16 @@ const message = (character, side = "left", kind = "text") => ({
   side,
 });
 const snapshot = (messageCount, messages) => ({ messageCount, messages });
+
+test("uses a distinct deterministic fingerprint for quoted shared-work replies", () => {
+  const plain = computeTextMessageFingerprint("reply");
+  const quoted = computeQuotedTextMessageFingerprint("reply");
+  assert.notEqual(quoted, plain);
+  assert.equal(quoted, computeQuotedTextMessageFingerprint(" reply "));
+  assert.notEqual(quoted, computeQuotedTextMessageFingerprint("reply", "right", "unknown"));
+  assert.throws(() => computeQuotedTextMessageFingerprint("reply", "center"));
+  assert.throws(() => computeQuotedTextMessageFingerprint("reply", "right", "video"));
+});
 
 function readyState(checkpointSnapshot = snapshot(1, [message("a")])) {
   return createBridgeState({
@@ -240,6 +251,31 @@ test("does not invent an append when an unchanged fixed window has duplicate fin
   const duplicate = message("same", "left", "media");
   const unchanged = snapshot(30, Array.from({ length: 12 }, () => ({ ...duplicate })));
   assert.deepEqual(findAppendedMessages(unchanged, unchanged), []);
+});
+
+test("migrates only an explicitly aliased legacy outgoing quote checkpoint", () => {
+  const legacyFingerprint = "a".repeat(64);
+  const currentFingerprint = "b".repeat(64);
+  const quoteTargetFingerprint = "c".repeat(64);
+  const legacy = snapshot(1, [{
+    fingerprint: legacyFingerprint,
+    kind: "media",
+    side: "right",
+  }]);
+  const current = snapshot(1, [{
+    fingerprint: currentFingerprint,
+    kind: "text",
+    side: "right",
+    quoteTargetFingerprint,
+    legacyFingerprint,
+  }]);
+  assert.deepEqual(findAppendedMessages(legacy, current), []);
+  assert.throws(() => findAppendedMessages(current, snapshot(1, [{
+    fingerprint: currentFingerprint,
+    kind: "text",
+    side: "right",
+    legacyFingerprint,
+  }])), /no longer matches/u);
 });
 
 test("refuses a fixed-size DOM replacement without a reliable overlap boundary", () => {

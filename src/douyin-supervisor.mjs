@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -13,6 +14,7 @@ const EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "m
 const RESTART_DELAYS_MS = [2_000, 5_000, 15_000, 60_000];
 const RESTART_WINDOW_MS = 10 * 60_000;
 const MAX_RESTARTS_PER_WINDOW = 6;
+const configWriteChains = new Map();
 const DEFAULT_CONFIG = Object.freeze({
   version: 1,
   model: "gpt-5.6-sol",
@@ -61,15 +63,24 @@ export async function loadSupervisorConfig(configPath) {
 
 export async function saveSupervisorConfig(configPath, config) {
   const validated = validateConfig(config);
-  await fs.mkdir(path.dirname(configPath), { recursive: true });
-  const temporaryPath = `${configPath}.tmp-${process.pid}`;
+  const predecessor = configWriteChains.get(configPath) ?? Promise.resolve();
+  const operation = predecessor.catch(() => {}).then(async () => {
+    await fs.mkdir(path.dirname(configPath), { recursive: true });
+    const temporaryPath = `${configPath}.tmp-${process.pid}-${randomUUID()}`;
+    try {
+      await fs.writeFile(temporaryPath, `${JSON.stringify(validated, null, 2)}\n`, "utf8");
+      await fs.rename(temporaryPath, configPath);
+    } finally {
+      await fs.rm(temporaryPath, { force: true }).catch(() => {});
+    }
+    return validated;
+  });
+  configWriteChains.set(configPath, operation);
   try {
-    await fs.writeFile(temporaryPath, `${JSON.stringify(validated, null, 2)}\n`, "utf8");
-    await fs.rename(temporaryPath, configPath);
+    return await operation;
   } finally {
-    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+    if (configWriteChains.get(configPath) === operation) configWriteChains.delete(configPath);
   }
-  return validated;
 }
 
 export function acquireSupervisorLock(pipeName = "codex-douyin-supervisor-v1") {

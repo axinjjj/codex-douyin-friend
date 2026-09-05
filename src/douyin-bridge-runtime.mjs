@@ -14,7 +14,15 @@ import {
   verifyChatEditorReady,
 } from "./douyin-editor-control.mjs";
 import { findExpectedNewOutgoingMessage } from "./douyin-chat-snapshot.mjs";
-import { computeTextMessageFingerprint } from "./douyin-bridge-state.mjs";
+import {
+  computeQuotedTextMessageFingerprint,
+  computeTextMessageFingerprint,
+} from "./douyin-bridge-state.mjs";
+import {
+  bindIncomingDouyinMediaQuote,
+  cancelBoundDouyinMediaQuote,
+  releaseBoundDouyinMediaQuote,
+} from "./douyin-message-quote.mjs";
 import { MAX_FINAL_FRAME_COUNT } from "./video-frame-selection.mjs";
 import { DOUYIN_EVIDENCE_MODES } from "./douyin-media-evidence.mjs";
 
@@ -587,30 +595,98 @@ export async function sendAndVerifyDouyinReply({
   reply,
   beforeSend,
   expectedChatFingerprint,
+  quoteTarget = null,
+  quoteTargetFingerprint = null,
+  quoteNonce = null,
   shouldStop = () => false,
   canSend = async () => true,
   onSendAttempted = async () => {},
+  onSendCancelledBeforeEnter = async () => {},
+  sleepFn = sleep,
 }) {
+  if (typeof sleepFn !== "function") throw new Error("A Douyin send sleep function is required.");
+  if (typeof onSendAttempted !== "function" || typeof onSendCancelledBeforeEnter !== "function") {
+    throw new Error("Douyin send journal callbacks are required.");
+  }
+  if (quoteTarget && (!/^[0-9a-f]{64}$/u.test(quoteTargetFingerprint || "")
+      || !/^[0-9a-f]{24}$/u.test(quoteNonce || ""))) {
+    throw new Error("A stable Douyin quote target and nonce are required.");
+  }
+  if (!quoteTarget && (quoteTargetFingerprint !== null || quoteNonce !== null)) {
+    throw new Error("Douyin quote metadata was supplied without a quote target.");
+  }
   if (shouldStop()) {
     throw new DouyinSendAbortedError("Bridge stop requested before editor insertion.", "stop");
   }
   if (!(await canSend())) {
     throw new DouyinSendAbortedError("The active Douyin chat changed before editor insertion.", "chat-changed");
   }
-  const expectedFingerprint = computeTextMessageFingerprint(reply);
-  const insertion = await replaceChatEditorText(cdp, reply);
-  if (!insertion?.ok) {
+  const expectedFingerprint = quoteTarget
+    ? computeQuotedTextMessageFingerprint(reply)
+    : computeTextMessageFingerprint(reply);
+  const quoteBinding = quoteTarget ? {
+    message: quoteTarget,
+    nonce: quoteNonce,
+    quoteTargetFingerprint,
+  } : null;
+  const verifyOwnedDraft = () => verifyChatEditorReady(cdp, {
+    expectedText: reply,
+    expectedChatFingerprint,
+    quoteBinding,
+  });
+  const clearOwnedDraft = async () => {
+    const authority = await verifyOwnedDraft().catch(() => null);
+    if (!authority?.ok) return false;
     await focusAndClearChatEditor(cdp);
+    return true;
+  };
+  let quoteBound = false;
+  let quoteDraftPresent = false;
+  if (quoteTarget) {
+    try {
+      const quote = await bindIncomingDouyinMediaQuote({
+        cdp,
+        message: quoteTarget,
+        expectedChatFingerprint,
+        quoteNonce,
+        quoteTargetFingerprint,
+        expectedText: reply,
+        sleepFn,
+      });
+      quoteBound = true;
+      quoteDraftPresent = quote.draftPresent;
+    } catch {
+      throw new DouyinSendAbortedError(
+        "Douyin media quote authority could not be established; refusing to send.",
+        "quote-authority-lost",
+      );
+    }
+  }
+  const insertion = quoteDraftPresent
+    ? await verifyOwnedDraft()
+    : await replaceChatEditorText(cdp, reply);
+  if (!insertion?.ok) {
     throw new Error("Douyin editor did not accept the complete reply; refusing to press Enter.");
   }
 
-  await sleep(250);
+  await sleepFn(250);
   const sendStillSafe = await canSend();
   if (shouldStop() || !sendStillSafe) {
-    if (sendStillSafe) await focusAndClearChatEditor(cdp);
+    if (sendStillSafe) {
+      const cleared = await clearOwnedDraft();
+      if (quoteBound && cleared) {
+        await cancelBoundDouyinMediaQuote({
+          cdp,
+          expectedChatFingerprint,
+          quoteNonce,
+          quoteTargetFingerprint,
+          sleepFn,
+        }).catch(() => {});
+      }
+    }
     throw new DouyinSendAbortedError(
       sendStillSafe
-        ? "Bridge stop requested before Enter; the editor was cleared."
+        ? "Bridge stop requested before Enter; refusing to send."
         : "The active Douyin chat changed before Enter; refusing to touch the new editor.",
       sendStillSafe ? "stop" : "chat-changed",
     );
@@ -618,17 +694,61 @@ export async function sendAndVerifyDouyinReply({
   const editorAuthority = await verifyChatEditorReady(cdp, {
     expectedText: reply,
     expectedChatFingerprint,
+    quoteBinding,
   });
   if (!editorAuthority?.ok) {
-    if (editorAuthority?.chatMatches && editorAuthority?.canClear) {
-      await focusAndClearChatEditor(cdp).catch(() => {});
+    const cleared = await clearOwnedDraft();
+    if (quoteBound && cleared) {
+      await cancelBoundDouyinMediaQuote({
+        cdp,
+        expectedChatFingerprint,
+        quoteNonce,
+        quoteTargetFingerprint,
+        sleepFn,
+      }).catch(() => {});
     }
     throw new DouyinSendAbortedError(
       "Douyin editor authority was lost before Enter; refusing to send.",
       "editor-authority-lost",
     );
   }
-  await onSendAttempted({ expectedFingerprint });
+  try {
+    await onSendAttempted({
+      expectedFingerprint,
+      expectedQuoteTargetFingerprint: quoteTargetFingerprint,
+    });
+  } catch (error) {
+    await onSendCancelledBeforeEnter();
+    const cleared = await clearOwnedDraft();
+    if (quoteBound && cleared) {
+      await cancelBoundDouyinMediaQuote({
+        cdp,
+        expectedChatFingerprint,
+        quoteNonce,
+        quoteTargetFingerprint,
+        sleepFn,
+      }).catch(() => {});
+    }
+    throw error;
+  }
+  const finalEditorAuthority = await verifyOwnedDraft();
+  if (!finalEditorAuthority?.ok) {
+    await onSendCancelledBeforeEnter();
+    const cleared = await clearOwnedDraft();
+    if (quoteBound && cleared) {
+      await cancelBoundDouyinMediaQuote({
+        cdp,
+        expectedChatFingerprint,
+        quoteNonce,
+        quoteTargetFingerprint,
+        sleepFn,
+      }).catch(() => {});
+    }
+    throw new DouyinSendAbortedError(
+      "Douyin editor authority changed after journaling; refusing to send.",
+      "editor-authority-lost",
+    );
+  }
   await cdp.request("Input.dispatchKeyEvent", {
     type: "rawKeyDown",
     key: "Enter",
@@ -643,11 +763,10 @@ export async function sendAndVerifyDouyinReply({
     windowsVirtualKeyCode: 13,
     nativeVirtualKeyCode: 13,
   });
-
   let afterSend = beforeSend;
   let outgoing = null;
   for (let attempt = 0; attempt < 10 && !outgoing; attempt += 1) {
-    await sleep(500);
+    await sleepFn(500);
     const tail = await cdp.evaluate(buildEnsureChatTailVisibleExpression());
     if (!tail?.ok) throw new Error("The Douyin message tail is unavailable after sending.");
     afterSend = await cdp.evaluate(buildChatMessageMetadataExpression());
@@ -655,7 +774,27 @@ export async function sendAndVerifyDouyinReply({
       beforeSend,
       afterSend,
       expectedFingerprint,
+      quoteTargetFingerprint,
     );
+  }
+  if (quoteBound && outgoing) {
+    await releaseBoundDouyinMediaQuote({
+      cdp,
+      expectedChatFingerprint,
+      quoteNonce,
+      quoteTargetFingerprint,
+    });
+  } else if (quoteBound && !outgoing) {
+    const cleared = await clearOwnedDraft();
+    if (cleared) {
+      await cancelBoundDouyinMediaQuote({
+        cdp,
+        expectedChatFingerprint,
+        quoteNonce,
+        quoteTargetFingerprint,
+        sleepFn,
+      });
+    }
   }
   return { outgoing, afterSend };
 }

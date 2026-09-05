@@ -90,3 +90,29 @@ test("accepts only the exact expected outgoing as send verification", () => {
     null,
   );
 });
+
+test("requires the exact quoted shared-work identity when one is expected", () => {
+  const target = "a".repeat(64);
+  const current = {
+    messages: [{
+      fingerprint: "expected",
+      quoteTargetFingerprint: target,
+      side: "right",
+      ordinalFromEnd: 1,
+    }],
+  };
+  assert.equal(
+    findExpectedNewOutgoingMessage({ messages: [] }, current, "expected", target)
+      ?.quoteTargetFingerprint,
+    target,
+  );
+  assert.equal(
+    findExpectedNewOutgoingMessage(
+      { messages: [] },
+      current,
+      "expected",
+      "b".repeat(64),
+    ),
+    null,
+  );
+});

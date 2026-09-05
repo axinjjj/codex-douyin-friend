@@ -28,6 +28,7 @@ export function findExpectedNewOutgoingMessage(
   previousSnapshot,
   currentSnapshot,
   expectedFingerprint,
+  expectedQuoteTargetFingerprint = null,
 ) {
   const previousCounts = new Map();
   for (const message of previousSnapshot?.messages ?? []) {
@@ -47,7 +48,10 @@ export function findExpectedNewOutgoingMessage(
     }
   }
 
-  return newOutgoing.length === 1 && newOutgoing[0].fingerprint === expectedFingerprint
+  return newOutgoing.length === 1
+    && newOutgoing[0].fingerprint === expectedFingerprint
+    && (expectedQuoteTargetFingerprint === null
+      || newOutgoing[0].quoteTargetFingerprint === expectedQuoteTargetFingerprint)
     ? newOutgoing[0]
     : null;
 }

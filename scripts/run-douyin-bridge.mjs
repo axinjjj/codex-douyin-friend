@@ -38,6 +38,7 @@ import {
 import { planDouyinIncomingQueue } from "../src/douyin-inbound-planner.mjs";
 import {
   acquireBridgeRunLock,
+  computeQuotedTextMessageFingerprint,
   computeTextMessageFingerprint,
   createBridgeState,
   findAppendedMessages,
@@ -54,6 +55,10 @@ import {
 } from "../src/douyin-image-runtime.mjs";
 import { acquireDouyinMedia } from "../src/douyin-media-pipeline.mjs";
 import { likeIncomingDouyinMediaMessage } from "../src/douyin-media-reaction.mjs";
+import {
+  cleanupRecoveredDouyinMediaQuote,
+  shouldQuoteDouyinMediaReply,
+} from "../src/douyin-message-quote.mjs";
 import {
   cleanupStaleVideoAnalysisJobs,
   removeVideoAnalysisJob,
@@ -74,6 +79,7 @@ import {
   computeDouyinReplyDigest,
   computeDouyinTurnPromptDigest,
   createDouyinAction,
+  rollbackDouyinActionBeforeEnter,
   transitionDouyinAction,
 } from "../src/douyin-action-journal.mjs";
 
@@ -262,6 +268,16 @@ try {
       ? recovery.queuedPending
       : null;
     startupResumeAction = recovery.resumeAction ?? null;
+    // Keep the original sending checkpoint durable until quote cleanup succeeds.
+    // A crash here will therefore repeat the same idempotent recovery on restart.
+    if (recoveredVerifiedSend && startupResumeAction?.quoteTargetFingerprint) {
+      await cleanupRecoveredDouyinMediaQuote({
+        cdp,
+        expectedChatFingerprint: lockedChat.fingerprint,
+        quoteNonce: startupResumeAction.id.slice(0, 24),
+        quoteTargetFingerprint: startupResumeAction.quoteTargetFingerprint,
+      });
+    }
     if (recoveredVerifiedSend || recoveredForFreshThread || startupQueuedPending) {
       await saveBridgeState(projectRoot, storedState);
     }
@@ -339,12 +355,6 @@ try {
         && startupResumeAction.replyDigest !== replyDigest) {
       throw new Error("The persisted Codex reply digest does not match the recovered turn.");
     }
-    if (startupResumeAction.stage === "turn-started") {
-      startupResumeAction = transitionDouyinAction(startupResumeAction, "reply-ready", {
-        replyDigest,
-        reactionDecision,
-      });
-    }
     resumedReply = {
       action: startupResumeAction,
       reply: recoveredReply,
@@ -360,9 +370,8 @@ try {
       effort: runtime.effort,
       generation: taskGeneration,
       snapshot: previous,
-      phase: "reply-ready",
+      phase: "queued",
       pending: queuedIncoming,
-      outboundFingerprint: computeTextMessageFingerprint(resumedReply.reply),
       action: resumedReply.action,
     })
     : queuedIncoming
@@ -898,13 +907,69 @@ try {
         }
       }
 
-      const outboundFingerprint = computeTextMessageFingerprint(reply);
+      const sendPreparationMetadata = await cdp.evaluate(buildChatMessageMetadataExpression());
+      if (sendPreparationMetadata.chatFingerprint !== lockedChat.fingerprint) {
+        throw new Error("The active Douyin chat changed while preparing a reply; refusing to send.");
+      }
+      const sendPreparationSnapshot = normalizeBridgeSnapshot({
+        messageCount: sendPreparationMetadata.messageCount,
+        messages: sendPreparationMetadata.messages,
+      });
+      const activityBeforeSend = findAppendedMessages(current, sendPreparationSnapshot);
+      if (activityBeforeSend.some((message) => message.side === "right")
+          || activityBeforeSend.some((message) => (
+            message.side === "left" && message.kind !== "text" && message.kind !== "media"
+          ))) {
+        throw new Error("Ambiguous Douyin activity appeared while preparing a reply.");
+      }
+      let discoveredQuoteTarget = null;
+      let discoveredQuoteTargetFingerprint = null;
+      if (incomingBatch.mediaMessage) {
+        const rebasedMediaMessage = {
+          ...incomingBatch.mediaMessage,
+          ordinalFromEnd: incomingBatch.mediaMessage.ordinalFromEnd + activityBeforeSend.length,
+        };
+        const sendMediaClassification = await cdp.evaluate(
+          buildClassifyLatestIncomingMediaExpression(rebasedMediaMessage),
+        );
+        if (!sendMediaClassification?.ok) {
+          throw new Error("The incoming Douyin media changed before reply preparation.");
+        }
+        if (shouldQuoteDouyinMediaReply({
+          replyKind,
+          mediaType: sendMediaClassification.mediaType,
+          quoteTargetFingerprint: sendMediaClassification.quoteTargetFingerprint,
+        })) {
+          discoveredQuoteTarget = rebasedMediaMessage;
+          discoveredQuoteTargetFingerprint = sendMediaClassification.quoteTargetFingerprint;
+        }
+      }
+      let quoteTarget = discoveredQuoteTarget;
+      let quoteTargetFingerprint = discoveredQuoteTargetFingerprint;
+      if (currentAction.stage === "reply-ready") {
+        if (currentAction.quoteTargetFingerprint) {
+          if (!discoveredQuoteTarget
+              || discoveredQuoteTargetFingerprint !== currentAction.quoteTargetFingerprint) {
+            throw new Error("The persisted Douyin quote target changed before recovery.");
+          }
+        } else {
+          quoteTarget = null;
+          quoteTargetFingerprint = null;
+        }
+      }
+      const outboundFingerprint = quoteTarget
+        ? computeQuotedTextMessageFingerprint(reply)
+        : computeTextMessageFingerprint(reply);
       if (currentAction.stage === "turn-started") {
         currentAction = transitionDouyinAction(currentAction, "reply-ready", {
           replyDigest: computeDouyinReplyDigest(reply),
           replyKind,
           reactionDecision: reactionDecision ?? "disabled",
+          quoteTargetFingerprint,
         });
+      }
+      if ((currentAction.quoteTargetFingerprint ?? null) !== quoteTargetFingerprint) {
+        throw new Error("The prepared Douyin quote target does not match its action journal.");
       }
       activeState = createBridgeState({
         chatKey: lockedChat.fingerprint,
@@ -934,13 +999,23 @@ try {
         sendResult = await sendAndVerifyDouyinReply({
           cdp,
           reply,
-          beforeSend: currentMetadata,
+          beforeSend: sendPreparationMetadata,
           expectedChatFingerprint: lockedChat.fingerprint,
+          quoteTarget,
+          quoteTargetFingerprint,
+          quoteNonce: quoteTarget ? currentAction.id.slice(0, 24) : null,
           shouldStop: () => stopRequested,
           canSend: async () => {
             return verifyActiveSendCapability();
           },
-          onSendAttempted: async () => {
+          onSendAttempted: async ({
+            expectedFingerprint,
+            expectedQuoteTargetFingerprint,
+          }) => {
+            if (expectedFingerprint !== outboundFingerprint
+                || expectedQuoteTargetFingerprint !== currentAction.quoteTargetFingerprint) {
+              throw new Error("The prepared Douyin outbound fingerprint changed before Enter.");
+            }
             currentAction = transitionDouyinAction(currentAction, "send-attempted");
             activeState = createBridgeState({
               chatKey: lockedChat.fingerprint,
@@ -956,6 +1031,28 @@ try {
             });
             await saveBridgeState(projectRoot, activeState);
             setBridgePhase("sending");
+          },
+          onSendCancelledBeforeEnter: async () => {
+            if (currentAction.stage === "send-attempted") {
+              currentAction = rollbackDouyinActionBeforeEnter(currentAction);
+            }
+            if (currentAction.stage !== "reply-ready") {
+              throw new Error("The cancelled Douyin send action cannot return to reply-ready.");
+            }
+            activeState = createBridgeState({
+              chatKey: lockedChat.fingerprint,
+              threadId: runtime.threadId,
+              model: runtime.model,
+              effort: runtime.effort,
+              generation: taskGeneration,
+              snapshot: current,
+              phase: "reply-ready",
+              pending: incoming,
+              outboundFingerprint,
+              action: currentAction,
+            });
+            await saveBridgeState(projectRoot, activeState);
+            setBridgePhase("reply-ready");
           },
         });
       } catch (error) {
@@ -973,7 +1070,7 @@ try {
           action: currentAction,
         });
         await saveBridgeState(projectRoot, activeState);
-        if (error.reason === "chat-changed" || error.reason === "editor-authority-lost") {
+        if (["chat-changed", "editor-authority-lost", "quote-authority-lost"].includes(error.reason)) {
           process.exitCode = 4;
         }
         setBridgePhase(error.reason === "stop" ? "stopping" : "blocked");
@@ -981,6 +1078,8 @@ try {
           ok: error.reason === "stop",
           event: error.reason === "stop"
             ? "bridge-stop-requested-before-send"
+            : error.reason === "quote-authority-lost"
+              ? "media-quote-authority-lost-before-send"
             : error.reason === "editor-authority-lost"
               ? "editor-authority-lost-before-send"
               : "chat-changed-before-send",
@@ -1020,6 +1119,8 @@ try {
       const outgoingDuringSend = appendedDuringSend.filter((message) => message.side === "right");
       const unexpectedOutgoing = outgoingDuringSend.filter((message) => (
         message.kind !== "text" || message.fingerprint !== outboundFingerprint
+        || (currentAction.quoteTargetFingerprint !== null
+          && message.quoteTargetFingerprint !== currentAction.quoteTargetFingerprint)
       ));
       const incomingDuringSend = appendedDuringSend.filter((message) => (
         message.side === "left" && (message.kind === "text" || message.kind === "media")

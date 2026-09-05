@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 const HASH_PATTERN = /^[0-9a-f]{64}$/u;
 const TURN_ID_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/u;
 const REACTION_NONCE_PATTERN = /^[0-9a-f]{24}$/u;
+const QUOTE_TARGET_PATTERN = /^[0-9a-f]{64}$/u;
 const STAGES = new Set([
   "planned",
   "evidence-ready",
@@ -52,7 +53,7 @@ function normalizeReactionTarget(value) {
 }
 
 export function validateDouyinAction(value) {
-  if (!exactObject(value, [
+  const versionOneKeys = [
     "version",
     "id",
     "generation",
@@ -65,10 +66,14 @@ export function validateDouyinAction(value) {
     "reactionDecision",
     "reactionTarget",
     "reactionOrdinalShift",
-  ])) {
+  ];
+  const versionTwoKeys = [...versionOneKeys, "quoteTargetFingerprint"];
+  const isVersionOne = value?.version === 1 && exactObject(value, versionOneKeys);
+  const isVersionTwo = value?.version === 2 && exactObject(value, versionTwoKeys);
+  if (!isVersionOne && !isVersionTwo) {
     throw new Error("Douyin action journal entry has an invalid shape.");
   }
-  if (value.version !== 1 || !HASH_PATTERN.test(value.id)
+  if (!HASH_PATTERN.test(value.id)
       || !Number.isSafeInteger(value.generation) || value.generation < 1
       || !STAGES.has(value.stage)) {
     throw new Error("Douyin action journal entry is invalid.");
@@ -97,8 +102,14 @@ export function validateDouyinAction(value) {
       || value.reactionOrdinalShift < 0 || value.reactionOrdinalShift > 12) {
     throw new Error("Douyin action reaction ordinal shift is invalid.");
   }
+  const quoteTargetFingerprint = isVersionOne ? null : value.quoteTargetFingerprint;
+  if (quoteTargetFingerprint !== null && !QUOTE_TARGET_PATTERN.test(quoteTargetFingerprint)) {
+    throw new Error("Douyin action quote target fingerprint is invalid.");
+  }
   const normalized = {
     ...value,
+    version: 2,
+    quoteTargetFingerprint,
     turnIds: [...value.turnIds],
     reactionTarget: normalizeReactionTarget(value.reactionTarget),
   };
@@ -110,6 +121,10 @@ export function validateDouyinAction(value) {
       .includes(normalized.stage)
       && (!normalized.replyDigest || !normalized.replyKind || normalized.reactionDecision === null)) {
     throw new Error("Douyin action stage requires a verified reply decision.");
+  }
+  if (normalized.quoteTargetFingerprint !== null
+      && (normalized.replyKind !== "video" || normalized.reactionTarget === null)) {
+    throw new Error("Douyin action quote target is inconsistent with its media reply.");
   }
   return normalized;
 }
@@ -128,7 +143,7 @@ export function createDouyinAction({ chatKey, generation, pending, replyKind = n
     return [index, message.fingerprint, message.kind, message.side, ordinal].join(":");
   });
   return validateDouyinAction({
-    version: 1,
+    version: 2,
     id: digest(["douyin-inbound-action-v1", chatKey, generation, ...identity].join("|")),
     generation,
     stage: "planned",
@@ -140,6 +155,7 @@ export function createDouyinAction({ chatKey, generation, pending, replyKind = n
     reactionDecision: null,
     reactionTarget: null,
     reactionOrdinalShift: 0,
+    quoteTargetFingerprint: null,
   });
 }
 
@@ -155,6 +171,17 @@ export function transitionDouyinAction(action, stage, patch = {}) {
     turnIds: patch.turnIds ? [...patch.turnIds] : current.turnIds,
   };
   return validateDouyinAction(candidate);
+}
+
+export function rollbackDouyinActionBeforeEnter(action) {
+  const current = validateDouyinAction(action);
+  if (current.stage !== "send-attempted") {
+    throw new Error("Only a pre-Enter Douyin send attempt can return to reply-ready.");
+  }
+  return validateDouyinAction({
+    ...current,
+    stage: "reply-ready",
+  });
 }
 
 export function computeDouyinTurnPromptDigest(params) {
