@@ -41,15 +41,29 @@ function exactObject(value, keys) {
 
 function normalizeReactionTarget(value) {
   if (value === null) return null;
-  if (!exactObject(value, ["fingerprint", "kind", "side", "ordinalFromEnd"])) {
+  const hasLegacyFingerprint = Object.hasOwn(value ?? {}, "legacyFingerprint");
+  const keys = [
+    "fingerprint",
+    "kind",
+    "side",
+    "ordinalFromEnd",
+    ...(hasLegacyFingerprint ? ["legacyFingerprint"] : []),
+  ];
+  if (!exactObject(value, keys)) {
     throw new Error("Douyin action reaction target has an invalid shape.");
   }
   if (!HASH_PATTERN.test(value.fingerprint) || value.kind !== "media" || value.side !== "left"
       || !Number.isSafeInteger(value.ordinalFromEnd) || value.ordinalFromEnd < 1
-      || value.ordinalFromEnd > 12) {
+      || value.ordinalFromEnd > 12
+      || (hasLegacyFingerprint && !HASH_PATTERN.test(value.legacyFingerprint))) {
     throw new Error("Douyin action reaction target is invalid.");
   }
-  return { ...value };
+  return {
+    fingerprint: value.fingerprint,
+    kind: value.kind,
+    side: value.side,
+    ordinalFromEnd: value.ordinalFromEnd,
+  };
 }
 
 export function validateDouyinAction(value) {

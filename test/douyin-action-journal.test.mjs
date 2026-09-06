@@ -83,6 +83,28 @@ test("upgrades the bounded version-one action shape without inventing quote auth
   assert.equal(normalized.quoteTargetFingerprint, null);
 });
 
+test("canonicalizes a migrated native-sticker reaction target", () => {
+  const migratedSticker = {
+    ...incoming,
+    legacyFingerprint: "d".repeat(64),
+  };
+  const action = transitionDouyinAction(actionAt("planned"), "evidence-ready", {
+    replyKind: "image",
+    reactionNonce: "c".repeat(24),
+    reactionTarget: migratedSticker,
+  });
+  assert.deepEqual(action.reactionTarget, incoming);
+  assert.equal(Object.hasOwn(action.reactionTarget, "legacyFingerprint"), false);
+  assert.throws(
+    () => transitionDouyinAction(actionAt("planned"), "evidence-ready", {
+      replyKind: "image",
+      reactionNonce: "c".repeat(24),
+      reactionTarget: { ...migratedSticker, unexpected: true },
+    }),
+    /invalid shape/u,
+  );
+});
+
 test("rolls back only a journaled attempt that has not pressed Enter", () => {
   let action = actionAt("reply-ready");
   action = transitionDouyinAction(action, "send-attempted");
