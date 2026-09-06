@@ -139,3 +139,32 @@ test("product contract 7: an optional like decision stays in the media turn and 
   assert.equal(decision.shouldLike, true);
   assert.doesNotMatch(decision.reply, /douyin-media-like/u);
 });
+
+test("product contract 8: ordered built-in emoji remain visual chat intent", async () => {
+  const acquired = await acquireDouyinMedia({
+    ...acquisitionContext,
+    mediaType: "native_sticker",
+    dependencies: {
+      captureNativeSticker: async () => ({
+        imagePaths: ["C:/runtime/sticker-1.png", "C:/runtime/sticker-2.png"],
+        emojiCount: 2,
+      }),
+    },
+  });
+  let turn;
+  await generateDouyinImageReply({
+    codex: { async runTurn(value) { turn = value; return "fixture reply"; } },
+    threadId: "persistent-thread",
+    imagePaths: acquired.imagePaths,
+    mediaType: acquired.kind,
+    nativeStickerCount: acquired.emojiCount,
+    nativeStickerLabels: ["fixture-1", "fixture-2"],
+    evidence: acquired.evidence,
+  });
+  assert.deepEqual(turn.input.slice(1), [
+    { type: "localImage", path: "C:/runtime/sticker-1.png" },
+    { type: "localImage", path: "C:/runtime/sticker-2.png" },
+  ]);
+  assert.match(turn.input[0].text, /按消息节点顺序排列/u);
+  assert.match(turn.input[0].text, /不要逐项描述图片/u);
+});

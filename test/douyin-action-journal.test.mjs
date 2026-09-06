@@ -123,6 +123,56 @@ test("requeues pre-turn work but fails closed on an ambiguous turn start", () =>
   );
 });
 
+test("upgrades an in-flight empty-text sticker fingerprint to canonical media", () => {
+  const legacySticker = {
+    fingerprint: "d".repeat(64),
+    kind: "text",
+    side: "left",
+    ordinalFromEnd: 2,
+  };
+  const followingText = {
+    fingerprint: "e".repeat(64),
+    kind: "text",
+    side: "left",
+    ordinalFromEnd: 1,
+  };
+  const currentSticker = {
+    fingerprint: "f".repeat(64),
+    legacyFingerprint: legacySticker.fingerprint,
+    kind: "media",
+    side: "left",
+  };
+  const oldSnapshot = {
+    messageCount: 2,
+    messages: [legacySticker, followingText],
+  };
+  const currentSnapshot = {
+    messageCount: 2,
+    messages: [currentSticker, followingText],
+  };
+  const state = createBridgeState({
+    chatKey,
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
+    generation: 2,
+    snapshot: oldSnapshot,
+    phase: "processing",
+    pending: [legacySticker, followingText],
+    action: createDouyinAction({
+      chatKey,
+      generation: 2,
+      pending: [legacySticker, followingText],
+    }),
+  });
+  const recovered = recoverBridgeStateForStartup(state, currentSnapshot);
+  assert.equal(recovered.state.checkpoint.phase, "queued");
+  assert.deepEqual(recovered.queuedPending, [
+    { ...currentSticker, ordinalFromEnd: 2 },
+    { ...followingText, ordinalFromEnd: 1 },
+  ]);
+});
+
 test("resumes a completed turn by id and never starts a second turn implicitly", () => {
   const state = createBridgeState({
     chatKey,

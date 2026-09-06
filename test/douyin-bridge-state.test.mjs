@@ -353,6 +353,22 @@ test("migrates only an explicitly aliased legacy outgoing quote checkpoint", () 
   }])), /no longer matches/u);
 });
 
+test("limits legacy aliases to outgoing quoted text and incoming media migrations", () => {
+  const legacyFingerprint = "a".repeat(64);
+  assert.doesNotThrow(() => readyState(snapshot(1, [{
+    fingerprint: "b".repeat(64),
+    kind: "media",
+    side: "left",
+    legacyFingerprint,
+  }])));
+  for (const invalid of [
+    { fingerprint: "b".repeat(64), kind: "text", side: "left", legacyFingerprint },
+    { fingerprint: "b".repeat(64), kind: "media", side: "right", legacyFingerprint },
+  ]) {
+    assert.throws(() => readyState(snapshot(1, [invalid])), /invalid legacy message fingerprint/u);
+  }
+});
+
 test("refuses a fixed-size DOM replacement without a reliable overlap boundary", () => {
   assert.throws(
     () => findAppendedMessages(
@@ -508,6 +524,29 @@ test("rebinds a paused queue by occurrence and appends newly visible input", () 
     }),
     /queued bridge checkpoint is inconsistent/u,
   );
+});
+
+test("skips an unsupported incoming item while preserving later text", () => {
+  const pendingMedia = message("pending-media", "left", "media");
+  const before = snapshot(1, [pendingMedia]);
+  const queued = createBridgeState({
+    chatKey,
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
+    snapshot: before,
+    phase: "queued",
+    pending: [pendingMedia],
+  });
+  const unsupported = message("unsupported", "left", "unknown");
+  const laterText = message("later-text", "left", "text");
+  const current = snapshot(3, [pendingMedia, unsupported, laterText]);
+  const recovered = recoverBridgeStateForStartup(queued, current);
+  assert.equal(recovered.state.checkpoint.phase, "queued");
+  assert.deepEqual(recovered.queuedPending, [
+    { ...pendingMedia, ordinalFromEnd: 3 },
+    { ...laterText, ordinalFromEnd: 1 },
+  ]);
 });
 
 test("refuses automatic recovery for an ambiguous in-flight Codex turn", () => {

@@ -55,6 +55,7 @@ import {
 } from "../src/douyin-bridge-state.mjs";
 import {
   cleanupStaleImageAnalysisJobs,
+  DouyinNativeStickerUnavailableError,
   removeImageAnalysisJob,
 } from "../src/douyin-image-runtime.mjs";
 import { acquireDouyinMedia } from "../src/douyin-media-pipeline.mjs";
@@ -104,6 +105,13 @@ const forceFreshThread = process.env.DOUYIN_FORCE_FRESH_THREAD === "true";
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const compactionPolicy = resolveContextCompactionPolicy();
 let stopRequested = false;
+class DouyinUnsupportedIncomingError extends Error {
+  constructor(reason = "unsupported-media-type") {
+    super("A Douyin incoming item uses an unsupported media structure.");
+    this.name = "DouyinUnsupportedIncomingError";
+    this.reason = /^[a-z0-9-]{1,80}$/u.test(reason) ? reason : "unsupported-media-type";
+  }
+}
 const requestStop = () => {
   stopRequested = true;
 };
@@ -639,7 +647,14 @@ try {
     }
 
     const queuePlan = planDouyinIncomingQueue(incoming);
-    if (!queuePlan.ok || unsupportedIncoming.length > 0) {
+    if (unsupportedIncoming.length > 0) {
+      console.log(JSON.stringify({
+        ok: true,
+        event: "unsupported-incoming-skipped",
+        count: unsupportedIncoming.length,
+      }));
+    }
+    if (!queuePlan.ok) {
       setBridgePhase("blocked");
       activeState = createBridgeState({
         chatKey: lockedChat.fingerprint,
@@ -650,9 +665,7 @@ try {
         snapshot: current,
         phase: "blocked",
         pending: incoming,
-        blockedReason: unsupportedIncoming.length > 0
-          ? "unsupported-incoming-batch"
-          : "ambiguous-incoming-batch",
+        blockedReason: "ambiguous-incoming-batch",
       });
       await saveBridgeState(projectRoot, activeState);
       console.log(JSON.stringify({
@@ -792,9 +805,13 @@ try {
             reason: "unsupported-media-type",
             ...(diagnostic ? { diagnostic } : {}),
           }));
-          throw new Error(`The latest Douyin media type is unsupported: ${mediaClassification?.reason || "unknown"}.`);
+          if (mediaClassification?.reason === "unsupported-media-type") {
+            throw new DouyinUnsupportedIncomingError(mediaClassification.reason);
+          }
+          throw new Error(`The latest Douyin media type is unavailable: ${mediaClassification?.reason || "unknown"}.`);
         }
         let sharedComment = null;
+        let nativeStickerLabels = [];
         if (mediaClassification.mediaType === "comment_share") {
           const commentShare = await cdp.evaluate(
             buildReadIncomingCommentShareExpression(incomingBatch.mediaMessage),
@@ -813,6 +830,9 @@ try {
           if (mediaMessage.text && !inboundTextParts.includes(mediaMessage.text)) {
             inboundTextParts.push(mediaMessage.text);
           }
+          nativeStickerLabels = Array.isArray(mediaMessage.nativeStickerLabels)
+            ? mediaMessage.nativeStickerLabels
+            : [];
         }
         const inboundText = inboundTextParts.join("\n") || null;
         media = await acquireDouyinMedia({
@@ -836,7 +856,8 @@ try {
           throw new Error("The Douyin chat changed during media capture; refusing the wrong conversation.");
         }
         const reactionNonce = mediaReactionEnabled ? randomBytes(12).toString("hex") : null;
-        if (media.kind === "chat_image" || media.kind === "image_post" || media.kind === "shared_cover") {
+        if (media.kind === "chat_image" || media.kind === "image_post"
+            || media.kind === "shared_cover" || media.kind === "native_sticker") {
           currentAction = transitionDouyinAction(currentAction, "evidence-ready", {
             replyKind: "image",
             reactionNonce,
@@ -864,6 +885,8 @@ try {
             partial: Boolean(media.partial),
             evidence: media.evidence,
             inboundText,
+            nativeStickerLabels,
+            nativeStickerCount: media.emojiCount ?? null,
             sharedComment,
             mediaReactionEnabled,
             reactionNonce,
@@ -936,10 +959,7 @@ try {
         messages: sendPreparationMetadata.messages,
       });
       const activityBeforeSend = findAppendedMessages(current, sendPreparationSnapshot);
-      if (activityBeforeSend.some((message) => message.side === "right")
-          || activityBeforeSend.some((message) => (
-            message.side === "left" && message.kind !== "text" && message.kind !== "media"
-          ))) {
+      if (activityBeforeSend.some((message) => message.side === "right")) {
         throw new Error("Ambiguous Douyin activity appeared while preparing a reply.");
       }
       let discoveredQuoteTarget = null;
@@ -1161,8 +1181,7 @@ try {
       const reboundRemaining = remainingMessages.length > 0
         ? rebindPendingMessages(afterSendSnapshot, remainingMessages)
         : [];
-      if (outgoingDuringSend.length !== 1 || unexpectedOutgoing.length > 0
-          || unsupportedDuringSend.length > 0) {
+      if (outgoingDuringSend.length !== 1 || unexpectedOutgoing.length > 0) {
         setBridgePhase("blocked");
         activeState = createBridgeState({
           chatKey: lockedChat.fingerprint,
@@ -1173,9 +1192,7 @@ try {
           snapshot: afterSendSnapshot,
           phase: "blocked",
           pending: reboundRemaining,
-          blockedReason: unsupportedDuringSend.length > 0
-            ? "unsupported-incoming-batch"
-            : "concurrent-outgoing-ambiguous",
+          blockedReason: "concurrent-outgoing-ambiguous",
           action: currentAction,
         });
         await saveBridgeState(projectRoot, activeState);
@@ -1185,6 +1202,13 @@ try {
         }));
         process.exitCode = 6;
         break;
+      }
+      if (unsupportedDuringSend.length > 0) {
+        console.log(JSON.stringify({
+          ok: true,
+          event: "unsupported-incoming-skipped",
+          count: unsupportedDuringSend.length,
+        }));
       }
       currentAction = transitionDouyinAction(currentAction, "send-verified", {
         reactionOrdinalShift: appendedDuringSend.length,
@@ -1252,6 +1276,37 @@ try {
       previous = afterSendSnapshot;
       setBridgePhase(queuedIncoming ? "queued" : "listening");
     } catch (error) {
+      if (error instanceof DouyinUnsupportedIncomingError
+          || error instanceof DouyinNativeStickerUnavailableError) {
+        if (currentAction.stage !== "planned" || !incomingBatch.mediaMessage) throw error;
+        const unsupportedIndex = incoming.indexOf(incomingBatch.mediaMessage);
+        if (unsupportedIndex < 0) throw error;
+        const remainingAfterUnsupported = incoming.filter((_, index) => index !== unsupportedIndex);
+        const reboundRemaining = remainingAfterUnsupported.length > 0
+          ? rebindPendingMessages(current, remainingAfterUnsupported)
+          : [];
+        activeState = createBridgeState({
+          chatKey: lockedChat.fingerprint,
+          threadId: runtime.threadId,
+          model: runtime.model,
+          effort: runtime.effort,
+          generation: taskGeneration,
+          snapshot: current,
+          phase: reboundRemaining.length > 0 ? "queued" : "ready",
+          pending: reboundRemaining,
+        });
+        await saveBridgeState(projectRoot, activeState);
+        queuedIncoming = reboundRemaining.length > 0 ? reboundRemaining : null;
+        previous = current;
+        setBridgePhase(queuedIncoming ? "queued" : "listening");
+        console.log(JSON.stringify({
+          ok: true,
+          event: "unsupported-media-skipped",
+          reason: error.reason,
+          remainingCount: reboundRemaining.length,
+        }));
+        continue;
+      }
       if (!(error instanceof CodexContextRecoveryError)) throw error;
       contextRecoveryFailed = true;
       activeState = createBridgeState({
@@ -1277,7 +1332,8 @@ try {
       break;
     } finally {
       if (media?.jobDirectory) {
-        if (media.kind === "chat_image" || media.kind === "image_post" || media.kind === "shared_cover") {
+        if (media.kind === "chat_image" || media.kind === "image_post"
+            || media.kind === "shared_cover" || media.kind === "native_sticker") {
           await removeImageAnalysisJob(projectRoot, media.jobDirectory);
         } else {
           await removeVideoAnalysisJob(projectRoot, media.jobDirectory);

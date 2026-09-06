@@ -1,18 +1,31 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { CdpClient } from "./cdp-client.mjs";
 import {
   buildLocateLatestIncomingChatImageExpression,
+  buildReadIncomingNativeStickerSourcesExpression,
   buildReadLatestIncomingChatImageSourceExpression,
 } from "./douyin-chat-page.mjs";
 import { isTrustedDouyinMediaUrl } from "./douyin-video-runtime.mjs";
 
 const IMAGE_JOB_NAME_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const DEFAULT_MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_STICKER_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_IMAGE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_IMAGE_POST_WALL_TIME_MS = 150_000;
 const MAX_IMAGE_SOURCE_CANDIDATES = 4;
 const MAX_IMAGE_DOWNLOAD_CONCURRENCY = 3;
+const NATIVE_STICKER_WALL_TIME_MS = 60_000;
+
+export class DouyinNativeStickerUnavailableError extends Error {
+  constructor(reason = "native-sticker-unavailable") {
+    super("Douyin native sticker visual evidence is unavailable.");
+    this.name = "DouyinNativeStickerUnavailableError";
+    this.reason = /^[a-z0-9-]{1,80}$/u.test(reason) ? reason : "native-sticker-unavailable";
+  }
+}
 
 export function resolveImageAnalysisRoot(projectRoot) {
   return path.resolve(projectRoot, ".runtime", "image-analysis");
@@ -86,6 +99,185 @@ function decodePng(data, maxBytes) {
     throw new Error("Douyin chat-image capture was not a valid bounded PNG.");
   }
   return image;
+}
+
+function validatePngDimensions(image, maxDimension = 768) {
+  if (!Buffer.isBuffer(image) || image.length < 24
+      || image.subarray(12, 16).toString("ascii") !== "IHDR") {
+    throw new Error("Douyin capture PNG dimensions are unavailable.");
+  }
+  const width = image.readUInt32BE(16);
+  const height = image.readUInt32BE(20);
+  if (width < 1 || height < 1 || width > maxDimension || height > maxDimension) {
+    throw new Error("Douyin capture PNG dimensions exceed the bounded image size.");
+  }
+  return { width, height };
+}
+
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function waitForTemporaryTarget(port, targetId, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (response.ok) {
+      const targets = await response.json();
+      const target = targets.find((candidate) => candidate.id === targetId);
+      if (target?.webSocketDebuggerUrl) return target;
+    }
+    await sleep(100);
+  }
+  throw new Error("Timed out waiting for the temporary native-sticker target.");
+}
+
+async function closeTemporaryTarget(browserCdp, port, targetId) {
+  if (!targetId) return;
+  const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
+    signal: AbortSignal.timeout(3_000),
+  });
+  if (!response.ok) throw new Error("Browser target list is unavailable during cleanup.");
+  const targets = await response.json();
+  if (!targets.some((target) => target.id === targetId)) return;
+  const result = await browserCdp.request("Target.closeTarget", { targetId }, 5_000);
+  if (result?.success === false) throw new Error("Browser refused to close the native-sticker target.");
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const listResponse = await fetch(`http://127.0.0.1:${port}/json/list`, {
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!listResponse.ok) throw new Error("Browser target list is unavailable during cleanup.");
+    const remaining = await listResponse.json();
+    if (!remaining.some((target) => target.id === targetId)) return;
+    await sleep(100);
+  }
+  throw new Error("Native-sticker target remained open after close confirmation.");
+}
+
+async function startNativeStickerNormalizerServer(images) {
+  if (!Array.isArray(images) || images.length === 0 || images.length > 12
+      || images.some((image) => !Buffer.isBuffer(image) || image.length === 0)) {
+    throw new Error("Native-sticker normalizer images are invalid.");
+  }
+  const html = `<!doctype html><meta charset=utf-8><title>Local native sticker normalizer</title>${
+    images.map((_, index) => `<img src="/sticker-${index}.webp">`).join("")
+  }`;
+  const server = createServer((request, response) => {
+    if ((request.method === "GET" || request.method === "HEAD") && request.url === "/index.html") {
+      response.writeHead(200, {
+        "Cache-Control": "no-store",
+        "Content-Length": String(Buffer.byteLength(html)),
+        "Content-Security-Policy": "default-src 'self'; img-src 'self'; style-src 'none'; script-src 'none'",
+        "Content-Type": "text/html; charset=utf-8",
+      });
+      response.end(request.method === "HEAD" ? undefined : html);
+      return;
+    }
+    const match = /^\/sticker-(\d{1,2})\.webp$/u.exec(request.url || "");
+    const index = match ? Number.parseInt(match[1], 10) : -1;
+    if ((request.method !== "GET" && request.method !== "HEAD")
+        || index < 0 || index >= images.length) {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, {
+      "Cache-Control": "no-store",
+      "Content-Length": String(images[index].length),
+      "Content-Type": "image/webp",
+    });
+    response.end(request.method === "HEAD" ? undefined : images[index]);
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Native-sticker normalizer address is unavailable.");
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}/index.html`,
+    close: async () => {
+      const closed = new Promise((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+      });
+      server.closeAllConnections();
+      await closed;
+    },
+  };
+}
+
+async function normalizeWebpStickerImages({ images, port, maxBytes }) {
+  const versionResponse = await fetch(`http://127.0.0.1:${port}/json/version`, {
+    signal: AbortSignal.timeout(3_000),
+  });
+  if (!versionResponse.ok) throw new Error("Browser debugger version endpoint is unavailable.");
+  const version = await versionResponse.json();
+  if (!version.webSocketDebuggerUrl) throw new Error("Browser debugger endpoint is missing.");
+  const server = await startNativeStickerNormalizerServer(images);
+  const browserCdp = new CdpClient(version.webSocketDebuggerUrl);
+  let pageCdp;
+  let targetId;
+  try {
+    await browserCdp.connect();
+    const created = await browserCdp.request("Target.createTarget", {
+      url: server.url,
+      background: true,
+      hidden: true,
+    }, 10_000);
+    targetId = created?.targetId;
+    if (!targetId) throw new Error("Browser did not create a native-sticker target.");
+    const target = await waitForTemporaryTarget(port, targetId);
+    pageCdp = new CdpClient(target.webSocketDebuggerUrl);
+    await pageCdp.connect();
+    await pageCdp.request("Emulation.setFocusEmulationEnabled", { enabled: true }, 5_000);
+    const encoded = await pageCdp.evaluate(`(async () => {
+      const deadline = Date.now() + 10_000;
+      while (document.images.length !== ${images.length} && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const images = Array.from(document.images).slice(0, 12);
+      if (images.length !== ${images.length}) return { ok: false, reason: 'image-count-changed' };
+      await Promise.all(images.map((image) => image.decode()));
+      const outputs = [];
+      for (const image of images) {
+        if (image.naturalWidth < 1 || image.naturalHeight < 1
+            || image.naturalWidth > 768 || image.naturalHeight > 768) {
+          return { ok: false, reason: 'image-dimensions-invalid' };
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext('2d', { alpha: true });
+        if (!context) return { ok: false, reason: 'canvas-context-unavailable' };
+        context.drawImage(image, 0, 0);
+        const data = canvas.toDataURL('image/png');
+        if (!data.startsWith('data:image/png;base64,')) {
+          return { ok: false, reason: 'png-conversion-failed' };
+        }
+        outputs.push(data.slice('data:image/png;base64,'.length));
+      }
+      return { ok: true, outputs };
+    })()`, 20_000);
+    if (!encoded?.ok || !Array.isArray(encoded.outputs)
+        || encoded.outputs.length !== images.length) {
+      throw new Error("Native-sticker WebP normalization failed.");
+    }
+    return encoded.outputs.map((data) => {
+      const image = decodePng(data, maxBytes);
+      validatePngDimensions(image);
+      return image;
+    });
+  } finally {
+    pageCdp?.close();
+    try {
+      await closeTemporaryTarget(browserCdp, port, targetId);
+    } finally {
+      browserCdp.close();
+      await server.close();
+    }
+  }
 }
 
 function decodeEmbeddedImage(source, maxBytes) {
@@ -211,6 +403,96 @@ export async function captureLatestDouyinChatImage({
   } catch (error) {
     await removeImageAnalysisJob(projectRoot, jobDirectory).catch(() => {});
     throw error;
+  }
+}
+
+export async function captureDouyinNativeSticker({
+  cdp,
+  projectRoot,
+  mediaMessage,
+  port = 9229,
+  maxBytes = DEFAULT_MAX_STICKER_BYTES,
+  fetchFn = fetch,
+  normalizeWebpImages = normalizeWebpStickerImages,
+}) {
+  if (!cdp || typeof cdp.evaluate !== "function") {
+    throw new Error("A connected CDP client is required for native-sticker capture.");
+  }
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("The native-sticker debugger port is invalid.");
+  }
+  const boundedMaxBytes = Math.max(64 * 1024, Math.min(
+    DEFAULT_MAX_STICKER_BYTES,
+    Number.isFinite(maxBytes) ? Math.trunc(maxBytes) : DEFAULT_MAX_STICKER_BYTES,
+  ));
+  const sourceResult = await cdp.evaluate(
+    buildReadIncomingNativeStickerSourcesExpression(mediaMessage),
+  );
+  if (!sourceResult?.ok || !Array.isArray(sourceResult.sources)
+      || sourceResult.sources.length < 1 || sourceResult.sources.length > 12
+      || sourceResult.sources.some((source) => (
+        typeof source !== "string" || !isTrustedDouyinMediaUrl(source)
+      ))) {
+    throw new DouyinNativeStickerUnavailableError(sourceResult?.reason);
+  }
+  const root = resolveImageAnalysisRoot(projectRoot);
+  const jobDirectory = path.join(root, randomUUID());
+  const deadline = Date.now() + NATIVE_STICKER_WALL_TIME_MS;
+  try {
+    await mkdir(jobDirectory, { recursive: true });
+    const records = [];
+    let downloadedBytes = 0;
+    for (let index = 0; index < sourceResult.sources.length; index += 1) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) throw new Error("Native-sticker acquisition exceeded its wall time.");
+      const temporaryPath = path.join(
+        jobDirectory,
+        `native-sticker-${String(index + 1).padStart(2, "0")}.download`,
+      );
+      const download = await downloadDouyinImage({
+        source: sourceResult.sources[index],
+        destination: temporaryPath,
+        maxBytes: boundedMaxBytes,
+        fetchFn,
+        timeoutMs: Math.min(30_000, remainingMs),
+      });
+      downloadedBytes += download.byteCount;
+      if (downloadedBytes > DEFAULT_MAX_TOTAL_IMAGE_BYTES) {
+        throw new Error("Native-sticker assets exceed the total size limit.");
+      }
+      const sourcePath = `${temporaryPath}${extensionForImageContentType(download.contentType)}`;
+      await rename(temporaryPath, sourcePath);
+      records.push({ contentType: download.contentType, sourcePath, byteCount: download.byteCount });
+    }
+    const webpRecords = records.filter((record) => record.contentType === "image/webp");
+    if (webpRecords.length > 0) {
+      const webpImages = await Promise.all(webpRecords.map((record) => readFile(record.sourcePath)));
+      const normalizedImages = await normalizeWebpImages({
+        images: webpImages,
+        port,
+        maxBytes: boundedMaxBytes,
+      });
+      for (let index = 0; index < webpRecords.length; index += 1) {
+        const record = webpRecords[index];
+        const normalizedPath = record.sourcePath.replace(/\.webp$/u, ".png");
+        await writeFile(normalizedPath, normalizedImages[index], { flag: "wx" });
+        await rm(record.sourcePath, { force: true });
+        record.contentType = "image/png";
+        record.sourcePath = normalizedPath;
+        record.byteCount = normalizedImages[index].length;
+      }
+    }
+    const imagePaths = records.map((record) => record.sourcePath);
+    return {
+      jobDirectory,
+      imagePaths,
+      byteCount: records.reduce((sum, record) => sum + record.byteCount, 0),
+      emojiCount: sourceResult.sources.length,
+    };
+  } catch (error) {
+    await removeImageAnalysisJob(projectRoot, jobDirectory).catch(() => {});
+    if (error instanceof DouyinNativeStickerUnavailableError) throw error;
+    throw new DouyinNativeStickerUnavailableError("native-sticker-acquisition-failed");
   }
 }
 

@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   assertImageAnalysisJobPath,
+  captureDouyinNativeSticker,
   captureLatestDouyinChatImage,
   cleanupStaleImageAnalysisJobs,
   prepareDouyinImagePost,
@@ -54,6 +55,104 @@ test("captures only a bounded visible chat-image clip into an isolated job", asy
   await access(result.imagePaths[0]);
   await removeImageAnalysisJob(projectRoot, result.jobDirectory);
   await assert.rejects(access(result.imagePaths[0]));
+});
+
+test("downloads ordered native-sticker visuals into an isolated job", async (t) => {
+  const projectRoot = await temporaryRoot(t);
+  let downloads = 0;
+  const result = await captureDouyinNativeSticker({
+    projectRoot,
+    mediaMessage: {
+      ordinalFromEnd: 2,
+      fingerprint: "a".repeat(64),
+      kind: "media",
+      side: "left",
+    },
+    cdp: {
+      async evaluate(expression) {
+        assert.match(expression, /native-sticker-source-not-ready/u);
+        return {
+          ok: true,
+          sources: [
+            "https://p3.douyinpic.com/sticker-1.png",
+            "https://p3.douyinpic.com/sticker-2.png",
+          ],
+        };
+      },
+    },
+    async fetchFn() {
+      downloads += 1;
+      return new Response(ONE_PIXEL_PNG, {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      });
+    },
+  });
+  assert.equal(result.emojiCount, 2);
+  assert.equal(result.imagePaths.length, 2);
+  assert.equal(downloads, 2);
+  for (const imagePath of result.imagePaths) {
+    assert.equal(path.extname(imagePath), ".png");
+    await access(imagePath);
+  }
+  await removeImageAnalysisJob(projectRoot, result.jobDirectory);
+});
+
+test("refuses an untrusted native-sticker source", async (t) => {
+  const projectRoot = await temporaryRoot(t);
+  await assert.rejects(captureDouyinNativeSticker({
+    projectRoot,
+    mediaMessage: {
+      ordinalFromEnd: 1,
+      fingerprint: "a".repeat(64),
+      kind: "media",
+      side: "left",
+    },
+    cdp: {
+      async evaluate() {
+        return {
+          ok: true,
+          sources: ["https://example.invalid/sticker.webp"],
+        };
+      },
+    },
+  }), /visual evidence is unavailable/u);
+});
+
+test("normalizes native-sticker WebP assets to ordered PNGs before Codex", async (t) => {
+  const projectRoot = await temporaryRoot(t);
+  let normalizedCount = 0;
+  const result = await captureDouyinNativeSticker({
+    projectRoot,
+    mediaMessage: {
+      ordinalFromEnd: 1,
+      fingerprint: "a".repeat(64),
+      kind: "media",
+      side: "left",
+    },
+    cdp: {
+      async evaluate() {
+        return { ok: true, sources: ["https://p3.douyinpic.com/sticker.webp"] };
+      },
+    },
+    async fetchFn() {
+      return new Response(MINIMAL_WEBP, {
+        status: 200,
+        headers: { "content-type": "image/webp" },
+      });
+    },
+    async normalizeWebpImages({ images, maxBytes }) {
+      normalizedCount = images.length;
+      assert.equal(maxBytes, 4 * 1024 * 1024);
+      assert.equal(images[0].equals(MINIMAL_WEBP), true);
+      return [ONE_PIXEL_PNG];
+    },
+  });
+  assert.equal(normalizedCount, 1);
+  assert.equal(result.imagePaths.length, 1);
+  assert.equal(path.extname(result.imagePaths[0]), ".png");
+  assert.equal(result.imagePaths.some((imagePath) => imagePath.endsWith(".webp")), false);
+  await removeImageAnalysisJob(projectRoot, result.jobDirectory);
 });
 
 test("refuses invalid clips, non-PNG captures, and paths outside the job root", async (t) => {

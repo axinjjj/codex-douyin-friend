@@ -1,5 +1,6 @@
 import { buildReadCompatibleAwemeMediaExpression } from "./douyin-chat-page.mjs";
 import {
+  captureDouyinNativeSticker,
   captureLatestDouyinChatImage,
   prepareDouyinImagePost,
 } from "./douyin-image-runtime.mjs";
@@ -26,6 +27,31 @@ const directImageAdapter = Object.freeze({
       evidence: createDouyinMediaEvidence({
         mode: DOUYIN_EVIDENCE_MODES.DIRECT_IMAGE,
         assetCount: prepared.imagePaths?.length ?? 1,
+      }),
+    };
+  },
+});
+
+const nativeStickerAdapter = Object.freeze({
+  key: "native-sticker",
+  mediaTypes: Object.freeze(["native_sticker"]),
+  async acquire(context, dependencies) {
+    const prepared = await dependencies.captureNativeSticker({
+      cdp: context.cdp,
+      projectRoot: context.projectRoot,
+      port: context.port,
+      mediaMessage: context.mediaMessage,
+    });
+    return {
+      kind: "native_sticker",
+      ...prepared,
+      evidence: createDouyinMediaEvidence({
+        mode: DOUYIN_EVIDENCE_MODES.NATIVE_STICKER,
+        assetCount: prepared.imagePaths?.length ?? 1,
+        totalAssetCount: prepared.emojiCount ?? prepared.imagePaths?.length ?? 1,
+        limitations: prepared.imagePaths?.length === prepared.emojiCount
+          ? []
+          : ["some-native-stickers-unavailable"],
       }),
     };
   },
@@ -178,6 +204,7 @@ const commentShareAdapter = Object.freeze({
 });
 
 export const DOUYIN_MEDIA_ADAPTER_REGISTRY = Object.freeze([
+  nativeStickerAdapter,
   directImageAdapter,
   sharedWorkAdapter,
   commentShareAdapter,
@@ -204,6 +231,7 @@ export async function acquireDouyinMedia({
   const adapter = matchDouyinMediaAdapter(mediaType, registry);
   if (!adapter) throw new Error("The latest Douyin media type is unsupported.");
   const resolvedDependencies = {
+    captureNativeSticker: dependencies.captureNativeSticker || captureDouyinNativeSticker,
     captureChatImage: dependencies.captureChatImage || captureLatestDouyinChatImage,
     readSharedWorkManifest: dependencies.readSharedWorkManifest || (async (context) => (
       context.cdp.evaluate(buildReadCompatibleAwemeMediaExpression(context.mediaMessage), 15_000)

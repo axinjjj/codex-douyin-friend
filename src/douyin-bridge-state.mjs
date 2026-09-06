@@ -66,8 +66,10 @@ function normalizeMessageMetadata(message) {
       || message.kind !== "text" || message.side !== "right")) {
     throw new Error("Bridge state contains an invalid quote target fingerprint.");
   }
+  const legacyFingerprintAllowed = (message.kind === "text" && message.side === "right")
+    || (message.kind === "media" && message.side === "left");
   if (hasLegacyFingerprint && (!MESSAGE_FINGERPRINT_PATTERN.test(message.legacyFingerprint)
-      || message.kind !== "text" || message.side !== "right")) {
+      || !legacyFingerprintAllowed)) {
     throw new Error("Bridge state contains an invalid legacy message fingerprint.");
   }
   const normalized = {
@@ -420,7 +422,7 @@ export function rebindPendingMessages(snapshot, pendingMessages) {
       throw new Error("A queued Douyin message is no longer visible at its checkpoint.");
     }
     rebound[pendingIndex] = {
-      ...pending[pendingIndex],
+      ...current.messages[currentIndex],
       ordinalFromEnd: current.messages.length - currentIndex,
     };
     currentIndex -= 1;
@@ -550,12 +552,6 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
     if (appended.some((message) => message.side === "right")) {
       throw new Error("Unexpected outgoing activity appeared while a media queue was paused.");
     }
-    const unsupportedIncoming = appended.filter((message) => (
-      message.side === "left" && message.kind !== "text" && message.kind !== "media"
-    ));
-    if (unsupportedIncoming.length > 0) {
-      throw new Error("Unsupported incoming activity appeared while a media queue was paused.");
-    }
     const queuedPending = rebindPendingMessages(current, [
       ...normalized.checkpoint.pending,
       ...appended.filter((message) => (
@@ -591,8 +587,9 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
     const appendedIncoming = appended.filter((message) => (
       message.side === "left" && (message.kind === "text" || message.kind === "media")
     ));
-    if (appended.length !== appendedIncoming.length) {
-      throw new Error("Unsupported activity appeared during action recovery.");
+    const unexpectedActivity = appended.filter((message) => message.side !== "left");
+    if (unexpectedActivity.length > 0) {
+      throw new Error("Unexpected activity appeared during action recovery.");
     }
     const queuedPending = rebindPendingMessages(current, [
       ...normalized.checkpoint.pending,
@@ -648,12 +645,6 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
       || outgoing[0].quoteTargetFingerprint === expectedQuoteTarget);
   if (!sent) {
     throw new Error("The previous Douyin send cannot be verified; refusing to resend.");
-  }
-  const unsupportedIncoming = appended.filter((message) => (
-    message.side === "left" && message.kind !== "text" && message.kind !== "media"
-  ));
-  if (unsupportedIncoming.length > 0) {
-    throw new Error("Unsupported incoming activity appeared while a verified send was recovering.");
   }
   const completedBatchLength = firstPendingBatchLength(normalized.checkpoint.pending);
   const queuedMessages = [

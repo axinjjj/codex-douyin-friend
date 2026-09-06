@@ -17,8 +17,9 @@ const DOUYIN_EDITOR_QUOTE_SELECTOR = ".MsgInputReferencewrapper";
 const DOUYIN_OUTGOING_QUOTE_SELECTOR = ".MessageBoxRefContainerrefContainer";
 const DOUYIN_OUTGOING_SHARED_WORK_REFERENCE_SELECTOR =
   ".MessageItemShareAwemerefContainer";
+const DOUYIN_NATIVE_STICKER_IMAGE_SELECTOR = ".TextMessageTextemoji img";
 const DOUYIN_MEDIA_CONTENT_SELECTOR =
-  `${DOUYIN_SHARED_WORK_SELECTOR}, .MessageItemImageImageBox, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]`;
+  `${DOUYIN_SHARED_WORK_SELECTOR}, .MessageItemImageImageBox, ${DOUYIN_NATIVE_STICKER_IMAGE_SELECTOR}, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]`;
 const DOUYIN_QUOTE_BINDING_KEY = "__codexDouyinMediaQuoteBindingV1";
 
 export function resolveDouyinSharedWorkManifest({ detail = null, parsedContent = null } = {}) {
@@ -322,6 +323,34 @@ const STABLE_MEDIA_FINGERPRINT_SOURCE = `
           return ['shared-work-v2', variant, String(identity)].join('|');
         }
       }
+      const nativeStickerImages = Array.from(mediaMessage.querySelectorAll(
+        ${JSON.stringify(DOUYIN_NATIVE_STICKER_IMAGE_SELECTOR)}
+      )).slice(0, 12);
+      if (nativeStickerImages.length > 0) {
+        const identities = nativeStickerImages.map((image) => {
+          const label = String(
+            image.getAttribute('title') || image.getAttribute('alt') || ''
+          ).trim().slice(0, 80);
+          const source = String(image.currentSrc || '');
+          let stableSource = source;
+          if (source.startsWith('https://')) {
+            try {
+              const parsed = new URL(source);
+              stableSource = [parsed.origin, parsed.pathname].join('');
+            } catch {}
+          } else if (source.startsWith('data:')) {
+            stableSource = [
+              source.slice(0, 48),
+              source.length,
+              source.slice(-48),
+            ].join(':');
+          }
+          return label
+            ? ['label', label].join('|')
+            : ['source', stableSource.slice(0, 2_048)].join('|');
+        });
+        return ['native-sticker-v1', nativeStickerImages.length, ...identities].join('|');
+      }
       const directImages = Array.from(mediaMessage.querySelectorAll(
         '.MessageItemImageImage, .MessageItemImageImageBox img'
       )).slice(0, 4);
@@ -597,12 +626,15 @@ export function buildChatMessageMetadataExpression() {
       const source = (isOutgoingQuote
         ? outgoingQuoteBody.textContent
         : legacySource).trim();
+      const hasNativeSticker = Boolean(message.querySelector(
+        ${JSON.stringify(DOUYIN_NATIVE_STICKER_IMAGE_SELECTOR)}
+      ));
       const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
       const stableMediaFingerprintSource = hasMedia
         ? resolveStableMediaFingerprintSource(message, textBubble, stableContent)
         : null;
       const kind = isOutgoingQuote ? 'text'
-        : hasMedia ? 'media' : textBubble ? 'text' : centered ? 'system' : 'unknown';
+        : hasMedia ? 'media' : textBubble && source ? 'text' : centered ? 'system' : 'unknown';
       const fingerprintSource = kind === 'media'
         ? stableMediaFingerprintSource
         : source;
@@ -611,7 +643,9 @@ export function buildChatMessageMetadataExpression() {
         : kind === 'media' || kind === 'text'
           ? [kind, side, fingerprintSource].join('|')
           : [kind, side, source, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|');
-      const legacyKind = hasMedia ? 'media' : textBubble ? 'text' : centered ? 'system' : 'unknown';
+      const legacyKind = hasNativeSticker
+        ? (textBubble ? 'text' : centered ? 'system' : 'unknown')
+        : hasMedia ? 'media' : textBubble ? 'text' : centered ? 'system' : 'unknown';
       const legacyFingerprintSource = legacyKind === 'media'
         ? stableMediaFingerprintSource
         : legacySource;
@@ -619,7 +653,11 @@ export function buildChatMessageMetadataExpression() {
         ? (legacyKind === 'media' || legacyKind === 'text'
           ? [legacyKind, side, legacyFingerprintSource].join('|')
           : [legacyKind, side, legacySource, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|'))
-        : null;
+        : hasNativeSticker
+          ? (legacyKind === 'media' || legacyKind === 'text'
+            ? [legacyKind, side, legacyFingerprintSource].join('|')
+            : [legacyKind, side, legacySource, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|'))
+          : null;
       return {
         kind,
         side,
@@ -729,12 +767,15 @@ export function buildBridgeStartupViewExpression(limit = 12) {
         const source = (isOutgoingQuote
           ? outgoingQuoteBody.textContent
           : legacySource).trim();
+        const hasNativeSticker = Boolean(message.querySelector(
+          ${JSON.stringify(DOUYIN_NATIVE_STICKER_IMAGE_SELECTOR)}
+        ));
         const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
         const stableMediaFingerprintSource = hasMedia
           ? resolveStableMediaFingerprintSource(message, bubble, stableContent)
           : null;
         const kind = isOutgoingQuote ? 'text'
-          : hasMedia ? 'media' : bubble ? 'text' : centered ? 'system' : 'unknown';
+          : hasMedia ? 'media' : bubble && source ? 'text' : centered ? 'system' : 'unknown';
         const fingerprintSource = kind === 'media'
           ? stableMediaFingerprintSource
           : source;
@@ -743,7 +784,9 @@ export function buildBridgeStartupViewExpression(limit = 12) {
           : kind === 'media' || kind === 'text'
             ? [kind, side, fingerprintSource].join('|')
             : [kind, side, source, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|');
-        const legacyKind = hasMedia ? 'media' : bubble ? 'text' : centered ? 'system' : 'unknown';
+        const legacyKind = hasNativeSticker
+          ? (bubble ? 'text' : centered ? 'system' : 'unknown')
+          : hasMedia ? 'media' : bubble ? 'text' : centered ? 'system' : 'unknown';
         const legacyFingerprintSource = legacyKind === 'media'
           ? stableMediaFingerprintSource
           : legacySource;
@@ -751,7 +794,11 @@ export function buildBridgeStartupViewExpression(limit = 12) {
           ? (legacyKind === 'media' || legacyKind === 'text'
             ? [legacyKind, side, legacyFingerprintSource].join('|')
             : [legacyKind, side, legacySource, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|'))
-          : null;
+          : hasNativeSticker
+            ? (legacyKind === 'media' || legacyKind === 'text'
+              ? [legacyKind, side, legacyFingerprintSource].join('|')
+              : [legacyKind, side, legacySource, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|'))
+            : null;
         return {
           source,
           side,
@@ -896,6 +943,21 @@ export function buildClassifyLatestIncomingMediaExpression(mediaMessage = null) 
         quoteTargetFingerprint,
       };
     }
+    const visibleNativeStickerImages = Array.from(message.querySelectorAll(
+      ${JSON.stringify(DOUYIN_NATIVE_STICKER_IMAGE_SELECTOR)}
+    )).slice(0, 12).filter((image) => {
+      const imageRect = image.getBoundingClientRect();
+      const style = getComputedStyle(image);
+      return imageRect.width >= 8 && imageRect.height >= 8 &&
+        style.display !== 'none' && style.visibility !== 'hidden';
+    });
+    if (visibleNativeStickerImages.length > 0) {
+      return {
+        ok: true,
+        mediaType: 'native_sticker',
+        emojiCount: visibleNativeStickerImages.length,
+      };
+    }
     const visibleImage = Array.from(message.querySelectorAll('.MessageItemImageImage, .MessageItemImageImageBox img'))
       .find((image) => {
         const imageRect = image.getBoundingClientRect();
@@ -932,6 +994,30 @@ export function buildClassifyLatestIncomingMediaExpression(mediaMessage = null) 
       reason: 'unsupported-media-type',
       diagnostic: { version: 1, signature, ...safeShape },
     };
+  })()`;
+}
+
+export function buildReadIncomingNativeStickerSourcesExpression(mediaMessage) {
+  const expected = normalizeExactIncomingMediaMessage(mediaMessage);
+  return `(async () => {
+    ${buildExactIncomingMediaLookupSource(expected)}
+    if (message.querySelector(${JSON.stringify(DOUYIN_SHARED_WORK_SELECTOR)})) {
+      return { ok: false, reason: 'selected-media-is-shared-aweme' };
+    }
+    const images = Array.from(message.querySelectorAll(
+      ${JSON.stringify(DOUYIN_NATIVE_STICKER_IMAGE_SELECTOR)}
+    )).slice(0, 12);
+    if (images.length === 0) return { ok: false, reason: 'native-sticker-not-found' };
+    const deadline = Date.now() + 5_000;
+    let sources = images.map((image) => String(image.currentSrc || ''));
+    while (sources.some((source) => !source) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      sources = images.map((image) => String(image.currentSrc || ''));
+    }
+    if (sources.some((source) => !source)) {
+      return { ok: false, reason: 'native-sticker-source-not-ready' };
+    }
+    return { ok: true, sources };
   })()`;
 }
 
@@ -1649,6 +1735,11 @@ export function buildReadIncomingMediaTextExpression(message) {
       ok: true,
       chatFingerprint: opaqueId ? await digest(['douyin-opponent-v1', opaqueId].join('|')) : null,
       text: (bubble?.textContent || '').trim() || null,
+      nativeStickerLabels: Array.from(message.querySelectorAll(
+        ${JSON.stringify(DOUYIN_NATIVE_STICKER_IMAGE_SELECTOR)}
+      )).slice(0, 12).map((image) => (
+        String(image.getAttribute('title') || image.getAttribute('alt') || '').trim().slice(0, 80)
+      )).filter(Boolean),
     };
   })()`;
 }

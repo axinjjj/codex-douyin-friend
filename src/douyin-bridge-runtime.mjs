@@ -493,6 +493,8 @@ export async function generateDouyinImageReply({
   partial = false,
   evidence = null,
   inboundText = null,
+  nativeStickerLabels = [],
+  nativeStickerCount = null,
   sharedComment = null,
   mediaReactionEnabled = false,
   reactionNonce = null,
@@ -506,16 +508,30 @@ export async function generateDouyinImageReply({
   if (new Set(imagePaths).size !== imagePaths.length) {
     throw new Error("Duplicate Douyin image paths are not allowed.");
   }
-  if (mediaType !== "chat_image" && mediaType !== "image_post" && mediaType !== "shared_cover") {
+  if (mediaType !== "chat_image" && mediaType !== "image_post"
+      && mediaType !== "shared_cover" && mediaType !== "native_sticker") {
     throw new Error("Douyin image media type is invalid.");
   }
   if (!Number.isSafeInteger(totalImageCount) || totalImageCount < imagePaths.length) {
     throw new Error("Douyin total image count is invalid.");
   }
+  if (mediaType === "native_sticker" && (!Number.isSafeInteger(nativeStickerCount)
+      || nativeStickerCount < 1 || nativeStickerCount > 12)) {
+    throw new Error("Douyin native sticker count is invalid.");
+  }
+  const boundedStickerLabels = Array.isArray(nativeStickerLabels)
+    ? nativeStickerLabels
+      .filter((label) => typeof label === "string")
+      .map((label) => label.trim().slice(0, 80))
+      .filter(Boolean)
+      .slice(0, 12)
+    : [];
   const description = mediaType === "image_post"
     ? `聊天对方刚在抖音中分享了一条图文作品。下面的 ${imagePaths.length} 张图片按原作品顺序排列。`
     : mediaType === "shared_cover"
       ? "聊天对方刚在抖音中分享了一条作品，但当前登录态拿不到作品详情；下面只提供了分享卡片封面。"
+      : mediaType === "native_sticker"
+        ? `聊天对方刚发来一条抖音内置表情消息。下面的 ${imagePaths.length} 张视觉图片按消息节点顺序排列，对应 ${nativeStickerCount} 个内置表情；消息中也可能夹有文字。`
       : "聊天对方刚在抖音中直接发来了一张聊天图片。";
   const samplingBoundary = mediaType === "image_post" && totalImageCount > requestedImageCount
     ? `原作品共有 ${totalImageCount} 张图，本次只选取了按时间均匀分布的 ${requestedImageCount} 张；不要声称看见了未选取的图片。`
@@ -532,6 +548,14 @@ export async function generateDouyinImageReply({
   const visualEvidenceBoundary = mediaType === "shared_cover"
     ? null
     : "这些本地图片已经作为本次输入提供给你，你可以直接观察其中的画面；不要笼统声称自己看不到图片或画面。具体细节看不清时只说明那个细节。";
+  const nativeStickerLines = mediaType === "native_sticker"
+    ? [
+      ...(boundedStickerLabels.length > 0
+        ? [`抖音节点按顺序提供了这些表情标题，仅作画面理解的辅助，以视觉截图为准：${boundedStickerLabels.join("、")}`]
+        : []),
+      "把它当作聊天中的表情语气来理解并自然回应，不要逐项描述图片，也不要解释自己在识别表情。",
+    ]
+    : [];
   const boundedInboundText = String(inboundText || "").trim().slice(0, 4_000);
   const inboundTextLines = boundedInboundText
     ? [
@@ -551,6 +575,8 @@ export async function generateDouyinImageReply({
   const evidenceLines = buildStructuredEvidenceLines(evidence, {
     mode: mediaType === "shared_cover"
       ? DOUYIN_EVIDENCE_MODES.COVER_ONLY
+      : mediaType === "native_sticker"
+        ? DOUYIN_EVIDENCE_MODES.NATIVE_STICKER
       : partial ? DOUYIN_EVIDENCE_MODES.PARTIAL_IMAGES
         : mediaType === "chat_image"
           ? DOUYIN_EVIDENCE_MODES.DIRECT_IMAGE
@@ -571,6 +597,7 @@ export async function generateDouyinImageReply({
       ...(samplingBoundary ? [samplingBoundary] : []),
       ...(partialBoundary ? [partialBoundary] : []),
       ...(coverBoundary ? [coverBoundary] : []),
+      ...nativeStickerLines,
       ...sharedCommentLines,
       ...inboundTextLines,
       "请先准确观察图片中的人物、物体、动作、文字、表情和笑点，再遵循已经加载的全局 AGENTS.md 人设，自然回应对方分享它的意图。",

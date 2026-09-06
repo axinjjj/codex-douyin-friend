@@ -973,6 +973,34 @@ test("marks direct chat images as media content and sends them to the same threa
   assert.match(turn.input[0].text, /自然决定回复长度/u);
 });
 
+test("treats Douyin built-in stickers as ordered visual chat intent", async () => {
+  let turn;
+  const result = await generateDouyinImageReply({
+    codex: {
+      async runTurn(value) {
+        turn = value;
+        return "笑得这么开心啊";
+      },
+    },
+    threadId: "thread-1",
+    imagePaths: ["C:/runtime/native-sticker.png"],
+    mediaType: "native_sticker",
+    nativeStickerCount: 2,
+    nativeStickerLabels: ["大笑", "捂脸"],
+  });
+  assert.equal(result.reply, "笑得这么开心啊");
+  assert.match(turn.input[0].text, /抖音内置表情消息/u);
+  assert.match(turn.input[0].text, /对应 2 个内置表情/u);
+  assert.match(turn.input[0].text, /大笑、捂脸/u);
+  assert.match(turn.input[0].text, /仅作画面理解的辅助，以视觉截图为准/u);
+  assert.match(turn.input[0].text, /不要逐项描述图片/u);
+  assert.match(turn.input[0].text, /"mode":"native-sticker"/u);
+  assert.deepEqual(turn.input[1], {
+    type: "localImage",
+    path: "C:/runtime/native-sticker.png",
+  });
+});
+
 test("returns a private media-like decision without leaking its control marker", async () => {
   let prompt;
   const result = await generateDouyinImageReply({

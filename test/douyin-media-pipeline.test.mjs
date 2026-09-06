@@ -30,6 +30,7 @@ test("uses a static, non-overlapping media adapter registry", () => {
   assert.deepEqual(
     DOUYIN_MEDIA_ADAPTER_REGISTRY.map(({ key, mediaTypes }) => ({ key, mediaTypes })),
     [
+      { key: "native-sticker", mediaTypes: ["native_sticker"] },
       { key: "direct-image", mediaTypes: ["chat_image"] },
       { key: "shared-work", mediaTypes: ["shared_aweme"] },
       { key: "comment-share", mediaTypes: ["comment_share"] },
@@ -43,6 +44,7 @@ test("uses a static, non-overlapping media adapter registry", () => {
       { key: "cover-only", mediaTypes: ["shared_cover"] },
     ],
   );
+  assert.equal(matchDouyinMediaAdapter("native_sticker").key, "native-sticker");
   assert.equal(matchDouyinMediaAdapter("chat_image").key, "direct-image");
   assert.equal(matchDouyinMediaAdapter("comment_share").key, "comment-share");
   assert.equal(matchDouyinMediaAdapter("unknown"), null);
@@ -50,6 +52,41 @@ test("uses a static, non-overlapping media adapter registry", () => {
     { mediaTypes: ["chat_image"], acquire() {} },
     { mediaTypes: ["chat_image"], acquire() {} },
   ]), /Multiple Douyin media registry entries/u);
+});
+
+test("keeps native-sticker acquisition isolated and exposes visual evidence", async () => {
+  const result = await acquireDouyinMedia({
+    ...baseContext,
+    mediaType: "native_sticker",
+    dependencies: {
+      captureNativeSticker: async ({ mediaMessage }) => {
+        assert.equal(mediaMessage, baseContext.mediaMessage);
+        return {
+          jobDirectory: "C:/runtime/sticker-job",
+          imagePaths: ["C:/runtime/native-sticker.png"],
+          emojiCount: 2,
+        };
+      },
+      captureChatImage: async () => {
+        throw new Error("Direct-image adapter must not run.");
+      },
+    },
+  });
+  assert.deepEqual(result, {
+    kind: "native_sticker",
+    jobDirectory: "C:/runtime/sticker-job",
+    imagePaths: ["C:/runtime/native-sticker.png"],
+    emojiCount: 2,
+    evidence: {
+      version: 1,
+      mode: "native-sticker",
+      assetCount: 1,
+      totalAssetCount: 2,
+      audioStatus: "not-applicable",
+      limitations: ["some-native-stickers-unavailable"],
+      orderedAssets: [{ type: "image", ordinal: 1 }],
+    },
+  });
 });
 
 test("keeps direct chat image acquisition isolated from shared-work dependencies", async () => {

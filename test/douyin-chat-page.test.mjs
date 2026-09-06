@@ -23,6 +23,7 @@ import {
   buildReadIncomingTextBatchExpression,
   buildReadIncomingCommentShareExpression,
   buildReadIncomingMediaTextExpression,
+  buildReadIncomingNativeStickerSourcesExpression,
   buildReadCompatibleAwemeMediaExpression,
   buildReadLatestIncomingTextExpression,
   buildReadOpenSharedWorkStateExpression,
@@ -80,9 +81,34 @@ test("message metadata hashes content without returning it", () => {
   assert.match(expression, /fiber\.pendingProps/u);
   assert.match(expression, /fiber\.alternate\?\.pendingProps/u);
   assert.match(expression, /identities\.size === 1/u);
+  assert.match(expression, /TextMessageTextemoji/u);
+  assert.match(expression, /native-sticker-v1/u);
+  assert.match(expression, /hasNativeSticker/u);
   assert.doesNotMatch(expression, /slice\(0, 16\)/u);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/);
   assert.doesNotMatch(expression, /messages\.push\(\{[\s\S]*?\bsource,?\s*\}/);
+});
+
+test("classifies and reads ordered Douyin native stickers as bounded visual media", () => {
+  const exactMessage = {
+    ordinalFromEnd: 2,
+    fingerprint: "a".repeat(64),
+    kind: "media",
+    side: "left",
+  };
+  const classification = buildClassifyLatestIncomingMediaExpression(exactMessage);
+  const mediaText = buildReadIncomingMediaTextExpression(exactMessage);
+  const sources = buildReadIncomingNativeStickerSourcesExpression(exactMessage);
+  assert.match(classification, /mediaType: 'native_sticker'/u);
+  assert.match(classification, /emojiCount/u);
+  assert.match(mediaText, /nativeStickerLabels/u);
+  assert.match(mediaText, /getAttribute\('title'\)/u);
+  assert.match(sources, /currentSrc/u);
+  assert.doesNotMatch(sources, /\.src\b|getAttribute\(['"]src/u);
+  for (const expression of [classification, mediaText, sources]) {
+    assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
+    assert.doesNotThrow(() => new Function(`return ${expression}`));
+  }
 });
 
 test("builds bounded shared-work quote actions and page-local ownership", () => {

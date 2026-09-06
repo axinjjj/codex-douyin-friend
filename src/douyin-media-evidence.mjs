@@ -5,6 +5,7 @@ export const DOUYIN_EVIDENCE_MODES = Object.freeze({
   COMPLETE_IMAGES: "complete-images",
   PARTIAL_IMAGES: "partial-images",
   DIRECT_IMAGE: "direct-image",
+  NATIVE_STICKER: "native-sticker",
   COVER_ONLY: "cover-only",
 });
 
