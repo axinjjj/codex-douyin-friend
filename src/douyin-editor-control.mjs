@@ -16,7 +16,9 @@ const focusEmptyEditorExpression = `(() => {
   const visible = (element) => {
     const rect = element.getBoundingClientRect();
     const style = getComputedStyle(element);
-    return rect.width > 0 && rect.height > 0 && style.display !== 'none'
+    const minimizedViewport = window.innerWidth <= 100 && document.visibilityState === 'hidden';
+    return element.isConnected && rect.height > 0 && (rect.width > 0 || minimizedViewport)
+      && style.display !== 'none'
       && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
   };
   const editors = Array.from(document.querySelectorAll(

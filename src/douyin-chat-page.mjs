@@ -2542,7 +2542,9 @@ export function buildVerifyChatEditorReadyExpression({
       .filter((candidate) => {
         const rectangle = candidate.getBoundingClientRect();
         const style = getComputedStyle(candidate);
-        return rectangle.width > 0 && rectangle.height > 0
+        const minimizedViewport = window.innerWidth <= 100 && document.visibilityState === 'hidden';
+        return candidate.isConnected && rectangle.height > 0
+          && (rectangle.width > 0 || minimizedViewport)
           && style.display !== 'none' && style.visibility !== 'hidden';
       });
     if (visibleEditors.length !== 1) {

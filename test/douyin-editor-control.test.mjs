@@ -4,9 +4,11 @@ import { replaceChatEditorText, verifyChatEditorReady } from "../src/douyin-edit
 
 test("uses CDP native text insertion and returns only comparison metadata", async () => {
   const calls = [];
+  const expressions = [];
   let evaluateCount = 0;
   const client = {
-    async evaluate() {
+    async evaluate(expression) {
+      expressions.push(expression);
       evaluateCount += 1;
       return evaluateCount === 1
         ? { ok: true }
@@ -23,6 +25,9 @@ test("uses CDP native text insertion and returns only comparison metadata", asyn
   assert.equal(calls.at(-1).method, "Input.insertText");
   assert.equal(calls.at(-1).params.text, "hello");
   assert.equal(calls.some(({ params }) => params?.key === "Backspace"), false);
+  assert.match(expressions[0], /innerWidth <= 100/u);
+  assert.match(expressions[0], /visibilityState === 'hidden'/u);
+  assert.match(expressions[0], /rect\.width > 0 \|\| minimizedViewport/u);
 });
 
 test("does not replace a pre-existing editor draft", async () => {
@@ -53,6 +58,8 @@ test("builds one atomic chat and editor authority preflight", async () => {
   assert.equal(result.ok, true);
   assert.match(expression, /crypto\.subtle\.digest\('SHA-256'/u);
   assert.match(expression, /visibleEditors\.length !== 1/u);
+  assert.match(expression, /innerWidth <= 100/u);
+  assert.match(expression, /rectangle\.width > 0 \|\| minimizedViewport/u);
   assert.match(expression, /document\.activeElement !== editor/u);
   assert.match(expression, /ownsInsertedText = actual === expected/u);
   assert.match(expression, /canClear: ownsInsertedText/u);
