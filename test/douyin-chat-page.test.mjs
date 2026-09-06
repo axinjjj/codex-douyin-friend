@@ -77,6 +77,9 @@ test("message metadata hashes content without returning it", () => {
   assert.match(expression, /MessageBoxRefContainerrefContainer/u);
   assert.match(expression, /quoted-text-v1/u);
   assert.match(expression, /MessageItemShareAwemerefContainer/u);
+  assert.match(expression, /fiber\.pendingProps/u);
+  assert.match(expression, /fiber\.alternate\?\.pendingProps/u);
+  assert.match(expression, /identities\.size === 1/u);
   assert.doesNotMatch(expression, /slice\(0, 16\)/u);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/);
   assert.doesNotMatch(expression, /messages\.push\(\{[\s\S]*?\bsource,?\s*\}/);

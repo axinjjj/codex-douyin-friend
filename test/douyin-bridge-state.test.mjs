@@ -11,6 +11,7 @@ import {
   computeQuotedTextMessageFingerprint,
   computeTextMessageFingerprint,
   createBridgeState,
+  DouyinRecoverySafetyError,
   findAppendedMessages,
   loadBridgeState,
   rebindPendingMessages,
@@ -27,6 +28,17 @@ const message = (character, side = "left", kind = "text") => ({
   fingerprint: fingerprint(character),
   kind,
   side,
+});
+const quotedMessage = ({
+  target = "target",
+  primary = "quoted-reply",
+  legacy = "quoted-card",
+} = {}) => ({
+  fingerprint: fingerprint(primary),
+  kind: "text",
+  side: "right",
+  legacyFingerprint: fingerprint(legacy),
+  ...(target === null ? {} : { quoteTargetFingerprint: fingerprint(target) }),
 });
 const snapshot = (messageCount, messages) => ({ messageCount, messages });
 
@@ -247,6 +259,69 @@ test("derives appends when Douyin replaces the oldest items in a fixed DOM windo
   ]);
 });
 
+test("keeps a fixed-window checkpoint boundary when an old quote target becomes unobservable", () => {
+  const previousMessages = [
+    ..."abcdefghij".split("").map((value) => message(value)),
+    quotedMessage(),
+  ];
+  const retained = previousMessages.slice(2).map((entry) => ({ ...entry }));
+  delete retained.at(-1).quoteTargetFingerprint;
+  const nextMedia = message("next-media", "left", "media");
+  const nextText = message("next-text");
+  const appended = findAppendedMessages(
+    snapshot(11, previousMessages),
+    snapshot(11, [...retained, nextMedia, nextText]),
+  );
+  assert.deepEqual(appended, [
+    { ...nextMedia, ordinalFromEnd: 2 },
+    { ...nextText, ordinalFromEnd: 1 },
+  ]);
+});
+
+test("keeps a checkpoint boundary when an old quote target becomes observable", () => {
+  const priorQuote = quotedMessage({ target: null });
+  const currentQuote = quotedMessage();
+  const before = snapshot(3, [message("a"), priorQuote, message("b")]);
+  const after = snapshot(5, [message("a"), currentQuote, message("b"), message("c"), message("d")]);
+  assert.deepEqual(findAppendedMessages(before, after), [
+    { ...message("c"), ordinalFromEnd: 2 },
+    { ...message("d"), ordinalFromEnd: 1 },
+  ]);
+});
+
+test("does not invent activity when a quote target flickers inside a multi-message checkpoint", () => {
+  const visible = [message("a"), quotedMessage(), message("b")];
+  const degraded = visible.map((entry) => ({ ...entry }));
+  delete degraded[1].quoteTargetFingerprint;
+  assert.deepEqual(findAppendedMessages(snapshot(3, visible), snapshot(3, degraded)), []);
+  assert.deepEqual(findAppendedMessages(snapshot(3, degraded), snapshot(3, visible)), []);
+});
+
+test("never relaxes a one-message or conflicting quote checkpoint", () => {
+  const exact = quotedMessage();
+  const missing = quotedMessage({ target: null });
+  const different = quotedMessage({ target: "different-target" });
+  const wrongLegacy = quotedMessage({ target: null, legacy: "different-card" });
+  assert.throws(
+    () => findAppendedMessages(snapshot(1, [exact]), snapshot(1, [missing])),
+    /no longer matches/u,
+  );
+  assert.throws(
+    () => findAppendedMessages(
+      snapshot(2, [message("a"), exact]),
+      snapshot(2, [message("a"), different]),
+    ),
+    /no longer matches/u,
+  );
+  assert.throws(
+    () => findAppendedMessages(
+      snapshot(2, [message("a"), exact]),
+      snapshot(2, [message("a"), wrongLegacy]),
+    ),
+    /no longer matches/u,
+  );
+});
+
 test("does not invent an append when an unchanged fixed window has duplicate fingerprints", () => {
   const duplicate = message("same", "left", "media");
   const unchanged = snapshot(30, Array.from({ length: 12 }, () => ({ ...duplicate })));
@@ -447,7 +522,9 @@ test("refuses automatic recovery for an ambiguous in-flight Codex turn", () => {
   });
   assert.throws(
     () => recoverBridgeStateForStartup(processing, snapshot(1, [message("a")])),
-    /incomplete/u,
+    (error) => error instanceof DouyinRecoverySafetyError
+      && error.code === "DOUYIN_RECOVERY_SAFETY_STOP"
+      && /incomplete/u.test(error.message),
   );
 });
 
@@ -527,7 +604,9 @@ test("fresh-thread recovery refuses changed chats and sending checkpoints", () =
   });
   assert.throws(
     () => recoverBridgeStateForFreshThread(processing, snapshot(2, [pending, message("new")])),
-    /chat changed/u,
+    (error) => error instanceof DouyinRecoverySafetyError
+      && error.code === "DOUYIN_RECOVERY_SAFETY_STOP"
+      && /chat changed/u.test(error.message),
   );
   const sending = createBridgeState({
     chatKey,
@@ -542,5 +621,24 @@ test("fresh-thread recovery refuses changed chats and sending checkpoints", () =
   assert.throws(
     () => recoverBridgeStateForFreshThread(sending, snapshot(1, [pending])),
     /cannot be moved/u,
+  );
+
+  const exactQuote = quotedMessage();
+  const degradedQuote = quotedMessage({ target: null });
+  const quotedQueue = createBridgeState({
+    chatKey,
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
+    snapshot: snapshot(2, [exactQuote, pending]),
+    phase: "queued",
+    pending: [pending],
+  });
+  assert.throws(
+    () => recoverBridgeStateForFreshThread(
+      quotedQueue,
+      snapshot(2, [degradedQuote, pending]),
+    ),
+    /chat changed/u,
   );
 });

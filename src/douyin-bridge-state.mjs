@@ -16,6 +16,22 @@ const KINDS = new Set(["text", "media", "system", "unknown"]);
 const PHASES = new Set(["ready", "queued", "processing", "reply-ready", "sending", "blocked"]);
 const BLOCKED_REASON_PATTERN = /^[a-z0-9-]{1,80}$/u;
 
+export class DouyinCheckpointBoundaryError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "DouyinCheckpointBoundaryError";
+    this.code = "DOUYIN_CHECKPOINT_BOUNDARY_UNAVAILABLE";
+  }
+}
+
+export class DouyinRecoverySafetyError extends Error {
+  constructor(message, options = undefined) {
+    super(message, options);
+    this.name = "DouyinRecoverySafetyError";
+    this.code = "DOUYIN_RECOVERY_SAFETY_STOP";
+  }
+}
+
 function isPlainObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -363,6 +379,28 @@ function sameMessage(left, right) {
   return legacyIdentity;
 }
 
+function sameCheckpointBoundaryMessage(left, right) {
+  if (sameMessage(left, right)) return true;
+  if (left.side !== "right" || right.side !== "right"
+      || left.kind !== "text" || right.kind !== "text"
+      || left.fingerprint !== right.fingerprint
+      || !left.legacyFingerprint
+      || left.legacyFingerprint !== right.legacyFingerprint) {
+    return false;
+  }
+  const leftQuoteTarget = left.quoteTargetFingerprint ?? null;
+  const rightQuoteTarget = right.quoteTargetFingerprint ?? null;
+  return (leftQuoteTarget === null) !== (rightQuoteTarget === null);
+}
+
+function checkpointBoundaryMatches(leftMessages, rightMessages) {
+  return leftMessages.length === rightMessages.length
+    && leftMessages.length >= 2
+    && leftMessages.every((message, index) => (
+      sameCheckpointBoundaryMessage(message, rightMessages[index])
+    ));
+}
+
 export function rebindPendingMessages(snapshot, pendingMessages) {
   const current = normalizeBridgeSnapshot(snapshot);
   if (!Array.isArray(pendingMessages) || pendingMessages.length === 0
@@ -414,13 +452,18 @@ export function findAppendedMessages(previousSnapshot, currentSnapshot) {
   }
 
   if (appendedCount === 0
+      && checkpointBoundaryMatches(previous.messages, current.messages)) {
+    return [];
+  }
+
+  if (appendedCount === 0
       && previous.messages.length === current.messages.length
       && current.messages.length >= 3) {
     let overlapCount = 0;
     for (let candidate = current.messages.length - 1; candidate >= 2; candidate -= 1) {
       const previousBoundary = previous.messages.slice(-candidate);
       const currentBoundary = current.messages.slice(0, candidate);
-      if (previousBoundary.every((message, index) => sameMessage(message, currentBoundary[index]))) {
+      if (checkpointBoundaryMatches(previousBoundary, currentBoundary)) {
         overlapCount = candidate;
         break;
       }
@@ -434,20 +477,31 @@ export function findAppendedMessages(previousSnapshot, currentSnapshot) {
   }
 
   if (appendedCount < 0) {
-    throw new Error("Douyin message count moved backwards; refusing checkpoint recovery.");
+    throw new DouyinCheckpointBoundaryError(
+      "Douyin message count moved backwards; refusing checkpoint recovery.",
+    );
   }
   if (appendedCount > current.messages.length) {
-    throw new Error("New Douyin messages exceed the visible checkpoint window.");
+    throw new DouyinCheckpointBoundaryError(
+      "New Douyin messages exceed the visible checkpoint window.",
+    );
   }
 
   const retainedCount = current.messages.length - appendedCount;
   if (retainedCount > previous.messages.length) {
-    throw new Error("Douyin visible history grew without an append-only checkpoint boundary.");
+    throw new DouyinCheckpointBoundaryError(
+      "Douyin visible history grew without an append-only checkpoint boundary.",
+    );
   }
   const retainedPrevious = previous.messages.slice(previous.messages.length - retainedCount);
   const retainedCurrent = current.messages.slice(0, retainedCount);
-  if (!retainedPrevious.every((message, index) => sameMessage(message, retainedCurrent[index]))) {
-    throw new Error("Douyin visible history no longer matches the persisted checkpoint.");
+  const retainedExactly = retainedPrevious.every(
+    (message, index) => sameMessage(message, retainedCurrent[index]),
+  );
+  if (!retainedExactly && !checkpointBoundaryMatches(retainedPrevious, retainedCurrent)) {
+    throw new DouyinCheckpointBoundaryError(
+      "Douyin visible history no longer matches the persisted checkpoint.",
+    );
   }
 
   return current.messages.slice(retainedCount).map((message, index) => ({
@@ -480,7 +534,7 @@ export function computeQuotedTextMessageFingerprint(
   return createHash("sha256").update(structuralKey, "utf8").digest("hex");
 }
 
-export function recoverBridgeStateForStartup(state, currentSnapshot) {
+function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
   const normalized = validateBridgeState(state);
   const action = normalized.checkpoint.action;
   if (normalized.checkpoint.phase === "ready") {
@@ -641,7 +695,24 @@ export function recoverBridgeStateForStartup(state, currentSnapshot) {
   };
 }
 
-export function recoverBridgeStateForFreshThread(state, currentSnapshot) {
+export function recoverBridgeStateForStartup(state, currentSnapshot) {
+  try {
+    return recoverBridgeStateForStartupInternal(state, currentSnapshot);
+  } catch (error) {
+    if (error instanceof DouyinCheckpointBoundaryError
+        || error instanceof DouyinRecoverySafetyError) {
+      throw error;
+    }
+    throw new DouyinRecoverySafetyError(
+      error instanceof Error
+        ? error.message
+        : "The persisted bridge checkpoint cannot be recovered safely.",
+      { cause: error },
+    );
+  }
+}
+
+function recoverBridgeStateForFreshThreadInternal(state, currentSnapshot) {
   const normalized = validateBridgeState(state);
   const phase = normalized.checkpoint.phase;
   const explicitlyRecoverable = phase === "processing"
@@ -712,4 +783,21 @@ export function recoverBridgeStateForFreshThread(state, currentSnapshot) {
     }),
     recoveredPendingCount: pending.length,
   };
+}
+
+export function recoverBridgeStateForFreshThread(state, currentSnapshot) {
+  try {
+    return recoverBridgeStateForFreshThreadInternal(state, currentSnapshot);
+  } catch (error) {
+    if (error instanceof DouyinCheckpointBoundaryError
+        || error instanceof DouyinRecoverySafetyError) {
+      throw error;
+    }
+    throw new DouyinRecoverySafetyError(
+      error instanceof Error
+        ? error.message
+        : "The interrupted bridge checkpoint cannot be moved safely.",
+      { cause: error },
+    );
+  }
 }

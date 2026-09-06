@@ -286,7 +286,11 @@ const STABLE_MEDIA_FINGERPRINT_SOURCE = `
           for (let fiberDepth = 0; fiber && fiberDepth < 16;
             fiberDepth += 1, fiber = fiber.return) {
             inspectObjectGraph(fiber.memoizedProps);
+            inspectObjectGraph(fiber.pendingProps);
             inspectObjectGraph(fiber.memoizedState);
+            inspectObjectGraph(fiber.alternate?.memoizedProps);
+            inspectObjectGraph(fiber.alternate?.pendingProps);
+            inspectObjectGraph(fiber.alternate?.memoizedState);
           }
         }
       }

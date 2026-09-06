@@ -10,7 +10,9 @@ import {
 } from "../src/codex-context-compaction.mjs";
 import { CdpClient } from "../src/cdp-client.mjs";
 import {
+  classifyBridgeTerminalFailure,
   createBridgeControlChannel,
+  createBridgeTerminalEvent,
   writeBridgeEvent,
 } from "../src/douyin-bridge-control.mjs";
 import {
@@ -41,6 +43,8 @@ import {
   computeQuotedTextMessageFingerprint,
   computeTextMessageFingerprint,
   createBridgeState,
+  DouyinCheckpointBoundaryError,
+  DouyinRecoverySafetyError,
   findAppendedMessages,
   loadBridgeState,
   normalizeBridgeSnapshot,
@@ -247,7 +251,9 @@ try {
   const startupSnapshot = normalizeBridgeSnapshot(startupView.snapshot);
   const loadedState = await loadBridgeState(projectRoot, lockedChat.fingerprint);
   if (loadedState.status === "corrupt") {
-    throw new Error("Both bridge checkpoint copies are unreadable; refusing an ambiguous restart.");
+    throw new DouyinRecoverySafetyError(
+      "Both bridge checkpoint copies are unreadable; refusing an ambiguous restart.",
+    );
   }
   let storedState = loadedState.state;
   let recoveredVerifiedSend = false;
@@ -333,7 +339,9 @@ try {
     const turnId = startupResumeAction.turnIds.at(-1);
     const recoveredTurn = await codex.readTurn({ threadId: runtime.threadId, turnId });
     if (!recoveredTurn.found || recoveredTurn.status !== "completed" || !recoveredTurn.text) {
-      throw new Error("The persisted Codex turn cannot be recovered without duplication.");
+      throw new DouyinRecoverySafetyError(
+        "The persisted Codex turn cannot be recovered without duplication.",
+      );
     }
     let recoveredReply;
     let reactionDecision = "disabled";
@@ -341,19 +349,31 @@ try {
     if (startupResumeAction.replyKind === "text") {
       recoveredReply = normalizeOutboundText(recoveredTurn.text);
     } else {
-      const parsed = parseDouyinMediaReply(recoveredTurn.text, {
-        reactionEnabled: Boolean(startupResumeAction.reactionNonce),
-        nonce: startupResumeAction.reactionNonce,
-      });
+      let parsed;
+      try {
+        parsed = parseDouyinMediaReply(recoveredTurn.text, {
+          reactionEnabled: Boolean(startupResumeAction.reactionNonce),
+          nonce: startupResumeAction.reactionNonce,
+        });
+      } catch (error) {
+        throw new DouyinRecoverySafetyError(
+          "The persisted Codex media reply is invalid.",
+          { cause: error },
+        );
+      }
       recoveredReply = parsed.reply;
       reactionDecision = parsed.reactionDecision;
       shouldLike = parsed.shouldLike;
     }
-    if (!recoveredReply) throw new Error("The persisted Codex reply is empty.");
+    if (!recoveredReply) {
+      throw new DouyinRecoverySafetyError("The persisted Codex reply is empty.");
+    }
     const replyDigest = computeDouyinReplyDigest(recoveredReply);
     if (startupResumeAction.replyDigest
         && startupResumeAction.replyDigest !== replyDigest) {
-      throw new Error("The persisted Codex reply digest does not match the recovered turn.");
+      throw new DouyinRecoverySafetyError(
+        "The persisted Codex reply digest does not match the recovered turn.",
+      );
     }
     resumedReply = {
       action: startupResumeAction,
@@ -1070,8 +1090,10 @@ try {
           action: currentAction,
         });
         await saveBridgeState(projectRoot, activeState);
-        if (["chat-changed", "editor-authority-lost", "quote-authority-lost"].includes(error.reason)) {
+        if (error.reason === "chat-changed") {
           process.exitCode = 4;
+        } else if (["editor-authority-lost", "quote-authority-lost"].includes(error.reason)) {
+          process.exitCode = 8;
         }
         setBridgePhase(error.reason === "stop" ? "stopping" : "blocked");
         console.log(JSON.stringify({
@@ -1082,8 +1104,15 @@ try {
               ? "media-quote-authority-lost-before-send"
             : error.reason === "editor-authority-lost"
               ? "editor-authority-lost-before-send"
-              : "chat-changed-before-send",
+            : "chat-changed-before-send",
         }));
+        if (supervised && ["editor-authority-lost", "quote-authority-lost"].includes(error.reason)) {
+          emitBridgeEvent(createBridgeTerminalEvent({
+            disposition: "recover",
+            reason: "ui-authority-recovery-required",
+            phase: "reply-ready",
+          }));
+        }
         break;
       }
       const { outgoing, afterSend } = sendResult;
@@ -1266,6 +1295,14 @@ try {
   }
   setBridgePhase("stopped");
 } catch (error) {
+  if (supervised) emitBridgeEvent(classifyBridgeTerminalFailure({
+    errorCode: error instanceof DouyinCheckpointBoundaryError
+      || error instanceof DouyinRecoverySafetyError
+      ? error.code
+      : null,
+    exitCode: process.exitCode,
+    phase: currentPhase,
+  }));
   if (uncommittedStartupThreadId) {
     await codex.request("thread/archive", { threadId: uncommittedStartupThreadId }).catch(() => {});
     uncommittedStartupThreadId = null;

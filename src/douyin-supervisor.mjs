@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import readline from "node:readline";
+import { parseBridgeTerminalEvent } from "./douyin-bridge-control.mjs";
 import { validateDouyinSendCapability } from "./douyin-send-capability.mjs";
 
 const SAFETY_EXIT_CODES = new Set([3, 4, 5, 6, 7]);
@@ -180,6 +181,7 @@ export class DouyinSupervisor extends EventEmitter {
     this.plannedStop = false;
     this.restartTimer = null;
     this.restartTimes = [];
+    this.bridgeTerminal = null;
     this.forceFreshThread = false;
     this.currentChatBinding = null;
     this.models = [];
@@ -405,13 +407,16 @@ export class DouyinSupervisor extends EventEmitter {
       },
     });
     this.forceFreshThread = false;
+    this.bridgeTerminal = null;
     this.child = child;
     this.plannedStop = false;
     this.#update({ bridge: "running", appServer: "starting", phase: "starting", lastError: null });
     this.stdoutReader = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
     this.stdoutReader.on("line", (line) => this.#handleBridgeLine(line));
     child.stderr.on("data", () => {
-      this.#update({ lastError: { event: "bridge-stderr", reason: "private-diagnostics-hidden" } });
+      if (!this.bridgeTerminal) {
+        this.#update({ lastError: { event: "bridge-stderr", reason: "private-diagnostics-hidden" } });
+      }
     });
     child.once("error", () => this.#handleBridgeExit(null, "spawn-error"));
     child.once("exit", (code, signal) => this.#handleBridgeExit(code, signal));
@@ -426,19 +431,34 @@ export class DouyinSupervisor extends EventEmitter {
       return;
     }
     if (!event || typeof event.event !== "string") return;
+    if (event.event === "bridge-terminal") {
+      try {
+        this.bridgeTerminal = parseBridgeTerminalEvent(event);
+      } catch {
+        return;
+      }
+      this.#update({
+        lastError: {
+          event: "bridge-terminal",
+          disposition: this.bridgeTerminal.disposition,
+          reason: this.bridgeTerminal.reason,
+        },
+      });
+      return;
+    }
     if (event.event === "bridge-ready") {
       try {
         this.currentChatBinding = validateDouyinSendCapability(event.sendBinding);
       } catch {
         this.currentChatBinding = null;
       }
-      this.restartTimes = [];
       this.#update({
         bridge: "running",
         appServer: "ready",
         audio: event.audioEnabled ? "ready" : "unavailable",
         edge: "ready",
         phase: "listening",
+        restartAttempt: 0,
         model: String(event.model || this.config.model),
         effort: String(event.effort || this.config.effort),
         mediaReactionEnabled: Boolean(event.mediaReactionEnabled),
@@ -483,6 +503,8 @@ export class DouyinSupervisor extends EventEmitter {
 
   #handleBridgeExit(code, signal) {
     if (!this.child) return;
+    const terminal = this.bridgeTerminal;
+    this.bridgeTerminal = null;
     this.stdoutReader?.close();
     this.stdoutReader = null;
     this.child = null;
@@ -491,6 +513,22 @@ export class DouyinSupervisor extends EventEmitter {
     this.#update({ bridge: "offline", appServer: "offline" });
     if (code === 4) this.#revokeSendCapability("binding-invalidated");
     if (!this.desiredRunning || wasPlanned) return;
+    const terminalExitCompatible = terminal?.disposition === "block"
+      || (terminal?.reason === "ui-authority-recovery-required"
+        ? code === 8
+        : terminal && code !== 8 && !SAFETY_EXIT_CODES.has(code));
+    if (terminal && !terminalExitCompatible) {
+      this.#block("terminal-exit-mismatch");
+      return;
+    }
+    if (terminal?.disposition === "block") {
+      this.#block(terminal.reason);
+      return;
+    }
+    if (terminal?.disposition === "retry" || terminal?.disposition === "recover") {
+      this.#scheduleRestart();
+      return;
+    }
     if (SAFETY_EXIT_CODES.has(code) || DANGEROUS_PHASES.has(this.status.phase)) {
       this.#block(`bridge-exit-${code ?? signal ?? "unknown"}`);
       return;
@@ -503,7 +541,19 @@ export class DouyinSupervisor extends EventEmitter {
     const cutoff = this.now() - RESTART_WINDOW_MS;
     this.restartTimes = this.restartTimes.filter((timestamp) => timestamp >= cutoff);
     if (this.restartTimes.length >= MAX_RESTARTS_PER_WINDOW) {
-      this.#block("restart-limit-reached");
+      this.#update({
+        phase: "restarting",
+        restartAttempt: MAX_RESTARTS_PER_WINDOW,
+      });
+      this.restartTimer = this.setTimer(() => {
+        this.restartTimer = null;
+        this.start().catch(() => {
+          this.#update({
+            lastError: { event: "supervisor-restart-failed", reason: "start-threw" },
+          });
+          this.#scheduleRestart();
+        });
+      }, RESTART_DELAYS_MS.at(-1));
       return;
     }
     const attempt = this.restartTimes.length;
@@ -512,7 +562,12 @@ export class DouyinSupervisor extends EventEmitter {
     this.#update({ phase: "restarting", restartAttempt: attempt + 1 });
     this.restartTimer = this.setTimer(() => {
       this.restartTimer = null;
-      this.start().catch(() => this.#block("restart-failed"));
+      this.start().catch(() => {
+        this.#update({
+          lastError: { event: "supervisor-restart-failed", reason: "start-threw" },
+        });
+        this.#scheduleRestart();
+      });
     }, delay);
   }
 

@@ -245,6 +245,237 @@ test("restarts an idle crash with bounded backoff", async (t) => {
   assert.equal(children.length, 2);
 });
 
+test("blocks once on an explicit checkpoint terminal event without preserving stderr", async (t) => {
+  const root = await temporaryRoot(t);
+  const child = new FakeChild();
+  const timers = [];
+  const supervisor = await createDouyinSupervisor({
+    projectRoot: root,
+    nodePath: process.execPath,
+    fetchFn: readyFetch,
+    spawnProcess: () => child,
+    setTimer(callback, delay) {
+      timers.push({ callback, delay });
+      return timers.length;
+    },
+    clearTimer() {},
+  });
+  await supervisor.start();
+  child.stdout.write(`${JSON.stringify({
+    version: 1,
+    event: "bridge-terminal",
+    disposition: "block",
+    reason: "checkpoint-boundary-unavailable",
+    phase: "listening",
+  })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  child.stderr.write("private-chat-content-must-not-enter-status");
+  child.emit("exit", 1, null);
+
+  const status = supervisor.getStatus();
+  assert.equal(status.phase, "blocked");
+  assert.equal(status.lastError.reason, "checkpoint-boundary-unavailable");
+  assert.equal(timers.length, 0);
+  assert.doesNotMatch(JSON.stringify(status), /private-chat-content/u);
+});
+
+test("restarts an explicitly recoverable persisted action even from a dangerous phase", async (t) => {
+  const root = await temporaryRoot(t);
+  const child = new FakeChild();
+  const timers = [];
+  const sendCapability = {
+    version: 1,
+    chatFingerprint: "a".repeat(64),
+    targetId: "target-1",
+    pageEpoch: "b".repeat(64),
+    pageUrlHash: "c".repeat(64),
+  };
+  const supervisor = await createDouyinSupervisor({
+    projectRoot: root,
+    nodePath: process.execPath,
+    config: { version: 1, sendEnabled: true, sendCapability },
+    fetchFn: readyFetch,
+    spawnProcess: () => child,
+    setTimer(callback, delay) {
+      timers.push({ callback, delay });
+      return timers.length;
+    },
+    clearTimer() {},
+  });
+  await supervisor.start();
+  child.stdout.write('{"event":"bridge-status","phase":"sending"}\n');
+  child.stdout.write(`${JSON.stringify({
+    version: 1,
+    event: "bridge-terminal",
+    disposition: "recover",
+    reason: "ui-authority-recovery-required",
+    phase: "reply-ready",
+  })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  child.emit("exit", 8, null);
+
+  assert.equal(supervisor.getStatus().phase, "restarting");
+  assert.equal(supervisor.getStatus().sendEnabled, true);
+  assert.equal(timers[0].delay, 2_000);
+});
+
+test("rejects an invalid retry tuple in a dangerous phase", async (t) => {
+  const root = await temporaryRoot(t);
+  const child = new FakeChild();
+  const timers = [];
+  const supervisor = await createDouyinSupervisor({
+    projectRoot: root,
+    nodePath: process.execPath,
+    fetchFn: readyFetch,
+    spawnProcess: () => child,
+    setTimer(callback, delay) {
+      timers.push({ callback, delay });
+      return timers.length;
+    },
+    clearTimer() {},
+  });
+  await supervisor.start();
+  child.stdout.write('{"event":"bridge-status","phase":"sending"}\n');
+  child.stdout.write(`${JSON.stringify({
+    version: 1,
+    event: "bridge-terminal",
+    disposition: "retry",
+    reason: "runtime-retry-required",
+    phase: "sending",
+  })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  child.emit("exit", 1, null);
+
+  assert.equal(supervisor.getStatus().phase, "blocked");
+  assert.equal(supervisor.getStatus().lastError.reason, "bridge-exit-1");
+  assert.equal(timers.length, 0);
+});
+
+test("requires exit code eight for explicit UI authority recovery", async (t) => {
+  const root = await temporaryRoot(t);
+  const child = new FakeChild();
+  const timers = [];
+  const supervisor = await createDouyinSupervisor({
+    projectRoot: root,
+    nodePath: process.execPath,
+    fetchFn: readyFetch,
+    spawnProcess: () => child,
+    setTimer(callback, delay) {
+      timers.push({ callback, delay });
+      return timers.length;
+    },
+    clearTimer() {},
+  });
+  await supervisor.start();
+  child.stdout.write(`${JSON.stringify({
+    version: 1,
+    event: "bridge-terminal",
+    disposition: "recover",
+    reason: "ui-authority-recovery-required",
+    phase: "reply-ready",
+  })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  child.emit("exit", 1, null);
+
+  assert.equal(supervisor.getStatus().phase, "blocked");
+  assert.equal(supervisor.getStatus().lastError.reason, "terminal-exit-mismatch");
+  assert.equal(timers.length, 0);
+});
+
+test("blocks a deterministic persisted-recovery ambiguity without restart churn", async (t) => {
+  const root = await temporaryRoot(t);
+  const child = new FakeChild();
+  const timers = [];
+  const supervisor = await createDouyinSupervisor({
+    projectRoot: root,
+    nodePath: process.execPath,
+    fetchFn: readyFetch,
+    spawnProcess: () => child,
+    setTimer(callback, delay) {
+      timers.push({ callback, delay });
+      return timers.length;
+    },
+    clearTimer() {},
+  });
+  await supervisor.start();
+  child.stdout.write(`${JSON.stringify({
+    version: 1,
+    event: "bridge-terminal",
+    disposition: "block",
+    reason: "persisted-recovery-ambiguous",
+    phase: "starting",
+  })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  child.emit("exit", 1, null);
+
+  assert.equal(supervisor.getStatus().phase, "blocked");
+  assert.equal(supervisor.getStatus().lastError.reason, "persisted-recovery-ambiguous");
+  assert.equal(timers.length, 0);
+});
+
+test("keeps retrying an idle transient failure at the capped delay instead of going permanently offline", async (t) => {
+  const root = await temporaryRoot(t);
+  const children = [];
+  const timers = [];
+  const supervisor = await createDouyinSupervisor({
+    projectRoot: root,
+    nodePath: process.execPath,
+    fetchFn: readyFetch,
+    now: () => 1_000,
+    spawnProcess() {
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    },
+    setTimer(callback, delay) {
+      timers.push({ callback, delay });
+      return timers.length;
+    },
+    clearTimer() {},
+  });
+  await supervisor.start();
+  for (let failure = 0; failure < 7; failure += 1) {
+    const child = children.at(-1);
+    child.stdout.write('{"event":"bridge-ready","audioEnabled":true}\n');
+    await new Promise((resolve) => setImmediate(resolve));
+    child.stdout.write(`${JSON.stringify({
+      version: 1,
+      event: "bridge-terminal",
+      disposition: "retry",
+      reason: "runtime-retry-required",
+      phase: "listening",
+    })}\n`);
+    await new Promise((resolve) => setImmediate(resolve));
+    child.emit("exit", 1, null);
+    if (failure < 6) {
+      timers.at(-1).callback();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  const status = supervisor.getStatus();
+  assert.equal(status.phase, "restarting");
+  assert.equal(status.restartAttempt, 6);
+  assert.equal(timers.at(-1).delay, 60_000);
+  assert.notEqual(status.lastError?.reason, "restart-limit-reached");
+  timers.at(-1).callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(children.length, 8);
+  const nextChild = children.at(-1);
+  nextChild.stdout.write('{"event":"bridge-ready","audioEnabled":true}\n');
+  nextChild.stdout.write(`${JSON.stringify({
+    version: 1,
+    event: "bridge-terminal",
+    disposition: "retry",
+    reason: "runtime-retry-required",
+    phase: "listening",
+  })}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  nextChild.emit("exit", 1, null);
+  assert.equal(supervisor.getStatus().phase, "restarting");
+  assert.equal(timers.at(-1).delay, 60_000);
+});
+
 test("persists only a validated image-capable model and effort", async (t) => {
   const root = await temporaryRoot(t);
   const configPath = path.join(root, ".runtime", "supervisor", "config.json");
