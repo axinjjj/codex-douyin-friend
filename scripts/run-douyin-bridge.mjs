@@ -395,41 +395,38 @@ try {
       mediaShouldLike: shouldLike,
     };
   }
-  let activeState = resumedReply
-    ? createBridgeState({
+  let activeState;
+  const persistState = async (phase, overrides) => {
+    activeState = createBridgeState({
       chatKey: lockedChat.fingerprint,
       threadId: runtime.threadId,
       model: runtime.model,
       effort: runtime.effort,
       generation: taskGeneration,
+      phase,
+      ...overrides,
+    });
+    await saveBridgeState(projectRoot, activeState);
+  };
+  if (resumedReply) {
+    await persistState("queued", {
       snapshot: previous,
-      phase: "queued",
       pending: queuedIncoming,
       action: resumedReply.action,
-    })
-    : queuedIncoming
-    ? createBridgeState({
-      chatKey: lockedChat.fingerprint,
-      threadId: runtime.threadId,
-      model: runtime.model,
-      effort: runtime.effort,
-      generation: taskGeneration,
+    });
+  } else if (queuedIncoming) {
+    await persistState("queued", {
       snapshot: previous,
-      phase: "queued",
       pending: queuedIncoming,
       action: startupResumeAction,
-    })
-    : createBridgeState({
-      chatKey: lockedChat.fingerprint,
-      threadId: runtime.threadId,
-      model: runtime.model,
-      effort: runtime.effort,
-      generation: taskGeneration,
+    });
+  } else {
+    await persistState("ready", {
       snapshot: previous,
       outboundFingerprint: storedState?.checkpoint.outboundFingerprint ?? null,
       action: startupResumeAction,
     });
-  await saveBridgeState(projectRoot, activeState);
+  }
   if (startupResumeAction
       && ["send-verified", "reaction-attempted"].includes(startupResumeAction.stage)) {
     if (startupResumeAction.stage === "send-verified"
@@ -439,18 +436,11 @@ try {
         startupResumeAction,
         "reaction-attempted",
       );
-      activeState = createBridgeState({
-        chatKey: lockedChat.fingerprint,
-        threadId: runtime.threadId,
-        model: runtime.model,
-        effort: runtime.effort,
-        generation: taskGeneration,
+      await persistState(queuedIncoming?.length ? "queued" : "ready", {
         snapshot: previous,
-        phase: queuedIncoming?.length ? "queued" : "ready",
         pending: queuedIncoming ?? [],
         action: startupResumeAction,
       });
-      await saveBridgeState(projectRoot, activeState);
       try {
         await likeIncomingDouyinMediaMessage({
           cdp,
@@ -463,17 +453,10 @@ try {
       }
     }
     startupResumeAction = null;
-    activeState = createBridgeState({
-      chatKey: lockedChat.fingerprint,
-      threadId: runtime.threadId,
-      model: runtime.model,
-      effort: runtime.effort,
-      generation: taskGeneration,
+    await persistState(queuedIncoming?.length ? "queued" : "ready", {
       snapshot: previous,
-      phase: queuedIncoming?.length ? "queued" : "ready",
       pending: queuedIncoming ?? [],
     });
-    await saveBridgeState(projectRoot, activeState);
   }
   uncommittedStartupThreadId = null;
   if (session.replacedStoredThread && storedState?.threadId
@@ -608,20 +591,13 @@ try {
     if ((expectedOutboundFingerprint !== null && expectedOutgoingIndex < 0)
         || unexpectedOutgoingCount > 0) {
       setBridgePhase("blocked");
-      activeState = createBridgeState({
-        chatKey: lockedChat.fingerprint,
-        threadId: runtime.threadId,
-        model: runtime.model,
-        effort: runtime.effort,
-        generation: taskGeneration,
+      await persistState("blocked", {
         snapshot: current,
-        phase: "blocked",
         pending: incoming,
         blockedReason: expectedOutgoingIndex < 0
           ? "verified-outbound-missing"
           : "concurrent-outgoing-ambiguous",
       });
-      await saveBridgeState(projectRoot, activeState);
       console.log(JSON.stringify({
         ok: false,
         event: "outgoing-activity-ambiguous-bridge-stopped",
@@ -631,15 +607,9 @@ try {
     }
 
     if (incoming.length === 0) {
-      activeState = createBridgeState({
-        chatKey: lockedChat.fingerprint,
-        threadId: runtime.threadId,
-        model: runtime.model,
-        effort: runtime.effort,
-        generation: taskGeneration,
+      await persistState("ready", {
         snapshot: current,
       });
-      await saveBridgeState(projectRoot, activeState);
       previous = current;
       if (unsupportedIncoming.length > 0) {
         console.log(JSON.stringify({
@@ -668,18 +638,11 @@ try {
     }
     if (!queuePlan.ok) {
       setBridgePhase("blocked");
-      activeState = createBridgeState({
-        chatKey: lockedChat.fingerprint,
-        threadId: runtime.threadId,
-        model: runtime.model,
-        effort: runtime.effort,
-        generation: taskGeneration,
+      await persistState("blocked", {
         snapshot: current,
-        phase: "blocked",
         pending: incoming,
         blockedReason: "ambiguous-incoming-batch",
       });
-      await saveBridgeState(projectRoot, activeState);
       console.log(JSON.stringify({
         ok: false,
         event: "ambiguous-incoming-batch-bridge-stopped",
@@ -696,18 +659,11 @@ try {
       replyKind: incomingBatch.mode === "text" ? "text" : null,
     });
     if (!resumedReply) {
-      activeState = createBridgeState({
-        chatKey: lockedChat.fingerprint,
-        threadId: runtime.threadId,
-        model: runtime.model,
-        effort: runtime.effort,
-        generation: taskGeneration,
+      await persistState("processing", {
         snapshot: current,
-        phase: "processing",
         pending: incoming,
         action: currentAction,
       });
-      await saveBridgeState(projectRoot, activeState);
       setBridgePhase("processing");
     }
     const turnStartedAt = Date.now();
@@ -730,35 +686,21 @@ try {
           currentAction = transitionDouyinAction(currentAction, "turn-starting", {
             promptDigest,
           });
-          activeState = createBridgeState({
-            chatKey: lockedChat.fingerprint,
-            threadId: runtime.threadId,
-            model: runtime.model,
-            effort: runtime.effort,
-            generation: taskGeneration,
+          await persistState("processing", {
             snapshot: current,
-            phase: "processing",
             pending: incoming,
             action: currentAction,
           });
-          await saveBridgeState(projectRoot, activeState);
           return contextManager.runTurn({
             ...params,
             onTurnStarted: async ({ turnId }) => {
               const turnIds = [...new Set([...currentAction.turnIds, turnId])].slice(-2);
               currentAction = transitionDouyinAction(currentAction, "turn-started", { turnIds });
-              activeState = createBridgeState({
-                chatKey: lockedChat.fingerprint,
-                threadId: runtime.threadId,
-                model: runtime.model,
-                effort: runtime.effort,
-                generation: taskGeneration,
+              await persistState("processing", {
                 snapshot: current,
-                phase: "processing",
                 pending: incoming,
                 action: currentAction,
               });
-              await saveBridgeState(projectRoot, activeState);
             },
           });
         },
@@ -875,18 +817,11 @@ try {
             reactionNonce,
             reactionTarget: incomingBatch.mediaMessage,
           });
-          activeState = createBridgeState({
-            chatKey: lockedChat.fingerprint,
-            threadId: runtime.threadId,
-            model: runtime.model,
-            effort: runtime.effort,
-            generation: taskGeneration,
+          await persistState("processing", {
             snapshot: current,
-            phase: "processing",
             pending: incoming,
             action: currentAction,
           });
-          await saveBridgeState(projectRoot, activeState);
           const decision = await generateDouyinImageReply({
             codex: journaledCodex,
             threadId: runtime.threadId,
@@ -916,18 +851,11 @@ try {
             reactionNonce,
             reactionTarget: incomingBatch.mediaMessage,
           });
-          activeState = createBridgeState({
-            chatKey: lockedChat.fingerprint,
-            threadId: runtime.threadId,
-            model: runtime.model,
-            effort: runtime.effort,
-            generation: taskGeneration,
+          await persistState("processing", {
             snapshot: current,
-            phase: "processing",
             pending: incoming,
             action: currentAction,
           });
-          await saveBridgeState(projectRoot, activeState);
           const audioUnderstanding = media.audioUnderstanding || {
             processed: false,
             reason: media.audioReason || "audio-track-unavailable",
@@ -1023,19 +951,12 @@ try {
       if ((currentAction.quoteTargetFingerprint ?? null) !== quoteTargetFingerprint) {
         throw new Error("The prepared Douyin quote target does not match its action journal.");
       }
-      activeState = createBridgeState({
-        chatKey: lockedChat.fingerprint,
-        threadId: runtime.threadId,
-        model: runtime.model,
-        effort: runtime.effort,
-        generation: taskGeneration,
+      await persistState("reply-ready", {
         snapshot: current,
-        phase: "reply-ready",
         pending: incoming,
         outboundFingerprint,
         action: currentAction,
       });
-      await saveBridgeState(projectRoot, activeState);
       lastLatencyMs = Date.now() - turnStartedAt;
       setBridgePhase("reply-ready");
       if (stopRequested) {
@@ -1080,19 +1001,12 @@ try {
               }
             }
             currentAction = transitionDouyinAction(currentAction, "send-attempted");
-            activeState = createBridgeState({
-              chatKey: lockedChat.fingerprint,
-              threadId: runtime.threadId,
-              model: runtime.model,
-              effort: runtime.effort,
-              generation: taskGeneration,
+            await persistState("sending", {
               snapshot: current,
-              phase: "sending",
               pending: incoming,
               outboundFingerprint,
               action: currentAction,
             });
-            await saveBridgeState(projectRoot, activeState);
             setBridgePhase("sending");
           },
           onSendCancelledBeforeEnter: async () => {
@@ -1102,37 +1016,23 @@ try {
             if (currentAction.stage !== "reply-ready") {
               throw new Error("The cancelled Douyin send action cannot return to reply-ready.");
             }
-            activeState = createBridgeState({
-              chatKey: lockedChat.fingerprint,
-              threadId: runtime.threadId,
-              model: runtime.model,
-              effort: runtime.effort,
-              generation: taskGeneration,
+            await persistState("reply-ready", {
               snapshot: current,
-              phase: "reply-ready",
               pending: incoming,
               outboundFingerprint,
               action: currentAction,
             });
-            await saveBridgeState(projectRoot, activeState);
             setBridgePhase("reply-ready");
           },
         });
       } catch (error) {
         if (!(error instanceof DouyinSendAbortedError)) throw error;
-        activeState = createBridgeState({
-          chatKey: lockedChat.fingerprint,
-          threadId: runtime.threadId,
-          model: runtime.model,
-          effort: runtime.effort,
-          generation: taskGeneration,
+        await persistState("reply-ready", {
           snapshot: current,
-          phase: "reply-ready",
           pending: incoming,
           outboundFingerprint,
           action: currentAction,
         });
-        await saveBridgeState(projectRoot, activeState);
         if (error.reason === "chat-changed") {
           process.exitCode = 4;
         } else if (["editor-authority-lost", "quote-authority-lost"].includes(error.reason)) {
@@ -1207,19 +1107,12 @@ try {
         : [];
       if (outgoingDuringSend.length !== 1 || unexpectedOutgoing.length > 0) {
         setBridgePhase("blocked");
-        activeState = createBridgeState({
-          chatKey: lockedChat.fingerprint,
-          threadId: runtime.threadId,
-          model: runtime.model,
-          effort: runtime.effort,
-          generation: taskGeneration,
+        await persistState("blocked", {
           snapshot: afterSendSnapshot,
-          phase: "blocked",
           pending: reboundRemaining,
           blockedReason: "concurrent-outgoing-ambiguous",
           action: currentAction,
         });
-        await saveBridgeState(projectRoot, activeState);
         console.log(JSON.stringify({
           ok: false,
           event: "activity-during-send-ambiguous-bridge-stopped",
@@ -1237,34 +1130,20 @@ try {
       currentAction = transitionDouyinAction(currentAction, "send-verified", {
         reactionOrdinalShift: appendedDuringSend.length,
       });
-      activeState = createBridgeState({
-        chatKey: lockedChat.fingerprint,
-        threadId: runtime.threadId,
-        model: runtime.model,
-        effort: runtime.effort,
-        generation: taskGeneration,
+      await persistState("sending", {
         snapshot: current,
-        phase: "sending",
         pending: incoming,
         outboundFingerprint,
         action: currentAction,
       });
-      await saveBridgeState(projectRoot, activeState);
       if (mediaReactionEnabled && mediaShouldLike && incomingBatch.mediaMessage) {
         currentAction = transitionDouyinAction(currentAction, "reaction-attempted");
-        activeState = createBridgeState({
-          chatKey: lockedChat.fingerprint,
-          threadId: runtime.threadId,
-          model: runtime.model,
-          effort: runtime.effort,
-          generation: taskGeneration,
+        await persistState("sending", {
           snapshot: current,
-          phase: "sending",
           pending: incoming,
           outboundFingerprint,
           action: currentAction,
         });
-        await saveBridgeState(projectRoot, activeState);
         try {
           const reaction = await likeIncomingDouyinMediaMessage({
             cdp,
@@ -1285,17 +1164,10 @@ try {
           }));
         }
       }
-      activeState = createBridgeState({
-        chatKey: lockedChat.fingerprint,
-        threadId: runtime.threadId,
-        model: runtime.model,
-        effort: runtime.effort,
-        generation: taskGeneration,
+      await persistState(reboundRemaining.length > 0 ? "queued" : "ready", {
         snapshot: afterSendSnapshot,
-        phase: reboundRemaining.length > 0 ? "queued" : "ready",
         pending: reboundRemaining,
       });
-      await saveBridgeState(projectRoot, activeState);
       queuedIncoming = reboundRemaining.length > 0 ? reboundRemaining : null;
       previous = afterSendSnapshot;
       setBridgePhase(queuedIncoming ? "queued" : "listening");
@@ -1309,17 +1181,10 @@ try {
         const reboundRemaining = remainingAfterUnsupported.length > 0
           ? rebindPendingMessages(current, remainingAfterUnsupported)
           : [];
-        activeState = createBridgeState({
-          chatKey: lockedChat.fingerprint,
-          threadId: runtime.threadId,
-          model: runtime.model,
-          effort: runtime.effort,
-          generation: taskGeneration,
+        await persistState(reboundRemaining.length > 0 ? "queued" : "ready", {
           snapshot: current,
-          phase: reboundRemaining.length > 0 ? "queued" : "ready",
           pending: reboundRemaining,
         });
-        await saveBridgeState(projectRoot, activeState);
         queuedIncoming = reboundRemaining.length > 0 ? reboundRemaining : null;
         previous = current;
         setBridgePhase(queuedIncoming ? "queued" : "listening");
@@ -1333,19 +1198,12 @@ try {
       }
       if (!(error instanceof CodexContextRecoveryError)) throw error;
       contextRecoveryFailed = true;
-      activeState = createBridgeState({
-        chatKey: lockedChat.fingerprint,
-        threadId: runtime.threadId,
-        model: runtime.model,
-        effort: runtime.effort,
-        generation: taskGeneration,
+      await persistState("blocked", {
         snapshot: current,
-        phase: "blocked",
         pending: incoming,
         blockedReason: "context-recovery-failed",
         action: currentAction,
       });
-      await saveBridgeState(projectRoot, activeState);
       setBridgePhase("blocked");
       console.log(JSON.stringify({
         ok: false,
