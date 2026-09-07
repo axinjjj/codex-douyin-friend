@@ -7,6 +7,7 @@ import {
   CodexAppServerClient,
   extractAgentText,
   instructionSourcesContain,
+  instructionSourcesExactlyMatch,
   resolveCodexTurnTimeoutMs,
 } from "../src/codex-app-server-client.mjs";
 import { summarizeTargets } from "../src/cdp-client.mjs";
@@ -82,6 +83,35 @@ test("instructionSourcesContain compares Windows paths safely", () => {
     ),
     true,
   );
+});
+
+test("instructionSourcesExactlyMatch requires one ordered absolute source set", () => {
+  const expected = "C:\\Users\\Fixture\\.codex\\AGENTS.md";
+  assert.equal(instructionSourcesExactlyMatch(
+    [{ path: "c:/users/fixture/.codex/AGENTS.md" }],
+    [expected],
+    { platform: "win32" },
+  ), true);
+  assert.equal(instructionSourcesExactlyMatch(
+    [expected, "C:\\repo\\AGENTS.md"],
+    [expected],
+    { platform: "win32" },
+  ), false);
+  assert.equal(instructionSourcesExactlyMatch(
+    [expected, expected],
+    [expected, expected],
+    { platform: "win32" },
+  ), false);
+  assert.equal(instructionSourcesExactlyMatch(
+    ["relative/AGENTS.md"],
+    [expected],
+    { platform: "win32" },
+  ), false);
+  assert.equal(instructionSourcesExactlyMatch(
+    ["/Persona/AGENTS.md"],
+    ["/persona/AGENTS.md"],
+    { platform: "linux" },
+  ), false);
 });
 
 test("starts persistent threads and resumes them with the same safety overrides", async () => {

@@ -2,19 +2,20 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexAppServerClient } from "../src/codex-app-server-client.mjs";
+import { ensureDouyinCompanionCwd } from "../src/douyin-companion-runtime.mjs";
 import { CdpClient } from "../src/cdp-client.mjs";
 import {
   buildChatIdentityMetadataExpression,
-  buildChatMessageMetadataExpression,
   buildReadRecentConversationExpression,
   isDouyinChatTarget,
 } from "../src/douyin-chat-page.mjs";
 import {
   generateDouyinVideoReply,
   injectConversationHistory,
-  sendAndVerifyDouyinReply,
   startVerifiedPersonaThread,
 } from "../src/douyin-bridge-runtime.mjs";
+import { acquireBridgeRunLock } from "../src/douyin-bridge-state.mjs";
+import { runDouyinCleanupSteps } from "../src/douyin-runtime-cleanup.mjs";
 import {
   cleanupStaleVideoAnalysisJobs,
   prepareLatestDouyinVideoMedia,
@@ -29,9 +30,9 @@ const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(scriptDirectory, "..");
 const expectedPersonaPath = path.join(os.homedir(), ".codex", "AGENTS.md");
 const port = Number.parseInt(process.env.DOUYIN_DEBUG_PORT || "9229", 10);
-const sendEnabled = process.env.DOUYIN_SEND_ENABLED === "true";
 const model = process.env.CODEX_DOUYIN_MODEL || "gpt-5.6-sol";
 const effort = process.env.CODEX_DOUYIN_EFFORT || "xhigh";
+const companionCwd = await ensureDouyinCompanionCwd({ projectRoot });
 
 await verifySenseVoiceRuntime({ projectRoot });
 await cleanupStaleVideoAnalysisJobs(projectRoot);
@@ -50,15 +51,16 @@ codex.on("stderr", () => {
   // App Server diagnostics can include private local context.
 });
 let media;
+let bridgeLock = null;
 try {
   await cdp.connect();
   const lockedChat = await cdp.evaluate(buildChatIdentityMetadataExpression());
   if (!lockedChat?.found) throw new Error("The current Douyin chat could not be locked.");
-  const beforeSend = await cdp.evaluate(buildChatMessageMetadataExpression());
+  bridgeLock = await acquireBridgeRunLock(projectRoot, lockedChat.fingerprint);
   const recentConversation = await cdp.evaluate(buildReadRecentConversationExpression());
   const runtime = await startVerifiedPersonaThread({
     codex,
-    cwd: projectRoot,
+    cwd: companionCwd,
     expectedPersonaPath,
     model,
     effort,
@@ -98,48 +100,27 @@ try {
     model: runtime.model,
     effort: runtime.effort,
   });
-  if (!sendEnabled) {
-    console.log(JSON.stringify({
-      ok: true,
-      event: "video-reply-generated-not-sent",
-      frameCount: media.framePaths.length,
-      audioProcessed: audioUnderstanding.processed,
-      transcriptLength: audioUnderstanding.transcript?.length || 0,
-      audioLanguage: audioUnderstanding.language || null,
-      audioEmotions: audioUnderstanding.emotions || [],
-      audioEvents: audioUnderstanding.events || [],
-      audioTimingSource: audioUnderstanding.timingSource || "unavailable",
-      scanSampleCount: media.sampling.completedScanCount,
-      scanTruncated: media.sampling.scanTruncated,
-      replyLength: reply.length,
-    }));
-  } else {
-    const currentChat = await cdp.evaluate(buildChatIdentityMetadataExpression());
-    if (!currentChat?.found || currentChat.fingerprint !== lockedChat.fingerprint) {
-      throw new Error("The active Douyin chat changed during video analysis; refusing to send.");
-    }
-    const { outgoing, afterSend } = await sendAndVerifyDouyinReply({ cdp, reply, beforeSend });
-    console.log(JSON.stringify({
-      ok: Boolean(outgoing),
-      event: outgoing ? "video-reply-sent" : "video-send-unverified",
-      frameCount: media.framePaths.length,
-      audioProcessed: audioUnderstanding.processed,
-      transcriptLength: audioUnderstanding.transcript?.length || 0,
-      audioLanguage: audioUnderstanding.language || null,
-      audioEmotions: audioUnderstanding.emotions || [],
-      audioEvents: audioUnderstanding.events || [],
-      audioTimingSource: audioUnderstanding.timingSource || "unavailable",
-      scanSampleCount: media.sampling.completedScanCount,
-      scanTruncated: media.sampling.scanTruncated,
-      replyLength: reply.length,
-      messageCount: afterSend.messageCount,
-    }));
-    if (!outgoing) process.exitCode = 3;
-  }
+  console.log(JSON.stringify({
+    ok: true,
+    event: "video-reply-generated-not-sent",
+    frameCount: media.framePaths.length,
+    audioProcessed: audioUnderstanding.processed,
+    transcriptLength: audioUnderstanding.transcript?.length || 0,
+    audioLanguage: audioUnderstanding.language || null,
+    audioEmotions: audioUnderstanding.emotions || [],
+    audioEvents: audioUnderstanding.events || [],
+    audioTimingSource: audioUnderstanding.timingSource || "unavailable",
+    scanSampleCount: media.sampling.completedScanCount,
+    scanTruncated: media.sampling.scanTruncated,
+    replyLength: reply.length,
+  }));
 } finally {
-  if (media?.jobDirectory) {
-    await removeVideoAnalysisJob(projectRoot, media.jobDirectory);
-  }
-  await codex.close();
-  cdp.close();
+  await runDouyinCleanupSteps([
+    () => media?.jobDirectory
+      ? removeVideoAnalysisJob(projectRoot, media.jobDirectory)
+      : undefined,
+    () => codex.close(),
+    () => cdp.close(),
+    () => bridgeLock?.release(),
+  ]);
 }

@@ -198,6 +198,36 @@ export function rollbackDouyinActionBeforeEnter(action) {
   });
 }
 
+export function rebaseDouyinReactionTarget(action, reactionTarget) {
+  const current = validateDouyinAction(action);
+  const target = normalizeReactionTarget(reactionTarget);
+  if (current.stage !== "reply-ready" || current.reactionDecision !== "yes"
+      || !current.reactionTarget || !target
+      || current.reactionTarget.fingerprint !== target.fingerprint
+      || current.reactionTarget.kind !== target.kind
+      || current.reactionTarget.side !== target.side) {
+    throw new Error("The Douyin reaction target cannot be rebound safely.");
+  }
+  return validateDouyinAction({
+    ...current,
+    reactionTarget: target,
+    reactionOrdinalShift: 0,
+  });
+}
+
+export function invalidateDouyinReaction(action) {
+  const current = validateDouyinAction(action);
+  if (current.stage !== "reply-ready") {
+    throw new Error("Only a reply-ready Douyin reaction can be invalidated before sending.");
+  }
+  if (current.reactionDecision !== "yes") return current;
+  return validateDouyinAction({
+    ...current,
+    reactionDecision: "invalid",
+    reactionOrdinalShift: 0,
+  });
+}
+
 export function computeDouyinTurnPromptDigest(params) {
   const input = params?.input ?? [{ type: "text", text: params?.text }];
   return digest(JSON.stringify({

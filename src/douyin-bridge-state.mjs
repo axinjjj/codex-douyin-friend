@@ -2,7 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
-import { validateDouyinAction } from "./douyin-action-journal.mjs";
+import {
+  transitionDouyinAction,
+  validateDouyinAction,
+} from "./douyin-action-journal.mjs";
 import { planDouyinIncomingQueue } from "./douyin-inbound-planner.mjs";
 
 const STATE_VERSION = 1;
@@ -540,10 +543,42 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
   const normalized = validateBridgeState(state);
   const action = normalized.checkpoint.action;
   if (normalized.checkpoint.phase === "ready") {
+    if (!action || !["send-verified", "reaction-attempted"].includes(action.stage)) {
+      return {
+        state: normalized,
+        recoveredVerifiedSend: false,
+        resumeAction: action,
+      };
+    }
+    const current = normalizeBridgeSnapshot(currentSnapshot);
+    const appended = findAppendedMessages(normalized.checkpoint.snapshot, current);
+    if (appended.some((message) => message.side === "right")) {
+      throw new Error("Unexpected outgoing activity appeared during reaction recovery.");
+    }
+    const queuedMessages = appended.filter((message) => (
+      message.side === "left" && (message.kind === "text" || message.kind === "media")
+    ));
+    const queuedPending = queuedMessages.length > 0
+      ? rebindPendingMessages(current, queuedMessages)
+      : [];
+    const recoveredAction = advanceRecoveredReactionPosition(action, current, {
+      ordinalShift: action.reactionOrdinalShift + appended.length,
+    });
     return {
-      state: normalized,
+      state: createBridgeState({
+        chatKey: normalized.chatKey,
+        threadId: normalized.threadId,
+        model: normalized.model,
+        effort: normalized.effort,
+        generation: normalized.generation,
+        snapshot: current,
+        phase: queuedPending.length > 0 ? "queued" : "ready",
+        pending: queuedPending,
+        action: recoveredAction,
+      }),
       recoveredVerifiedSend: false,
-      resumeAction: action,
+      queuedPending,
+      resumeAction: recoveredAction,
     };
   }
   if (normalized.checkpoint.phase === "queued") {
@@ -558,6 +593,11 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
         message.side === "left" && (message.kind === "text" || message.kind === "media")
       )),
     ]);
+    const recoveredAction = action?.stage === "send-verified"
+      ? advanceRecoveredReactionPosition(action, current, {
+        ordinalShift: action.reactionOrdinalShift + appended.length,
+      })
+      : action;
     return {
       state: createBridgeState({
         chatKey: normalized.chatKey,
@@ -568,11 +608,11 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
         snapshot: current,
         phase: "queued",
         pending: queuedPending,
-        action,
+        action: recoveredAction,
       }),
       recoveredVerifiedSend: false,
       queuedPending,
-      resumeAction: action,
+      resumeAction: recoveredAction,
     };
   }
   if (action && normalized.checkpoint.phase !== "sending") {
@@ -663,14 +703,17 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
 
   let recoveredAction = action;
   if (recoveredAction?.stage === "send-attempted") {
-    recoveredAction = validateDouyinAction({
-      ...recoveredAction,
-      stage: "send-verified",
-      reactionOrdinalShift: appended.length,
+    recoveredAction = transitionDouyinAction(recoveredAction, "send-verified", {
+      reactionOrdinalShift: 0,
     });
   }
   if (recoveredAction && !["send-verified", "reaction-attempted"].includes(recoveredAction.stage)) {
     throw new Error("The persisted send action stage is inconsistent.");
+  }
+  if (recoveredAction?.stage === "send-verified") {
+    recoveredAction = advanceRecoveredReactionPosition(recoveredAction, current, {
+      ordinalShift: appended.length,
+    });
   }
   return {
     state: createBridgeState({
@@ -688,6 +731,25 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
     queuedPending,
     resumeAction: recoveredAction,
   };
+}
+
+function advanceRecoveredReactionPosition(action, currentSnapshot, { ordinalShift }) {
+  const current = validateDouyinAction(action);
+  if (current.stage !== "send-verified" || current.reactionDecision !== "yes"
+      || !current.reactionTarget) return current;
+  const targetOrdinal = current.reactionTarget.ordinalFromEnd + ordinalShift;
+  if (!Number.isSafeInteger(ordinalShift) || ordinalShift < 0 || ordinalShift > 12
+      || targetOrdinal < 1 || targetOrdinal > currentSnapshot.messages.length) {
+    return transitionDouyinAction(current, "reaction-attempted");
+  }
+  const visibleTarget = currentSnapshot.messages[currentSnapshot.messages.length - targetOrdinal];
+  if (!visibleTarget || !sameMessage(current.reactionTarget, visibleTarget)) {
+    return transitionDouyinAction(current, "reaction-attempted");
+  }
+  return validateDouyinAction({
+    ...current,
+    reactionOrdinalShift: ordinalShift,
+  });
 }
 
 export function recoverBridgeStateForStartup(state, currentSnapshot) {

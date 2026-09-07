@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import {
   CodexAppServerRequestError,
-  instructionSourcesContain,
+  instructionSourcesExactlyMatch,
 } from "./codex-app-server-client.mjs";
 import {
   buildChatMessageMetadataExpression,
@@ -105,9 +105,9 @@ export async function startVerifiedPersonaThread({
           "The persisted Codex thread is incompatible with the bridge configuration.",
         );
       }
-      if (!instructionSourcesContain(resumed.instructionSources, expectedPersonaPath)) {
+      if (!instructionSourcesExactlyMatch(resumed.instructionSources, [expectedPersonaPath])) {
         throw new IncompatiblePersistedThreadError(
-          "The private global AGENTS.md was not loaded on resume.",
+          "The companion instruction source set is incompatible on resume.",
         );
       }
       await setPersistentBridgeThreadName(codex, threadId);
@@ -132,8 +132,8 @@ export async function startVerifiedPersonaThread({
     if (threadResult.thread.ephemeral !== ephemeral || threadResult.model !== model) {
       throw new Error("thread/start did not create the requested Codex thread.");
     }
-    if (!instructionSourcesContain(threadResult.instructionSources, expectedPersonaPath)) {
-      throw new Error("The private global AGENTS.md was not loaded; refusing to reply.");
+    if (!instructionSourcesExactlyMatch(threadResult.instructionSources, [expectedPersonaPath])) {
+      throw new Error("The companion instruction source set is not isolated; refusing to reply.");
     }
     if (!ephemeral) {
       await setPersistentBridgeThreadName(codex, startedThreadId);
@@ -625,15 +625,20 @@ export async function sendAndVerifyDouyinReply({
   quoteTarget = null,
   quoteTargetFingerprint = null,
   quoteNonce = null,
-  shouldStop = () => false,
-  canSend = async () => true,
-  onSendAttempted = async () => {},
-  onSendCancelledBeforeEnter = async () => {},
+  shouldStop,
+  canSend,
+  onSendAttempted,
+  onSendCancelledBeforeEnter,
   sleepFn = sleep,
 }) {
   if (typeof sleepFn !== "function") throw new Error("A Douyin send sleep function is required.");
-  if (typeof onSendAttempted !== "function" || typeof onSendCancelledBeforeEnter !== "function") {
-    throw new Error("Douyin send journal callbacks are required.");
+  if (typeof shouldStop !== "function" || typeof canSend !== "function"
+      || typeof onSendAttempted !== "function"
+      || typeof onSendCancelledBeforeEnter !== "function") {
+    throw new Error("The Douyin send owner callbacks are required.");
+  }
+  if (!/^[0-9a-f]{64}$/u.test(expectedChatFingerprint || "")) {
+    throw new Error("A locked Douyin chat fingerprint is required.");
   }
   if (quoteTarget && (!/^[0-9a-f]{64}$/u.test(quoteTargetFingerprint || "")
       || !/^[0-9a-f]{24}$/u.test(quoteNonce || ""))) {

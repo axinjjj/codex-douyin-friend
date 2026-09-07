@@ -17,6 +17,13 @@ import {
   startVerifiedPersonaThread,
 } from "../src/douyin-bridge-runtime.mjs";
 
+const sendOwnerCallbacks = {
+  shouldStop: () => false,
+  canSend: async () => true,
+  onSendAttempted: async () => {},
+  onSendCancelledBeforeEnter: async () => {},
+};
+
 test("plans incoming text and media into chronological reply batches", () => {
   const text = { kind: "text", side: "left", fingerprint: "a".repeat(64) };
   const media = { kind: "media", side: "left", fingerprint: "b".repeat(64) };
@@ -97,9 +104,42 @@ test("lets text replies choose a natural length", async () => {
   assert.doesNotMatch(turn.text, /1\s*到\s*3\s*句话/u);
 });
 
+test("send requires one explicit owner contract before touching the page", async () => {
+  let pageCalls = 0;
+  const cdp = {
+    async evaluate() {
+      pageCalls += 1;
+      return { ok: true };
+    },
+    async request() {
+      pageCalls += 1;
+    },
+  };
+  for (const missing of Object.keys(sendOwnerCallbacks)) {
+    const callbacks = { ...sendOwnerCallbacks };
+    delete callbacks[missing];
+    await assert.rejects(() => sendAndVerifyDouyinReply({
+      ...callbacks,
+      cdp,
+      reply: "not sent",
+      beforeSend: { messageCount: 0, messages: [] },
+      expectedChatFingerprint: "a".repeat(64),
+    }), /send owner callbacks/u);
+  }
+  await assert.rejects(() => sendAndVerifyDouyinReply({
+    ...sendOwnerCallbacks,
+    cdp,
+    reply: "not sent",
+    beforeSend: { messageCount: 0, messages: [] },
+    expectedChatFingerprint: "invalid",
+  }), /locked Douyin chat fingerprint/u);
+  assert.equal(pageCalls, 0);
+});
+
 test("send aborts before touching the editor when shutdown was requested", async () => {
   await assert.rejects(
     () => sendAndVerifyDouyinReply({
+      ...sendOwnerCallbacks,
       cdp: {},
       reply: "not sent",
       beforeSend: { messageCount: 0, messages: [] },
@@ -123,6 +163,7 @@ test("send refuses Enter when the active chat changes after editor insertion", a
   };
   await assert.rejects(
     () => sendAndVerifyDouyinReply({
+      ...sendOwnerCallbacks,
       cdp,
       reply: "not sent",
       beforeSend: { messageCount: 0, messages: [] },
@@ -160,6 +201,7 @@ test("send refuses Enter when atomic editor authority is lost", async () => {
   };
   await assert.rejects(
     () => sendAndVerifyDouyinReply({
+      ...sendOwnerCallbacks,
       cdp,
       reply: "not sent",
       beforeSend: { messageCount: 0, messages: [] },
@@ -199,6 +241,7 @@ test("rechecks full editor authority after journaling and rolls back before Ente
     },
   };
   await assert.rejects(() => sendAndVerifyDouyinReply({
+    ...sendOwnerCallbacks,
     cdp,
     reply: "journaled reply",
     beforeSend: { messageCount: 0, messages: [] },
@@ -285,6 +328,7 @@ test("sends a shared-work reply only with its exact quote binding and quoted fin
     },
   };
   const result = await sendAndVerifyDouyinReply({
+    ...sendOwnerCallbacks,
     cdp,
     reply,
     beforeSend: { messageCount: 0, messages: [] },
@@ -324,6 +368,7 @@ test("resumes an exact pre-journal quoted draft without inserting the text twice
   const requests = [];
   let authorityChecks = 0;
   const result = await sendAndVerifyDouyinReply({
+    ...sendOwnerCallbacks,
     cdp: {
       async evaluate(expression) {
         if (expression.includes("state: 'bound'")) {
@@ -384,6 +429,7 @@ test("keeps quote ownership through Enter verification and cleans an exact no-op
   let metadataReads = 0;
   let cleanupVerified = false;
   const result = await sendAndVerifyDouyinReply({
+    ...sendOwnerCallbacks,
     cdp: {
       async evaluate(expression) {
         if (expression.includes("chat-input-not-empty")) return { ok: true };
@@ -529,6 +575,51 @@ test("renames a resumed persistent bridge task before accepting new turns", asyn
   }]);
 });
 
+test("replaces a resumed task whose instruction source set includes repository rules", async () => {
+  let started = false;
+  const runtime = await startVerifiedPersonaThread({
+    codex: {
+      async start() {},
+      async request(method) {
+        assert.equal(method, "model/list");
+        return {
+          data: [{
+            id: "gpt-5.6-sol",
+            supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+          }],
+        };
+      },
+      async resumeThread() {
+        return {
+          thread: { id: "thread-old", ephemeral: false },
+          model: "gpt-5.6-sol",
+          instructionSources: [
+            { path: "C:/persona/AGENTS.md" },
+            { path: "C:/project/AGENTS.md" },
+          ],
+        };
+      },
+      async startThread(params) {
+        started = true;
+        assert.equal(params.cwd, "C:/companion-runtime");
+        return {
+          thread: { id: "thread-new", ephemeral: false },
+          model: "gpt-5.6-sol",
+          instructionSources: [{ path: "C:/persona/AGENTS.md" }],
+        };
+      },
+      async setThreadName() {},
+    },
+    cwd: "C:/companion-runtime",
+    expectedPersonaPath: "C:/persona/AGENTS.md",
+    threadId: "thread-old",
+    ephemeral: false,
+  });
+  assert.equal(started, true);
+  assert.equal(runtime.threadId, "thread-new");
+  assert.equal(runtime.resumeFallback, true);
+});
+
 test("archives a newly created task when persona verification fails", async () => {
   const archived = [];
   await assert.rejects(
@@ -559,7 +650,7 @@ test("archives a newly created task when persona verification fails", async () =
       expectedPersonaPath: "C:/persona/AGENTS.md",
       ephemeral: false,
     }),
-    /AGENTS\.md was not loaded/u,
+    /instruction source set is not isolated/u,
   );
   assert.deepEqual(archived, ["thread-orphan"]);
 });
