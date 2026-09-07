@@ -5,7 +5,6 @@ import { fileURLToPath } from "node:url";
 import { CodexAppServerClient } from "../src/codex-app-server-client.mjs";
 import { ensureDouyinCompanionCwd } from "../src/douyin-companion-runtime.mjs";
 import {
-  CodexContextCompactionManager,
   CodexContextRecoveryError,
   resolveContextCompactionPolicy,
 } from "../src/codex-context-compaction.mjs";
@@ -19,40 +18,35 @@ import {
 import {
   buildChatIdentityMetadataExpression,
   buildChatMessageMetadataExpression,
-  buildBridgeStartupViewExpression,
   buildClassifyLatestIncomingMediaExpression,
   buildEnsureChatTailVisibleExpression,
   buildReadIncomingCommentShareExpression,
   buildReadIncomingMediaTextExpression,
   buildReadIncomingTextBatchExpression,
   isDouyinChatTarget,
-  normalizeOutboundText,
 } from "../src/douyin-chat-page.mjs";
 import {
   DouyinSendAbortedError,
   generateDouyinReply,
   generateDouyinImageReply,
   generateDouyinVideoReply,
-  parseDouyinMediaReply,
-  preparePersistentBridgeSession,
   sanitizeDouyinMediaDiagnostic,
   sendAndVerifyDouyinReply,
 } from "../src/douyin-bridge-runtime.mjs";
+import {
+  douyinBridgeStartupDependencies,
+  recoverBridgeStartup,
+} from "../src/douyin-bridge-startup.mjs";
 import { planDouyinIncomingQueue } from "../src/douyin-inbound-planner.mjs";
 import {
   acquireBridgeRunLock,
   computeQuotedTextMessageFingerprint,
   computeTextMessageFingerprint,
-  createBridgeState,
   DouyinCheckpointBoundaryError,
   DouyinRecoverySafetyError,
   findAppendedMessages,
-  loadBridgeState,
   normalizeBridgeSnapshot,
   rebindPendingMessages,
-  recoverBridgeStateForFreshThread,
-  recoverBridgeStateForStartup,
-  saveBridgeState,
 } from "../src/douyin-bridge-state.mjs";
 import {
   cleanupStaleImageAnalysisJobs,
@@ -62,10 +56,7 @@ import {
 import { acquireDouyinMedia } from "../src/douyin-media-pipeline.mjs";
 import { likeIncomingDouyinMediaMessage } from "../src/douyin-media-reaction.mjs";
 import { runDouyinCleanupSteps } from "../src/douyin-runtime-cleanup.mjs";
-import {
-  cleanupRecoveredDouyinMediaQuote,
-  shouldQuoteDouyinMediaReply,
-} from "../src/douyin-message-quote.mjs";
+import { shouldQuoteDouyinMediaReply } from "../src/douyin-message-quote.mjs";
 import {
   cleanupStaleVideoAnalysisJobs,
   removeVideoAnalysisJob,
@@ -154,7 +145,6 @@ let contextManager = null;
 let controlChannel = null;
 let pendingManualCompactionRequestId = null;
 let currentPhase = "starting";
-let phaseBeforeCompaction = null;
 let lastLatencyMs = null;
 let uncommittedStartupThreadId = null;
 const emitBridgeEvent = (event) => writeBridgeEvent(process.stdout, event);
@@ -256,209 +246,42 @@ try {
   };
   bridgeLock = await acquireBridgeRunLock(projectRoot, lockedChat.fingerprint);
 
-  const startupView = await cdp.evaluate(buildBridgeStartupViewExpression());
-  if (!startupView?.ok) throw new Error("The Douyin message list is unavailable.");
-  if (startupView.chatFingerprint !== lockedChat.fingerprint) {
-    throw new Error("The Douyin chat changed during startup; refusing to seed the wrong conversation.");
-  }
-  const startupSnapshot = normalizeBridgeSnapshot(startupView.snapshot);
-  const loadedState = await loadBridgeState(projectRoot, lockedChat.fingerprint);
-  if (loadedState.status === "corrupt") {
-    throw new DouyinRecoverySafetyError(
-      "Both bridge checkpoint copies are unreadable; refusing an ambiguous restart.",
-    );
-  }
-  let storedState = loadedState.state;
-  let recoveredVerifiedSend = false;
-  let recoveredForFreshThread = false;
-  let startupQueuedPending = null;
-  let startupResumeAction = null;
-  if (storedState) {
-    const canAttemptFreshRecovery = forceFreshThread
-      && storedState.checkpoint.phase !== "ready"
-      && storedState.checkpoint.phase !== "sending";
-    const recovery = canAttemptFreshRecovery
-      ? recoverBridgeStateForFreshThread(storedState, startupSnapshot)
-      : recoverBridgeStateForStartup(storedState, startupSnapshot);
-    storedState = recovery.state;
-    recoveredVerifiedSend = recovery.recoveredVerifiedSend;
-    recoveredForFreshThread = canAttemptFreshRecovery;
-    startupQueuedPending = recovery.queuedPending?.length > 0
-      ? recovery.queuedPending
-      : null;
-    startupResumeAction = recovery.resumeAction ?? null;
-    // Keep the original sending checkpoint durable until quote cleanup succeeds.
-    // A crash here will therefore repeat the same idempotent recovery on restart.
-    if (recoveredVerifiedSend && startupResumeAction?.quoteTargetFingerprint) {
-      await cleanupRecoveredDouyinMediaQuote({
-        cdp,
-        expectedChatFingerprint: lockedChat.fingerprint,
-        quoteNonce: startupResumeAction.id.slice(0, 24),
-        quoteTargetFingerprint: startupResumeAction.quoteTargetFingerprint,
-      });
-    }
-    if (recoveredVerifiedSend || recoveredForFreshThread || startupQueuedPending) {
-      await saveBridgeState(projectRoot, storedState);
-    }
-  }
-  const startupPendingMessages = startupQueuedPending ?? (storedState
-    ? findAppendedMessages(storedState.checkpoint.snapshot, startupSnapshot)
-    : []);
-
-  const session = await preparePersistentBridgeSession({
+  const startup = await recoverBridgeStartup({
+    cdp,
     codex,
-    cwd: companionCwd,
+    projectRoot,
+    lockedChat,
+    forceFreshThread,
+    companionCwd,
     expectedPersonaPath,
     model,
     effort,
-    storedState,
-    allowStoredThreadResume: !loadedState.requiresFreshThread && !forceFreshThread,
-    currentSnapshot: startupSnapshot,
-    visibleMessages: startupView.conversation,
-    pendingMessages: startupPendingMessages,
-  });
-  const runtime = session.runtime;
-  const taskGeneration = runtime.resumed
-    ? (storedState?.generation ?? 1)
-    : (storedState?.generation ?? 0) + 1;
-  if (!runtime.resumed) uncommittedStartupThreadId = runtime.threadId;
-  contextManager = new CodexContextCompactionManager({
-    codex,
-    threadId: runtime.threadId,
-    generation: taskGeneration,
-    ...compactionPolicy,
+    compactionPolicy,
+    supervised,
     onDiagnostic: (diagnostic) => console.log(JSON.stringify(diagnostic)),
-    onOperationStart: () => {
-      phaseBeforeCompaction = currentPhase;
-      setBridgePhase("compacting");
+    emitBridgeEvent,
+    getBridgePhase: () => currentPhase,
+    setBridgePhase,
+    setContextManager: (manager) => {
+      contextManager = manager;
     },
-    onOperationEnd: () => {
-      if (currentPhase === "compacting") setBridgePhase(phaseBeforeCompaction || "listening");
-      phaseBeforeCompaction = null;
+    setUncommittedStartupThreadId: (threadId) => {
+      uncommittedStartupThreadId = threadId;
     },
-    onUsage: (usage) => {
-      if (supervised) emitBridgeEvent({
-        ok: true,
-        event: "context-usage-updated",
-        contextUsage: usage,
-      });
-    },
+    dependencies: douyinBridgeStartupDependencies,
   });
-  let previous = normalizeBridgeSnapshot(session.baselineSnapshot);
-  let queuedIncoming = startupQueuedPending;
-  let resumedReply = null;
-  if (startupResumeAction
-      && ["turn-started", "reply-ready"].includes(startupResumeAction.stage)) {
-    const turnId = startupResumeAction.turnIds.at(-1);
-    const recoveredTurn = await codex.readTurn({ threadId: runtime.threadId, turnId });
-    if (!recoveredTurn.found || recoveredTurn.status !== "completed" || !recoveredTurn.text) {
-      throw new DouyinRecoverySafetyError(
-        "The persisted Codex turn cannot be recovered without duplication.",
-      );
-    }
-    let recoveredReply;
-    let reactionDecision = "disabled";
-    let shouldLike = false;
-    if (startupResumeAction.replyKind === "text") {
-      recoveredReply = normalizeOutboundText(recoveredTurn.text);
-    } else {
-      let parsed;
-      try {
-        parsed = parseDouyinMediaReply(recoveredTurn.text, {
-          reactionEnabled: Boolean(startupResumeAction.reactionNonce),
-          nonce: startupResumeAction.reactionNonce,
-        });
-      } catch (error) {
-        throw new DouyinRecoverySafetyError(
-          "The persisted Codex media reply is invalid.",
-          { cause: error },
-        );
-      }
-      recoveredReply = parsed.reply;
-      reactionDecision = parsed.reactionDecision;
-      shouldLike = parsed.shouldLike;
-    }
-    if (!recoveredReply) {
-      throw new DouyinRecoverySafetyError("The persisted Codex reply is empty.");
-    }
-    const replyDigest = computeDouyinReplyDigest(recoveredReply);
-    if (startupResumeAction.replyDigest
-        && startupResumeAction.replyDigest !== replyDigest) {
-      throw new DouyinRecoverySafetyError(
-        "The persisted Codex reply digest does not match the recovered turn.",
-      );
-    }
-    resumedReply = {
-      action: startupResumeAction,
-      reply: recoveredReply,
-      replyKind: startupResumeAction.replyKind,
-      mediaShouldLike: shouldLike,
-    };
-  }
-  let activeState;
-  const persistState = async (phase, overrides) => {
-    activeState = createBridgeState({
-      chatKey: lockedChat.fingerprint,
-      threadId: runtime.threadId,
-      model: runtime.model,
-      effort: runtime.effort,
-      generation: taskGeneration,
-      phase,
-      ...overrides,
-    });
-    await saveBridgeState(projectRoot, activeState);
-  };
-  if (resumedReply) {
-    await persistState("queued", {
-      snapshot: previous,
-      pending: queuedIncoming,
-      action: resumedReply.action,
-    });
-  } else if (queuedIncoming) {
-    await persistState("queued", {
-      snapshot: previous,
-      pending: queuedIncoming,
-      action: startupResumeAction,
-    });
-  } else {
-    await persistState("ready", {
-      snapshot: previous,
-      outboundFingerprint: storedState?.checkpoint.outboundFingerprint ?? null,
-      action: startupResumeAction,
-    });
-  }
-  if (startupResumeAction
-      && ["send-verified", "reaction-attempted"].includes(startupResumeAction.stage)) {
-    if (startupResumeAction.stage === "send-verified"
-        && startupResumeAction.reactionDecision === "yes"
-        && startupResumeAction.reactionTarget) {
-      startupResumeAction = transitionDouyinAction(
-        startupResumeAction,
-        "reaction-attempted",
-      );
-      await persistState(queuedIncoming?.length ? "queued" : "ready", {
-        snapshot: previous,
-        pending: queuedIncoming ?? [],
-        action: startupResumeAction,
-      });
-      try {
-        await likeIncomingDouyinMediaMessage({
-          cdp,
-          message: startupResumeAction.reactionTarget,
-          expectedChatFingerprint: lockedChat.fingerprint,
-          ordinalShift: startupResumeAction.reactionOrdinalShift,
-        });
-      } catch {
-        // The journal is already reaction-attempted, so restart will not repeat the click.
-      }
-    }
-    startupResumeAction = null;
-    await persistState(queuedIncoming?.length ? "queued" : "ready", {
-      snapshot: previous,
-      pending: queuedIncoming ?? [],
-    });
-  }
-  uncommittedStartupThreadId = null;
+  const {
+    getActiveState,
+    loadedState,
+    persistState,
+    runtime,
+    session,
+    storedState,
+    taskGeneration,
+  } = startup;
+  let previous = startup.previous;
+  let queuedIncoming = startup.queuedIncoming;
+  let resumedReply = startup.resumedReply;
   if (session.replacedStoredThread && storedState?.threadId
       && storedState.threadId !== runtime.threadId) {
     await codex.request("thread/archive", { threadId: storedState.threadId }).catch(() => {});
@@ -580,7 +403,7 @@ try {
       continue;
     }
 
-    const expectedOutboundFingerprint = activeState.checkpoint.outboundFingerprint;
+    const expectedOutboundFingerprint = getActiveState().checkpoint.outboundFingerprint;
     const expectedOutgoingIndex = expectedOutboundFingerprint === null
       ? -1
       : outgoing.findIndex((message) => (
