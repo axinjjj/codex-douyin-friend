@@ -646,7 +646,14 @@ try {
       continue;
     }
 
-    const queuePlan = planDouyinIncomingQueue(incoming);
+    const queuePlan = planDouyinIncomingQueue(incoming, {
+      action: resumedReply?.action ?? null,
+      chatKey: lockedChat.fingerprint,
+    });
+    if (resumedReply && !queuePlan.ok) {
+      // Preserve the old action/turn receipt instead of replacing it with a generic block.
+      throw new DouyinRecoverySafetyError("The recovered reply input boundary cannot be proved.");
+    }
     if (unsupportedIncoming.length > 0) {
       console.log(JSON.stringify({
         ok: true,
