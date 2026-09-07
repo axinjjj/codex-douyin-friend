@@ -293,7 +293,7 @@ test("quoted recovery consumes only the first adjacent video and rebinds the rem
   let action = createDouyinAction({
     chatKey,
     generation: 2,
-    pending: [firstVideo, secondVideo],
+    pending: [firstVideo],
   });
   action = transitionDouyinAction(action, "evidence-ready", {
     replyKind: "video",

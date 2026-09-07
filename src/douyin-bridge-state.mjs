@@ -3,6 +3,7 @@ import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
 import { validateDouyinAction } from "./douyin-action-journal.mjs";
+import { planDouyinIncomingQueue } from "./douyin-inbound-planner.mjs";
 
 const STATE_VERSION = 1;
 const MAX_VISIBLE_MESSAGES = 12;
@@ -430,16 +431,15 @@ export function rebindPendingMessages(snapshot, pendingMessages) {
   return rebound;
 }
 
-function firstPendingBatchLength(pending) {
-  let length = 0;
-  while (length < pending.length && pending[length].kind === "text") length += 1;
-  if (length === pending.length) return length;
-  if (pending[length].kind !== "media") {
-    throw new Error("The persisted Douyin queue contains an unsupported message kind.");
+function firstPendingBatchLength(pending, { action, chatKey, snapshot }) {
+  const messages = action ? rebindPendingMessages(snapshot, pending) : pending;
+  const plan = planDouyinIncomingQueue(messages, { action, chatKey });
+  if (!plan.ok) {
+    throw new DouyinRecoverySafetyError(
+      "The committed Douyin action input cannot be recovered exactly.",
+    );
   }
-  length += 1;
-  while (length < pending.length && pending[length].kind === "text") length += 1;
-  return length;
+  return plan.batches[0].messages.length;
 }
 
 export function findAppendedMessages(previousSnapshot, currentSnapshot) {
@@ -646,7 +646,11 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
   if (!sent) {
     throw new Error("The previous Douyin send cannot be verified; refusing to resend.");
   }
-  const completedBatchLength = firstPendingBatchLength(normalized.checkpoint.pending);
+  const completedBatchLength = firstPendingBatchLength(normalized.checkpoint.pending, {
+    action,
+    chatKey: normalized.chatKey,
+    snapshot: normalized.checkpoint.snapshot,
+  });
   const queuedMessages = [
     ...normalized.checkpoint.pending.slice(completedBatchLength),
     ...appended.filter((message) => (

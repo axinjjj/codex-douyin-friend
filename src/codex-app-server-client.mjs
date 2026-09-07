@@ -56,6 +56,29 @@ export function extractAgentText(item) {
     .join("");
 }
 
+// item/completed is the authoritative item snapshot. Keep this projection shared
+// by live completion and crash recovery; commentary is never a chat reply.
+export function selectCompletedCodexReply(items) {
+  const messages = (items ?? []).filter((item) => item?.type === "agentMessage");
+  if (messages.length > 64) throw new Error("Too many Codex reply items.");
+  const finals = messages.filter((item) => item.phase === "final_answer");
+  let selected;
+  if (finals.length === 1) {
+    selected = finals[0];
+  } else if (finals.length === 0 && messages.length === 1
+      && (messages[0].phase === undefined || messages[0].phase === null)) {
+    // Older App Server item snapshots omit phase. Only a single item is unambiguous.
+    selected = messages[0];
+  } else {
+    throw new Error("The Codex turn has no unique completed final reply.");
+  }
+  const text = extractAgentText(selected);
+  if (!text.trim() || Buffer.byteLength(text, "utf8") > 128 * 1024) {
+    throw new Error("The completed Codex reply is empty or exceeds its bound.");
+  }
+  return text;
+}
+
 export function instructionSourcesContain(instructionSources, expectedPath) {
   const normalizedExpected = expectedPath.replaceAll("\\", "/").toLowerCase();
   return (instructionSources ?? []).some((source) => {
@@ -266,10 +289,9 @@ export class CodexAppServerClient extends EventEmitter {
     const result = await this.request("thread/read", { threadId, includeTurns: true });
     const turn = result?.thread?.turns?.find((candidate) => candidate?.id === turnId);
     if (!turn) return { found: false, status: null, text: "" };
-    const text = (turn.items ?? [])
-      .map(extractAgentText)
-      .filter(Boolean)
-      .join("");
+    const text = turn.status === "completed"
+      ? selectCompletedCodexReply(turn.items ?? [])
+      : "";
     return {
       found: true,
       status: String(turn.status || ""),
@@ -287,11 +309,19 @@ export class CodexAppServerClient extends EventEmitter {
     timeoutMs = resolveCodexTurnTimeoutMs(),
   }) {
     const chunks = [];
+    const completedItems = new Map();
+    let anonymousItemCount = 0;
+    let sawStructuredAgent = false;
+    let legacyBytes = 0;
     const bufferedNotifications = [];
     let expectedTurnId = null;
+    let turnStartCommitted = false;
 
     return new Promise((resolve, reject) => {
       let settled = false;
+      let journalInFlight = false;
+      let hasDeferredFailure = false;
+      let deferredFailure = null;
       const cleanup = () => {
         clearTimeout(timeout);
         this.off("notification", onNotification);
@@ -299,6 +329,14 @@ export class CodexAppServerClient extends EventEmitter {
       };
       const finish = (callback, value) => {
         if (settled) return;
+        if (journalInFlight) {
+          // Do not release the caller/run lock while its durable write can still land.
+          if (callback === reject && !hasDeferredFailure) {
+            hasDeferredFailure = true;
+            deferredFailure = value;
+          }
+          return;
+        }
         settled = true;
         cleanup();
         callback(value);
@@ -310,26 +348,55 @@ export class CodexAppServerClient extends EventEmitter {
         message?.params?.turnId ?? message?.params?.turn?.id ?? null
       );
       const consumeNotification = (message) => {
-        if (notificationTurnId(message) !== expectedTurnId) return;
-        if (message.method === "item/agentMessage/delta") {
-          const delta = message.params?.delta;
-          if (typeof delta === "string") chunks.push(delta);
+        if (settled || notificationTurnId(message) !== expectedTurnId) return;
+        try {
+          const item = message.params?.item;
+          if (message.method === "item/started" && item?.type === "agentMessage") {
+            sawStructuredAgent = true;
+          }
+          if (message.method === "item/agentMessage/delta") {
+            if (message.params?.itemId) sawStructuredAgent = true;
+            // Compatibility for legacy streams that carry no structured items or item id.
+            // Modern item-id streams must supply a completed item; partial deltas cannot win.
+            if (!sawStructuredAgent && typeof message.params?.delta === "string") {
+              legacyBytes += Buffer.byteLength(message.params.delta, "utf8");
+              if (legacyBytes > 128 * 1024) {
+                throw new Error("Codex reply stream exceeded its bound.");
+              }
+              chunks.push(message.params.delta);
+            }
+          }
+          if (message.method === "item/completed" && item?.type === "agentMessage") {
+            sawStructuredAgent = true;
+            const key = item.id ?? `anonymous-${++anonymousItemCount}`;
+            if (completedItems.has(key)
+                && JSON.stringify(completedItems.get(key)) !== JSON.stringify(item)) {
+              throw new Error("A completed Codex reply item changed after completion.");
+            }
+            completedItems.set(key, item);
+            if (completedItems.size > 64) throw new Error("Too many Codex reply items.");
+          }
+          if (message.method !== "turn/completed") return;
+          const status = message.params?.turn?.status;
+          if (status && status !== "completed") {
+            throw new Error(`Codex turn ended with status ${status}.`);
+          }
+          const text = completedItems.size > 0
+            ? selectCompletedCodexReply([...completedItems.values()])
+            : !sawStructuredAgent && legacyBytes > 0
+              ? chunks.join("")
+              : selectCompletedCodexReply([]);
+          finish(resolve, text);
+        } catch (error) {
+          finish(reject, error);
         }
-        if (message.method === "item/completed") {
-          const completedText = extractAgentText(message.params?.item);
-          if (completedText && chunks.length === 0) chunks.push(completedText);
-        }
-        if (message.method !== "turn/completed") return;
-        const status = message.params?.turn?.status;
-        if (status && status !== "completed") {
-          finish(reject, new Error(`Codex turn ended with status ${status}.`));
-          return;
-        }
-        finish(resolve, chunks.join(""));
       };
       const onNotification = (message) => {
-        if (message?.params?.threadId !== threadId) return;
-        if (!expectedTurnId) {
+        if (settled || message?.params?.threadId !== threadId) return;
+        if (expectedTurnId && notificationTurnId(message) !== expectedTurnId) return;
+        if (!["item/started", "item/agentMessage/delta", "item/completed", "turn/completed"]
+            .includes(message.method)) return;
+        if (!turnStartCommitted) {
           if (bufferedNotifications.length >= 256) {
             finish(reject, new Error("Too many Codex notifications arrived before turn/start completed."));
             return;
@@ -351,21 +418,35 @@ export class CodexAppServerClient extends EventEmitter {
       };
       if (model) params.model = model;
       if (effort) params.effort = effort;
-      this.request("turn/start", params).then((result) => {
+      Promise.resolve().then(() => this.request("turn/start", params)).then(async (result) => {
+        // A late response must not begin a stale journal write after timeout or exit.
+        if (settled) return;
         expectedTurnId = result?.turn?.id ?? null;
-        if (!expectedTurnId) {
-          finish(reject, new Error("turn/start did not return a turn id."));
+        if (!expectedTurnId) throw new Error("turn/start did not return a turn id.");
+        if (typeof onTurnStarted === "function") {
+          journalInFlight = true;
+          try {
+            await onTurnStarted({ threadId, turnId: expectedTurnId });
+          } catch (error) {
+            if (!hasDeferredFailure) {
+              hasDeferredFailure = true;
+              deferredFailure = error;
+            }
+          } finally {
+            journalInFlight = false;
+          }
+        }
+        if (hasDeferredFailure) {
+          finish(reject, deferredFailure);
           return;
         }
-        Promise.resolve(typeof onTurnStarted === "function"
-          ? onTurnStarted({ threadId, turnId: expectedTurnId })
-          : null).then(() => {
-          for (const message of bufferedNotifications.splice(0)) {
-            if (settled) break;
-            consumeNotification(message);
-          }
-        }, (error) => finish(reject, error));
-      }, (error) => finish(reject, error));
+        if (settled) return;
+        turnStartCommitted = true;
+        for (const message of bufferedNotifications.splice(0)) {
+          if (settled) break;
+          consumeNotification(message);
+        }
+      }).catch((error) => finish(reject, error));
     });
   }
 
@@ -397,6 +478,21 @@ export class CodexAppServerClient extends EventEmitter {
       message = JSON.parse(line);
     } catch {
       this.emit("protocolError", new Error("Received non-JSON output from Codex."));
+      return;
+    }
+
+    if (message.id !== undefined && typeof message.method === "string") {
+      // Server requests have their own id namespace. Never interpret them as responses
+      // to our requests and never grant tools/permissions implicitly.
+      try {
+        this.#writePayload(this.process, {
+          id: message.id,
+          error: { code: -32601, message: "Server requests are not supported by this bridge." },
+        });
+      } catch {
+        // #writePayload already tears down a failed transport.
+      }
+      this.emit("serverRequestRejected", { reason: "unsupported-server-request" });
       return;
     }
 
