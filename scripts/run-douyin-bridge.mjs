@@ -46,8 +46,13 @@ import {
   DouyinRecoverySafetyError,
   findAppendedMessages,
   normalizeBridgeSnapshot,
+  planDegradedBridgeObservation,
   rebindPendingMessages,
 } from "../src/douyin-bridge-state.mjs";
+import {
+  DOUYIN_OUTBOUND_DEGRADED_REASON,
+  reconcileDouyinOutboundActivity,
+} from "../src/douyin-outbound-ledger.mjs";
 import {
   cleanupStaleImageAnalysisJobs,
   DouyinNativeStickerUnavailableError,
@@ -274,6 +279,10 @@ try {
     getActiveState,
     loadedState,
     persistState,
+    recoveredDegradation,
+    recoveredForFreshThread,
+    recoveredLegacySystemBlock,
+    recoveredVerifiedSend,
     runtime,
     session,
     storedState,
@@ -282,6 +291,7 @@ try {
   let previous = startup.previous;
   let queuedIncoming = startup.queuedIncoming;
   let resumedReply = startup.resumedReply;
+  let degradedOutgoing = startup.degradedOutgoing;
   if (session.replacedStoredThread && storedState?.threadId
       && storedState.threadId !== runtime.threadId) {
     await codex.request("thread/archive", { threadId: storedState.threadId }).catch(() => {});
@@ -304,12 +314,20 @@ try {
     threadResumeFallback: runtime.resumeFallback,
     recoveredVerifiedSend,
     recoveredForFreshThread,
+    recoveredLegacySystemBlock,
     seededMessageCount: session.seededMessageCount,
     baselineMessageCount: previous.messageCount,
-    phase: "listening",
+    phase: degradedOutgoing ? "degraded" : "listening",
     contextCompaction: contextManager.policy,
   }));
-  setBridgePhase("listening");
+  if (recoveredDegradation) {
+    console.log(JSON.stringify({
+      ok: true,
+      event: "outbound-ledger-reconciled",
+      resumedPhase: queuedIncoming ? "queued" : "ready",
+    }));
+  }
+  setBridgePhase(degradedOutgoing ? "degraded" : "listening");
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline && !stopRequested) {
@@ -327,7 +345,8 @@ try {
       });
       continue;
     }
-    const continuingQueue = Array.isArray(queuedIncoming) && queuedIncoming.length > 0;
+    const continuingQueue = !degradedOutgoing
+      && Array.isArray(queuedIncoming) && queuedIncoming.length > 0;
     if (!continuingQueue) {
       await sleep(750);
       if (stopRequested) break;
@@ -348,7 +367,7 @@ try {
       messages: currentMetadata.messages,
     });
     let appended = findAppendedMessages(previous, current);
-    if (appended.length === 0 && !continuingQueue) continue;
+    if (appended.length === 0 && !continuingQueue && !degradedOutgoing) continue;
     if (!continuingQueue && appended.some((message) => message.side === "left")) {
       let chatChangedDuringSettle = false;
       for (let settleRound = 0; settleRound < 3 && !stopRequested; settleRound += 1) {
@@ -378,13 +397,82 @@ try {
       }
       appended = findAppendedMessages(previous, current);
     }
+    if (degradedOutgoing) {
+      const observation = planDegradedBridgeObservation(getActiveState(), current);
+      if (!observation.ok) {
+        setBridgePhase("blocked");
+        await persistState("blocked", {
+          snapshot: observation.current,
+          pending: observation.pending,
+          blockedReason: observation.blockedReason,
+          action: observation.action,
+        });
+        console.log(JSON.stringify({
+          ok: false,
+          event: "outbound-ledger-conflict-bridge-stopped",
+          reason: observation.blockedReason,
+        }));
+        process.exitCode = 6;
+        break;
+      }
+      if (!observation.stable) {
+        await persistState("degraded", {
+          snapshot: observation.current,
+          pending: observation.pending,
+          blockedReason: DOUYIN_OUTBOUND_DEGRADED_REASON,
+          action: observation.action,
+        });
+        previous = observation.current;
+        queuedIncoming = observation.pending.length > 0 ? observation.pending : null;
+        setBridgePhase("degraded");
+        console.log(JSON.stringify({
+          ok: true,
+          event: "outgoing-degradation-continued",
+          unknownOutgoingCount: observation.unknownOutgoingCount,
+          systemEventCount: observation.systemEventCount,
+          pendingCount: observation.pending.length,
+        }));
+        continue;
+      }
+
+      let recoveredAction = observation.action;
+      if (recoveredAction?.stage === "send-verified"
+          && recoveredAction.reactionDecision === "yes"
+          && recoveredAction.reactionTarget) {
+        recoveredAction = transitionDouyinAction(recoveredAction, "reaction-attempted");
+        await persistState("degraded", {
+          snapshot: observation.current,
+          pending: observation.pending,
+          blockedReason: DOUYIN_OUTBOUND_DEGRADED_REASON,
+          action: recoveredAction,
+        });
+      }
+      if (recoveredAction?.stage === "send-verified") recoveredAction = null;
+      if (recoveredAction?.stage === "reaction-attempted") recoveredAction = null;
+      await persistState(observation.phase, {
+        snapshot: observation.current,
+        pending: observation.pending,
+        action: recoveredAction,
+      });
+      degradedOutgoing = false;
+      previous = observation.current;
+      queuedIncoming = observation.pending.length > 0 ? observation.pending : null;
+      setBridgePhase(queuedIncoming ? "queued" : "listening");
+      console.log(JSON.stringify({
+        ok: true,
+        event: "outbound-ledger-reconciled",
+        resumedPhase: queuedIncoming ? "queued" : "ready",
+        pendingCount: observation.pending.length,
+      }));
+      continue;
+    }
     const newlyIncoming = appended.filter((message) => (
       message.side === "left" && (message.kind === "text" || message.kind === "media")
     ));
     const unsupportedIncoming = appended.filter((message) => (
       message.side === "left" && message.kind !== "text" && message.kind !== "media"
     ));
-    const outgoing = appended.filter((message) => message.side === "right");
+    const systemEvents = appended.filter((message) => message.kind === "system");
     const incoming = continuingQueue
       ? rebindPendingMessages(current, [...queuedIncoming, ...newlyIncoming])
       : newlyIncoming;
@@ -400,33 +488,63 @@ try {
           unsupportedCount: unsupportedIncoming.length,
         }));
       }
+      if (systemEvents.length > 0) {
+        console.log(JSON.stringify({
+          ok: true,
+          event: "platform-system-event-skipped",
+          count: systemEvents.length,
+        }));
+      }
       continue;
     }
 
     const expectedOutboundFingerprint = getActiveState().checkpoint.outboundFingerprint;
-    const expectedOutgoingIndex = expectedOutboundFingerprint === null
-      ? -1
-      : outgoing.findIndex((message) => (
-        message.kind === "text" && message.fingerprint === expectedOutboundFingerprint
-      ));
-    const unexpectedOutgoingCount = outgoing.length - Number(expectedOutgoingIndex >= 0);
-
-    if ((expectedOutboundFingerprint !== null && expectedOutgoingIndex < 0)
-        || unexpectedOutgoingCount > 0) {
+    const outbound = reconcileDouyinOutboundActivity(appended, {
+      expectedFingerprint: expectedOutboundFingerprint,
+    });
+    if (!outbound.ok) {
       setBridgePhase("blocked");
       await persistState("blocked", {
         snapshot: current,
         pending: incoming,
-        blockedReason: expectedOutgoingIndex < 0
-          ? "verified-outbound-missing"
-          : "concurrent-outgoing-ambiguous",
+        blockedReason: outbound.reason,
+        action: resumedReply?.action ?? getActiveState().checkpoint.action,
       });
       console.log(JSON.stringify({
         ok: false,
-        event: "outgoing-activity-ambiguous-bridge-stopped",
+        event: "outbound-ledger-conflict-bridge-stopped",
+        reason: outbound.reason,
       }));
       process.exitCode = 6;
       break;
+    }
+    if (outbound.degraded) {
+      const activeAction = resumedReply?.action ?? getActiveState().checkpoint.action;
+      await persistState("degraded", {
+        snapshot: current,
+        pending: incoming,
+        blockedReason: DOUYIN_OUTBOUND_DEGRADED_REASON,
+        action: activeAction,
+      });
+      previous = current;
+      queuedIncoming = incoming.length > 0 ? incoming : null;
+      degradedOutgoing = true;
+      setBridgePhase("degraded");
+      console.log(JSON.stringify({
+        ok: true,
+        event: "unknown-outgoing-degraded",
+        unknownOutgoingCount: outbound.unknownCount,
+        systemEventCount: outbound.systemCount,
+        pendingCount: incoming.length,
+      }));
+      continue;
+    }
+    if (systemEvents.length > 0) {
+      console.log(JSON.stringify({
+        ok: true,
+        event: "platform-system-event-skipped",
+        count: systemEvents.length,
+      }));
     }
 
     if (incoming.length === 0) {
@@ -912,12 +1030,10 @@ try {
         messages: afterSend.messages,
       });
       const appendedDuringSend = findAppendedMessages(current, afterSendSnapshot);
-      const outgoingDuringSend = appendedDuringSend.filter((message) => message.side === "right");
-      const unexpectedOutgoing = outgoingDuringSend.filter((message) => (
-        message.kind !== "text" || message.fingerprint !== outboundFingerprint
-        || (currentAction.quoteTargetFingerprint !== null
-          && message.quoteTargetFingerprint !== currentAction.quoteTargetFingerprint)
-      ));
+      const outboundDuringSend = reconcileDouyinOutboundActivity(appendedDuringSend, {
+        expectedFingerprint: outboundFingerprint,
+        expectedQuoteTargetFingerprint: currentAction.quoteTargetFingerprint,
+      });
       const incomingDuringSend = appendedDuringSend.filter((message) => (
         message.side === "left" && (message.kind === "text" || message.kind === "media")
       ));
@@ -928,17 +1044,18 @@ try {
       const reboundRemaining = remainingMessages.length > 0
         ? rebindPendingMessages(afterSendSnapshot, remainingMessages)
         : [];
-      if (outgoingDuringSend.length !== 1 || unexpectedOutgoing.length > 0) {
+      if (!outboundDuringSend.ok) {
         setBridgePhase("blocked");
         await persistState("blocked", {
           snapshot: afterSendSnapshot,
           pending: reboundRemaining,
-          blockedReason: "concurrent-outgoing-ambiguous",
+          blockedReason: outboundDuringSend.reason,
           action: currentAction,
         });
         console.log(JSON.stringify({
           ok: false,
-          event: "activity-during-send-ambiguous-bridge-stopped",
+          event: "outbound-ledger-conflict-during-send-bridge-stopped",
+          reason: outboundDuringSend.reason,
         }));
         process.exitCode = 6;
         break;
@@ -950,6 +1067,13 @@ try {
           count: unsupportedDuringSend.length,
         }));
       }
+      if (outboundDuringSend.systemCount > 0) {
+        console.log(JSON.stringify({
+          ok: true,
+          event: "platform-system-event-skipped",
+          count: outboundDuringSend.systemCount,
+        }));
+      }
       currentAction = transitionDouyinAction(currentAction, "send-verified", {
         reactionOrdinalShift: appendedDuringSend.length,
       });
@@ -959,7 +1083,25 @@ try {
         outboundFingerprint,
         action: currentAction,
       });
-      if (mediaReactionEnabled && mediaShouldLike && incomingBatch.mediaMessage) {
+      if (outboundDuringSend.degraded
+          && currentAction.stage === "send-verified"
+          && currentAction.reactionDecision === "yes"
+          && currentAction.reactionTarget) {
+        currentAction = transitionDouyinAction(currentAction, "reaction-attempted");
+        await persistState("sending", {
+          snapshot: current,
+          pending: incoming,
+          outboundFingerprint,
+          action: currentAction,
+        });
+        if (mediaReactionEnabled && mediaShouldLike && incomingBatch.mediaMessage) {
+          console.log(JSON.stringify({
+            ok: true,
+            event: "media-like-skipped",
+            reason: "outgoing-degraded",
+          }));
+        }
+      } else if (mediaReactionEnabled && mediaShouldLike && incomingBatch.mediaMessage) {
         currentAction = transitionDouyinAction(currentAction, "reaction-attempted");
         await persistState("sending", {
           snapshot: current,
@@ -987,13 +1129,31 @@ try {
           }));
         }
       }
-      await persistState(reboundRemaining.length > 0 ? "queued" : "ready", {
-        snapshot: afterSendSnapshot,
-        pending: reboundRemaining,
-      });
+      await persistState(
+        outboundDuringSend.degraded
+          ? "degraded"
+          : reboundRemaining.length > 0 ? "queued" : "ready",
+        {
+          snapshot: afterSendSnapshot,
+          pending: reboundRemaining,
+          ...(outboundDuringSend.degraded
+            ? { blockedReason: DOUYIN_OUTBOUND_DEGRADED_REASON }
+            : {}),
+        },
+      );
       queuedIncoming = reboundRemaining.length > 0 ? reboundRemaining : null;
       previous = afterSendSnapshot;
-      setBridgePhase(queuedIncoming ? "queued" : "listening");
+      degradedOutgoing = outboundDuringSend.degraded;
+      setBridgePhase(degradedOutgoing ? "degraded" : queuedIncoming ? "queued" : "listening");
+      if (degradedOutgoing) {
+        console.log(JSON.stringify({
+          ok: true,
+          event: "unknown-outgoing-degraded",
+          unknownOutgoingCount: outboundDuringSend.unknownCount,
+          systemEventCount: outboundDuringSend.systemCount,
+          pendingCount: reboundRemaining.length,
+        }));
+      }
     } catch (error) {
       if (error instanceof DouyinUnsupportedIncomingError
           || error instanceof DouyinNativeStickerUnavailableError) {

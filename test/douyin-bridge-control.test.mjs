@@ -124,6 +124,15 @@ test("classifies checkpoint, recoverable, and retryable bridge failures without 
   assert.equal(classifyBridgeTerminalFailure({
     phase: "listening",
   }).disposition, "retry");
+  assert.deepEqual(classifyBridgeTerminalFailure({
+    phase: "degraded",
+  }), {
+    version: 1,
+    event: "bridge-terminal",
+    disposition: "retry",
+    reason: "runtime-retry-required",
+    phase: "degraded",
+  });
   assert.equal(classifyBridgeTerminalFailure({
     exitCode: 4,
     phase: "starting",

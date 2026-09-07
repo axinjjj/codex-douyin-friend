@@ -34,6 +34,7 @@ function createHarness({
 
   const dependencies = {
     CodexContextCompactionManager: FakeContextCompactionManager,
+    DOUYIN_OUTBOUND_DEGRADED_REASON: "unknown-outgoing-observed",
     buildBridgeStartupViewExpression() {
       calls.push("startup-expression-built");
       return "startup-expression";
@@ -172,6 +173,8 @@ test("starts normally without stored state and persists one ready checkpoint", a
   assert.equal(result.runtime, harness.runtime);
   assert.equal(result.taskGeneration, 1);
   assert.equal(result.queuedIncoming, null);
+  assert.equal(result.recoveredForFreshThread, false);
+  assert.equal(result.recoveredVerifiedSend, false);
   assert.equal(result.resumedReply, null);
   assert.deepEqual(harness.getPreparedSessionParams().pendingMessages, []);
   assert.deepEqual(harness.uncommittedThreadIds, ["thread-new", null]);
@@ -215,6 +218,8 @@ test("recovers a pending action and reuses its completed Codex turn", async () =
 
   assert.equal(result.taskGeneration, 7);
   assert.equal(result.queuedIncoming, pending);
+  assert.equal(result.recoveredForFreshThread, false);
+  assert.equal(result.recoveredVerifiedSend, false);
   assert.deepEqual(result.resumedReply, {
     action,
     reply: "recovered reply",
@@ -271,4 +276,35 @@ test("fails closed when a pending action turn cannot be recovered", async () => 
   assert.equal(harness.savedStates[0], storedState);
   assert.deepEqual(harness.uncommittedThreadIds, []);
   assert.equal(harness.calls.includes("state-saved:queued"), false);
+});
+
+test("keeps a recovered unknown-outgoing degradation durable across startup", async () => {
+  const storedState = {
+    generation: 4,
+    checkpoint: { phase: "degraded", snapshot: { normalized: "degraded" } },
+  };
+  const pending = [{ fingerprint: "pending-message" }];
+  const harness = createHarness({
+    loadedState: { status: "primary", state: storedState, requiresFreshThread: false },
+    recovery: {
+      state: storedState,
+      recoveredVerifiedSend: false,
+      queuedPending: pending,
+      degradedOutgoing: true,
+      recoveredDegradation: false,
+      checkpointChanged: true,
+    },
+    resumed: true,
+  });
+
+  const result = await recoverBridgeStartup(harness.args);
+
+  assert.equal(result.degradedOutgoing, true);
+  assert.equal(result.recoveredDegradation, false);
+  assert.equal(result.queuedIncoming, pending);
+  assert.equal(harness.savedStates.length, 2);
+  assert.equal(harness.savedStates[0], storedState);
+  assert.equal(harness.savedStates[1].checkpoint.phase, "degraded");
+  assert.equal(harness.savedStates[1].checkpoint.blockedReason, "unknown-outgoing-observed");
+  assert.deepEqual(harness.savedStates[1].checkpoint.pending, pending);
 });

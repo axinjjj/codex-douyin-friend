@@ -10,6 +10,33 @@ export function planDouyinIncomingQueue(messages, { action = null, chatKey = nul
     return { ok: false, batches: [] };
   }
   if (action !== null) return planCommittedActionQueue(messages, { action, chatKey });
+  const segments = splitOrdinalContiguousMessages(messages);
+  const batches = [];
+  for (const segment of segments) {
+    const segmentPlan = planContiguousIncomingQueue(segment);
+    if (!segmentPlan.ok) return { ok: false, batches: [] };
+    batches.push(...segmentPlan.batches);
+  }
+  return { ok: batches.length > 0, batches };
+}
+
+function splitOrdinalContiguousMessages(messages) {
+  const hasPositiveOrdinals = messages.every((message) => (
+    Number.isSafeInteger(message.ordinalFromEnd) && message.ordinalFromEnd > 0
+  ));
+  if (!hasPositiveOrdinals) return [messages];
+
+  const segments = [[messages[0]]];
+  for (let index = 1; index < messages.length; index += 1) {
+    const previous = messages[index - 1];
+    const current = messages[index];
+    if (previous.ordinalFromEnd - current.ordinalFromEnd !== 1) segments.push([]);
+    segments.at(-1).push(current);
+  }
+  return segments;
+}
+
+function planContiguousIncomingQueue(messages) {
   const batches = [];
   let index = 0;
   const leadingTextMessages = [];

@@ -23,9 +23,11 @@ import {
 } from "./douyin-action-journal.mjs";
 import { likeIncomingDouyinMediaMessage } from "./douyin-media-reaction.mjs";
 import { cleanupRecoveredDouyinMediaQuote } from "./douyin-message-quote.mjs";
+import { DOUYIN_OUTBOUND_DEGRADED_REASON } from "./douyin-outbound-ledger.mjs";
 
 export const douyinBridgeStartupDependencies = Object.freeze({
   CodexContextCompactionManager,
+  DOUYIN_OUTBOUND_DEGRADED_REASON,
   buildBridgeStartupViewExpression,
   cleanupRecoveredDouyinMediaQuote,
   computeDouyinReplyDigest,
@@ -66,6 +68,7 @@ export async function recoverBridgeStartup({
 }) {
   const {
     CodexContextCompactionManager: ContextCompactionManager,
+    DOUYIN_OUTBOUND_DEGRADED_REASON: outboundDegradedReason,
     buildBridgeStartupViewExpression,
     cleanupRecoveredDouyinMediaQuote,
     computeDouyinReplyDigest,
@@ -99,18 +102,25 @@ export async function recoverBridgeStartup({
   let storedState = loadedState.state;
   let recoveredVerifiedSend = false;
   let recoveredForFreshThread = false;
+  let recoveredDegradation = false;
+  let recoveredLegacySystemBlock = false;
+  let degradedOutgoing = false;
   let startupQueuedPending = null;
   let startupResumeAction = null;
   if (storedState) {
     const canAttemptFreshRecovery = forceFreshThread
       && storedState.checkpoint.phase !== "ready"
-      && storedState.checkpoint.phase !== "sending";
+      && storedState.checkpoint.phase !== "sending"
+      && storedState.checkpoint.phase !== "degraded";
     const recovery = canAttemptFreshRecovery
       ? recoverBridgeStateForFreshThread(storedState, startupSnapshot)
       : recoverBridgeStateForStartup(storedState, startupSnapshot);
     storedState = recovery.state;
     recoveredVerifiedSend = recovery.recoveredVerifiedSend;
     recoveredForFreshThread = canAttemptFreshRecovery;
+    recoveredDegradation = Boolean(recovery.recoveredDegradation);
+    recoveredLegacySystemBlock = Boolean(recovery.recoveredLegacySystemBlock);
+    degradedOutgoing = Boolean(recovery.degradedOutgoing);
     startupQueuedPending = recovery.queuedPending?.length > 0
       ? recovery.queuedPending
       : null;
@@ -125,7 +135,8 @@ export async function recoverBridgeStartup({
         quoteTargetFingerprint: startupResumeAction.quoteTargetFingerprint,
       });
     }
-    if (recoveredVerifiedSend || recoveredForFreshThread || startupQueuedPending) {
+    if (recoveredVerifiedSend || recoveredForFreshThread || startupQueuedPending
+        || recovery.checkpointChanged) {
       await saveBridgeState(projectRoot, storedState);
     }
   }
@@ -240,7 +251,14 @@ export async function recoverBridgeStartup({
     });
     await saveBridgeState(projectRoot, activeState);
   };
-  if (resumedReply) {
+  if (degradedOutgoing) {
+    await persistState("degraded", {
+      snapshot: previous,
+      pending: queuedIncoming ?? [],
+      blockedReason: outboundDegradedReason,
+      action: startupResumeAction,
+    });
+  } else if (resumedReply) {
     await persistState("queued", {
       snapshot: previous,
       pending: queuedIncoming,
@@ -259,7 +277,7 @@ export async function recoverBridgeStartup({
       action: startupResumeAction,
     });
   }
-  if (startupResumeAction
+  if (!degradedOutgoing && startupResumeAction
       && ["send-verified", "reaction-attempted"].includes(startupResumeAction.stage)) {
     if (startupResumeAction.stage === "send-verified"
         && startupResumeAction.reactionDecision === "yes"
@@ -299,6 +317,11 @@ export async function recoverBridgeStartup({
     persistState,
     previous,
     queuedIncoming,
+    degradedOutgoing,
+    recoveredDegradation,
+    recoveredForFreshThread,
+    recoveredLegacySystemBlock,
+    recoveredVerifiedSend,
     resumedReply,
     runtime,
     session,

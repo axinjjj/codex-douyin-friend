@@ -55,6 +55,15 @@ test("plans incoming text and media into chronological reply batches", () => {
     mediaMessage: media,
     messages: [media, trailingText],
   });
+  const separatedText = { ...text, ordinalFromEnd: 4 };
+  const separatedMedia = { ...media, ordinalFromEnd: 3 };
+  const textAfterGap = { ...trailingText, ordinalFromEnd: 1 };
+  const separated = planDouyinIncomingQueue([separatedText, separatedMedia, textAfterGap]);
+  assert.deepEqual(separated.batches.map((batch) => batch.messages), [
+    [separatedText, separatedMedia],
+    [textAfterGap],
+  ]);
+  assert.deepEqual(separated.batches.map((batch) => batch.mode), ["media", "text"]);
   assert.equal(planDouyinIncomingQueue([{ ...text, side: "right" }]).ok, false);
 });
 
@@ -729,6 +738,51 @@ test("resumes a compatible persistent thread without reinjecting visible history
       model: "gpt-5.6-sol",
       effort: "xhigh",
       checkpoint: { phase: "ready", snapshot },
+    },
+    currentSnapshot: { messageCount: 2, messages: [] },
+    visibleMessages: [{ role: "user", text: "private fixture" }],
+  });
+  assert.equal(session.runtime.resumed, true);
+  assert.equal(session.seededMessageCount, 0);
+  assert.equal(injected, false);
+  assert.deepEqual(session.baselineSnapshot, snapshot);
+});
+
+test("treats a degraded checkpoint as reliable thread continuity on restart", async () => {
+  let injected = false;
+  const session = await preparePersistentBridgeSession({
+    codex: {
+      async start() {},
+      async request() {
+        return {
+          data: [{
+            id: "gpt-5.6-sol",
+            supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+          }],
+        };
+      },
+      async resumeThread(params) {
+        assert.equal(params.threadId, "thread-1");
+        return {
+          thread: { id: "thread-1", ephemeral: false },
+          model: "gpt-5.6-sol",
+          instructionSources: [{ path: "C:/persona/AGENTS.md" }],
+        };
+      },
+      async startThread() {
+        throw new Error("should not start");
+      },
+      async injectItems() {
+        injected = true;
+      },
+    },
+    cwd: "C:/project",
+    expectedPersonaPath: "C:/persona/AGENTS.md",
+    storedState: {
+      threadId: "thread-1",
+      model: "gpt-5.6-sol",
+      effort: "xhigh",
+      checkpoint: { phase: "degraded", snapshot },
     },
     currentSnapshot: { messageCount: 2, messages: [] },
     visibleMessages: [{ role: "user", text: "private fixture" }],

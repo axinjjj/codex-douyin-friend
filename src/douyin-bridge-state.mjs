@@ -7,6 +7,10 @@ import {
   validateDouyinAction,
 } from "./douyin-action-journal.mjs";
 import { planDouyinIncomingQueue } from "./douyin-inbound-planner.mjs";
+import {
+  DOUYIN_OUTBOUND_DEGRADED_REASON,
+  reconcileDouyinOutboundActivity,
+} from "./douyin-outbound-ledger.mjs";
 
 const STATE_VERSION = 1;
 const MAX_VISIBLE_MESSAGES = 12;
@@ -17,7 +21,9 @@ const MODEL_PATTERN = /^[A-Za-z0-9._:-]{1,100}$/u;
 const EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const SIDES = new Set(["left", "right", "center"]);
 const KINDS = new Set(["text", "media", "system", "unknown"]);
-const PHASES = new Set(["ready", "queued", "processing", "reply-ready", "sending", "blocked"]);
+const PHASES = new Set([
+  "ready", "queued", "processing", "reply-ready", "sending", "degraded", "blocked",
+]);
 const BLOCKED_REASON_PATTERN = /^[a-z0-9-]{1,80}$/u;
 
 export class DouyinCheckpointBoundaryError extends Error {
@@ -71,7 +77,8 @@ function normalizeMessageMetadata(message) {
     throw new Error("Bridge state contains an invalid quote target fingerprint.");
   }
   const legacyFingerprintAllowed = (message.kind === "text" && message.side === "right")
-    || (message.kind === "media" && message.side === "left");
+    || (message.kind === "media" && message.side === "left")
+    || (message.kind === "system" && message.side === "right");
   if (hasLegacyFingerprint && (!MESSAGE_FINGERPRINT_PATTERN.test(message.legacyFingerprint)
       || !legacyFingerprintAllowed)) {
     throw new Error("Bridge state contains an invalid legacy message fingerprint.");
@@ -224,16 +231,28 @@ export function validateBridgeState(value, expectedChatKey = null) {
       && (pending.length === 0 || outboundFingerprint === null || blockedReason !== null)) {
     throw new Error("An outbound bridge checkpoint is inconsistent.");
   }
+  if (phase === "degraded" && (outboundFingerprint !== null
+      || blockedReason !== DOUYIN_OUTBOUND_DEGRADED_REASON
+      || pending.some((message) => (
+        message.side !== "left" || (message.kind !== "text" && message.kind !== "media")
+      )))) {
+    throw new Error("A degraded bridge checkpoint is inconsistent.");
+  }
   if (phase === "blocked" && (blockedReason === null || outboundFingerprint !== null)) {
     throw new Error("A blocked bridge checkpoint is inconsistent.");
   }
   if (action) {
+    if (phase === "degraded" && ["turn-started", "reply-ready"].includes(action.stage)
+        && pending.length === 0) {
+      throw new Error("A degraded pending action has no queued input.");
+    }
     const allowedActionStages = {
       ready: new Set(["send-verified", "reaction-attempted"]),
       queued: new Set(["turn-started", "reply-ready", "send-verified", "reaction-attempted"]),
       processing: new Set(["planned", "evidence-ready", "turn-starting", "turn-started"]),
       "reply-ready": new Set(["reply-ready"]),
       sending: new Set(["send-attempted", "send-verified", "reaction-attempted"]),
+      degraded: new Set(["turn-started", "reply-ready", "send-verified", "reaction-attempted"]),
       blocked: new Set([
         "planned", "evidence-ready", "turn-starting", "turn-started", "reply-ready",
         "send-attempted", "send-verified", "reaction-attempted",
@@ -515,6 +534,46 @@ export function findAppendedMessages(previousSnapshot, currentSnapshot) {
   }));
 }
 
+export function planDegradedBridgeObservation(state, currentSnapshot) {
+  const normalized = validateBridgeState(state);
+  if (normalized.checkpoint.phase !== "degraded") {
+    throw new Error("A degraded bridge checkpoint is required.");
+  }
+  const current = normalizeBridgeSnapshot(currentSnapshot);
+  const appended = findAppendedMessages(normalized.checkpoint.snapshot, current);
+  const appendedIncoming = appended.filter((message) => (
+    message.side === "left" && (message.kind === "text" || message.kind === "media")
+  ));
+  const pendingMessages = [
+    ...normalized.checkpoint.pending,
+    ...appendedIncoming,
+  ];
+  const pending = pendingMessages.length > 0
+    ? rebindPendingMessages(current, pendingMessages)
+    : [];
+  const outbound = reconcileDouyinOutboundActivity(appended);
+  if (!outbound.ok) {
+    return {
+      ok: false,
+      blockedReason: outbound.reason,
+      current,
+      pending,
+      action: normalized.checkpoint.action,
+    };
+  }
+  const stable = appended.length === 0;
+  return {
+    ok: true,
+    stable,
+    phase: stable ? (pending.length > 0 ? "queued" : "ready") : "degraded",
+    current,
+    pending,
+    action: normalized.checkpoint.action,
+    unknownOutgoingCount: outbound.unknownCount,
+    systemEventCount: outbound.systemCount,
+  };
+}
+
 export function computeTextMessageFingerprint(text, side = "right") {
   if (side !== "left" && side !== "right") throw new Error("Text message side is invalid.");
   const structuralKey = ["text", side, String(text ?? "").trim()].join("|");
@@ -539,9 +598,91 @@ export function computeQuotedTextMessageFingerprint(
   return createHash("sha256").update(structuralKey, "utf8").digest("hex");
 }
 
+function requireRecoverableOutboundActivity(appended, options = undefined) {
+  const outbound = reconcileDouyinOutboundActivity(appended, options);
+  if (!outbound.ok) {
+    throw new Error(outbound.reason === "verified-outbound-missing"
+      ? "The previous Douyin send cannot be verified; refusing to resend."
+      : "Unexpected accountable outgoing activity appeared during recovery.");
+  }
+  return outbound;
+}
+
+function recoveredCheckpointPhase(outbound, pending) {
+  if (outbound.degraded) return "degraded";
+  return pending.length > 0 ? "queued" : "ready";
+}
+
+function recoveredCheckpointReason(outbound) {
+  return outbound.degraded ? DOUYIN_OUTBOUND_DEGRADED_REASON : null;
+}
+
 function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
   const normalized = validateBridgeState(state);
   const action = normalized.checkpoint.action;
+  if (normalized.checkpoint.phase === "degraded") {
+    const observation = planDegradedBridgeObservation(normalized, currentSnapshot);
+    if (!observation.ok) {
+      throw new Error("Accountable outgoing activity contradicted the degraded checkpoint.");
+    }
+    return {
+      state: createBridgeState({
+        chatKey: normalized.chatKey,
+        threadId: normalized.threadId,
+        model: normalized.model,
+        effort: normalized.effort,
+        generation: normalized.generation,
+        snapshot: observation.current,
+        phase: observation.phase,
+        pending: observation.pending,
+        blockedReason: observation.stable ? null : DOUYIN_OUTBOUND_DEGRADED_REASON,
+        action,
+      }),
+      recoveredVerifiedSend: false,
+      queuedPending: observation.pending,
+      resumeAction: action,
+      degradedOutgoing: !observation.stable,
+      recoveredDegradation: observation.stable,
+      checkpointChanged: true,
+    };
+  }
+  if (normalized.checkpoint.phase === "blocked"
+      && ["verified-outbound-missing", "concurrent-outgoing-ambiguous"]
+        .includes(normalized.checkpoint.blockedReason)
+      && normalized.checkpoint.pending.length === 0
+      && action === null) {
+    const current = normalizeBridgeSnapshot(currentSnapshot);
+    const checkpoint = normalized.checkpoint.snapshot;
+    const exactMigratedBoundary = current.messageCount === checkpoint.messageCount
+      && current.messages.length === checkpoint.messages.length
+      && current.messages.every((message, index) => sameMessage(message, checkpoint.messages[index]));
+    const hasKnownSystemMigration = exactMigratedBoundary
+      && current.messages.some((message, index) => (
+        message.kind === "system"
+        && message.side === "right"
+        && message.legacyFingerprint === checkpoint.messages[index].fingerprint
+        && checkpoint.messages[index].kind === "unknown"
+        && checkpoint.messages[index].side === "right"
+      ));
+    if (hasKnownSystemMigration) {
+      return {
+        state: createBridgeState({
+          chatKey: normalized.chatKey,
+          threadId: normalized.threadId,
+          model: normalized.model,
+          effort: normalized.effort,
+          generation: normalized.generation,
+          snapshot: current,
+        }),
+        recoveredVerifiedSend: false,
+        queuedPending: [],
+        degradedOutgoing: false,
+        recoveredDegradation: true,
+        recoveredLegacySystemBlock: true,
+        checkpointChanged: true,
+      };
+    }
+  }
   if (normalized.checkpoint.phase === "ready") {
     if (!action || !["send-verified", "reaction-attempted"].includes(action.stage)) {
       return {
@@ -552,9 +693,7 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
     }
     const current = normalizeBridgeSnapshot(currentSnapshot);
     const appended = findAppendedMessages(normalized.checkpoint.snapshot, current);
-    if (appended.some((message) => message.side === "right")) {
-      throw new Error("Unexpected outgoing activity appeared during reaction recovery.");
-    }
+    const outbound = requireRecoverableOutboundActivity(appended);
     const queuedMessages = appended.filter((message) => (
       message.side === "left" && (message.kind === "text" || message.kind === "media")
     ));
@@ -572,21 +711,22 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
         effort: normalized.effort,
         generation: normalized.generation,
         snapshot: current,
-        phase: queuedPending.length > 0 ? "queued" : "ready",
+        phase: recoveredCheckpointPhase(outbound, queuedPending),
         pending: queuedPending,
+        blockedReason: recoveredCheckpointReason(outbound),
         action: recoveredAction,
       }),
       recoveredVerifiedSend: false,
       queuedPending,
       resumeAction: recoveredAction,
+      degradedOutgoing: outbound.degraded,
+      checkpointChanged: appended.length > 0,
     };
   }
   if (normalized.checkpoint.phase === "queued") {
     const current = normalizeBridgeSnapshot(currentSnapshot);
     const appended = findAppendedMessages(normalized.checkpoint.snapshot, current);
-    if (appended.some((message) => message.side === "right")) {
-      throw new Error("Unexpected outgoing activity appeared while a media queue was paused.");
-    }
+    const outbound = requireRecoverableOutboundActivity(appended);
     const queuedPending = rebindPendingMessages(current, [
       ...normalized.checkpoint.pending,
       ...appended.filter((message) => (
@@ -606,31 +746,28 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
         effort: normalized.effort,
         generation: normalized.generation,
         snapshot: current,
-        phase: "queued",
+        phase: recoveredCheckpointPhase(outbound, queuedPending),
         pending: queuedPending,
+        blockedReason: recoveredCheckpointReason(outbound),
         action: recoveredAction,
       }),
       recoveredVerifiedSend: false,
       queuedPending,
       resumeAction: recoveredAction,
+      degradedOutgoing: outbound.degraded,
+      checkpointChanged: appended.length > 0,
     };
   }
   if (action && normalized.checkpoint.phase !== "sending") {
     const current = normalizeBridgeSnapshot(currentSnapshot);
     const appended = findAppendedMessages(normalized.checkpoint.snapshot, current);
-    if (appended.some((message) => message.side === "right")) {
-      throw new Error("Unexpected outgoing activity appeared during action recovery.");
-    }
+    const outbound = requireRecoverableOutboundActivity(appended);
     if (action.stage === "turn-starting") {
       throw new Error("The persisted Codex turn start is ambiguous; refusing automatic recovery.");
     }
     const appendedIncoming = appended.filter((message) => (
       message.side === "left" && (message.kind === "text" || message.kind === "media")
     ));
-    const unexpectedActivity = appended.filter((message) => message.side !== "left");
-    if (unexpectedActivity.length > 0) {
-      throw new Error("Unexpected activity appeared during action recovery.");
-    }
     const queuedPending = rebindPendingMessages(current, [
       ...normalized.checkpoint.pending,
       ...appendedIncoming,
@@ -644,11 +781,14 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
           effort: normalized.effort,
           generation: normalized.generation,
           snapshot: current,
-          phase: "queued",
+          phase: recoveredCheckpointPhase(outbound, queuedPending),
           pending: queuedPending,
+          blockedReason: recoveredCheckpointReason(outbound),
         }),
         recoveredVerifiedSend: false,
         queuedPending,
+        degradedOutgoing: outbound.degraded,
+        checkpointChanged: appended.length > 0,
       };
     }
     if (action.stage === "turn-started" || action.stage === "reply-ready") {
@@ -660,13 +800,16 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
           effort: normalized.effort,
           generation: normalized.generation,
           snapshot: current,
-          phase: "queued",
+          phase: recoveredCheckpointPhase(outbound, queuedPending),
           pending: queuedPending,
+          blockedReason: recoveredCheckpointReason(outbound),
           action,
         }),
         recoveredVerifiedSend: false,
         queuedPending,
         resumeAction: action,
+        degradedOutgoing: outbound.degraded,
+        checkpointChanged: appended.length > 0,
       };
     }
   }
@@ -676,16 +819,11 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
 
   const current = normalizeBridgeSnapshot(currentSnapshot);
   const appended = findAppendedMessages(normalized.checkpoint.snapshot, current);
-  const outgoing = appended.filter((message) => message.side === "right");
   const expectedQuoteTarget = action?.quoteTargetFingerprint ?? null;
-  const sent = outgoing.length === 1
-    && outgoing[0].kind === "text"
-    && outgoing[0].fingerprint === normalized.checkpoint.outboundFingerprint
-    && (expectedQuoteTarget === null
-      || outgoing[0].quoteTargetFingerprint === expectedQuoteTarget);
-  if (!sent) {
-    throw new Error("The previous Douyin send cannot be verified; refusing to resend.");
-  }
+  const outbound = requireRecoverableOutboundActivity(appended, {
+    expectedFingerprint: normalized.checkpoint.outboundFingerprint,
+    expectedQuoteTargetFingerprint: expectedQuoteTarget,
+  });
   const completedBatchLength = firstPendingBatchLength(normalized.checkpoint.pending, {
     action,
     chatKey: normalized.chatKey,
@@ -723,13 +861,16 @@ function recoverBridgeStateForStartupInternal(state, currentSnapshot) {
       effort: normalized.effort,
       generation: normalized.generation,
       snapshot: current,
-      phase: queuedPending.length > 0 ? "queued" : "ready",
+      phase: recoveredCheckpointPhase(outbound, queuedPending),
       pending: queuedPending,
+      blockedReason: recoveredCheckpointReason(outbound),
       action: recoveredAction,
     }),
     recoveredVerifiedSend: true,
     queuedPending,
     resumeAction: recoveredAction,
+    degradedOutgoing: outbound.degraded,
+    checkpointChanged: true,
   };
 }
 

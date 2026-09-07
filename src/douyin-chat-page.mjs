@@ -3,6 +3,8 @@ export const DOUYIN_CHAT_INPUT_SELECTOR =
 export const DOUYIN_CHAT_LIST_SELECTOR = ".messageMessageListlist";
 export const DOUYIN_MESSAGE_SELECTOR = ".messageMessageBoxmessageBox";
 export const DOUYIN_TEXT_BUBBLE_SELECTOR = ".MessageItemTextbubbleTextContent";
+export const DOUYIN_PLATFORM_SYSTEM_CARD_SELECTOR =
+  ".MessageItemUnsuportunsupport .MessageItemUnsuporttips";
 const DOUYIN_COMMENT_SHARE_SELECTOR = ".MessageItemCommentSharecontainer";
 export const DOUYIN_SHARED_WORK_VARIANTS = Object.freeze([
   Object.freeze({ name: "legacy-aweme", selector: ".MessageItemShareAwemecontainer" }),
@@ -622,6 +624,9 @@ export function buildChatMessageMetadataExpression() {
         )
         : null;
       const isOutgoingQuote = Boolean(outgoingReference && outgoingQuoteBody);
+      const isKnownPlatformSystemCard = Boolean(message.querySelector(
+        ${JSON.stringify(DOUYIN_PLATFORM_SYSTEM_CARD_SELECTOR)}
+      ));
       const legacySource = (textBubble?.textContent || stableContent?.textContent || '').trim();
       const source = (isOutgoingQuote
         ? outgoingQuoteBody.textContent
@@ -633,7 +638,7 @@ export function buildChatMessageMetadataExpression() {
       const stableMediaFingerprintSource = hasMedia
         ? resolveStableMediaFingerprintSource(message, textBubble, stableContent)
         : null;
-      const kind = isOutgoingQuote ? 'text'
+      const kind = isOutgoingQuote ? 'text' : isKnownPlatformSystemCard ? 'system'
         : hasMedia ? 'media' : textBubble && source ? 'text' : centered ? 'system' : 'unknown';
       const fingerprintSource = kind === 'media'
         ? stableMediaFingerprintSource
@@ -653,6 +658,8 @@ export function buildChatMessageMetadataExpression() {
         ? (legacyKind === 'media' || legacyKind === 'text'
           ? [legacyKind, side, legacyFingerprintSource].join('|')
           : [legacyKind, side, legacySource, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|'))
+        : isKnownPlatformSystemCard
+          ? ['unknown', side, source, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|')
         : hasNativeSticker
           ? (legacyKind === 'media' || legacyKind === 'text'
             ? [legacyKind, side, legacyFingerprintSource].join('|')
@@ -763,6 +770,9 @@ export function buildBridgeStartupViewExpression(limit = 12) {
           )
           : null;
         const isOutgoingQuote = Boolean(outgoingReference && outgoingQuoteBody);
+        const isKnownPlatformSystemCard = Boolean(message.querySelector(
+          ${JSON.stringify(DOUYIN_PLATFORM_SYSTEM_CARD_SELECTOR)}
+        ));
         const legacySource = (bubble?.textContent || stableContent?.textContent || '').trim();
         const source = (isOutgoingQuote
           ? outgoingQuoteBody.textContent
@@ -774,7 +784,7 @@ export function buildBridgeStartupViewExpression(limit = 12) {
         const stableMediaFingerprintSource = hasMedia
           ? resolveStableMediaFingerprintSource(message, bubble, stableContent)
           : null;
-        const kind = isOutgoingQuote ? 'text'
+        const kind = isOutgoingQuote ? 'text' : isKnownPlatformSystemCard ? 'system'
           : hasMedia ? 'media' : bubble && source ? 'text' : centered ? 'system' : 'unknown';
         const fingerprintSource = kind === 'media'
           ? stableMediaFingerprintSource
@@ -794,6 +804,8 @@ export function buildBridgeStartupViewExpression(limit = 12) {
           ? (legacyKind === 'media' || legacyKind === 'text'
             ? [legacyKind, side, legacyFingerprintSource].join('|')
             : [legacyKind, side, legacySource, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|'))
+          : isKnownPlatformSystemCard
+            ? ['unknown', side, source, message.querySelectorAll('img').length, message.querySelectorAll('video').length].join('|')
           : hasNativeSticker
             ? (legacyKind === 'media' || legacyKind === 'text'
               ? [legacyKind, side, legacyFingerprintSource].join('|')
