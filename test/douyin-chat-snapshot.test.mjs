@@ -89,6 +89,26 @@ test("accepts only the exact expected outgoing as send verification", () => {
     }, "expected"),
     null,
   );
+  assert.equal(
+    findExpectedNewOutgoingMessage(previous, {
+      messages: [
+        { fingerprint: "old", side: "left", ordinalFromEnd: 4, kind: "text" },
+        { fingerprint: "expected", side: "right", ordinalFromEnd: 3, kind: "text" },
+        { fingerprint: "system", side: "right", ordinalFromEnd: 2, kind: "system" },
+        { fingerprint: "unknown", side: "right", ordinalFromEnd: 1, kind: "unknown" },
+      ],
+    }, "expected")?.fingerprint,
+    "expected",
+  );
+  assert.equal(
+    findExpectedNewOutgoingMessage(previous, {
+      messages: [
+        { fingerprint: "expected", side: "right", ordinalFromEnd: 2, kind: "text" },
+        { fingerprint: "extra", side: "right", ordinalFromEnd: 1, kind: "media" },
+      ],
+    }, "expected"),
+    null,
+  );
 });
 
 test("requires the exact quoted shared-work identity when one is expected", () => {

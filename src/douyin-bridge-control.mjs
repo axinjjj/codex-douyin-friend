@@ -13,7 +13,7 @@ const TERMINAL_REASONS = new Set([
   "safety-stop-required",
 ]);
 const TERMINAL_PHASES = new Set([
-  "starting", "listening", "queued", "processing", "reply-ready", "sending",
+  "starting", "listening", "queued", "processing", "reply-ready", "sending", "degraded",
   "compacting", "blocked", "stopping", "stopped",
 ]);
 const TERMINAL_RECOVERY_PHASES = new Set(["queued"]);
@@ -21,7 +21,9 @@ const TERMINAL_BLOCK_PHASES = new Set([
   "processing", "reply-ready", "sending", "compacting", "blocked",
 ]);
 const TERMINAL_SAFETY_EXIT_CODES = new Set([3, 4, 5, 6, 7]);
-const TERMINAL_RUNTIME_PHASES = new Set(["starting", "listening", "stopping", "stopped"]);
+const TERMINAL_RUNTIME_PHASES = new Set([
+  "starting", "listening", "degraded", "stopping", "stopped",
+]);
 
 function isValidTerminalTuple({ disposition, reason, phase }) {
   if (reason === "checkpoint-boundary-unavailable" || reason === "safety-stop-required") {

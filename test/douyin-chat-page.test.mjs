@@ -38,6 +38,7 @@ import {
   buildVisibleVideoStructureExpression,
   buildXgPlayerStructureExpression,
   DOUYIN_CHAT_INPUT_SELECTOR,
+  DOUYIN_PLATFORM_SYSTEM_CARD_SELECTOR,
   DOUYIN_SHARED_WORK_VARIANTS,
   isDouyinChatTarget,
   normalizeOutboundText,
@@ -223,6 +224,21 @@ test("startup view captures one bounded snapshot and seeding conversation", () =
   assert.match(expression, /chatFingerprint/u);
   assert.match(expression, /SHA-256/u);
   assert.doesNotMatch(expression, /document\.cookie|localStorage|sessionStorage/u);
+});
+
+test("classifies the registered unsupported-tip card as a platform system event", () => {
+  assert.equal(
+    DOUYIN_PLATFORM_SYSTEM_CARD_SELECTOR,
+    ".MessageItemUnsuportunsupport .MessageItemUnsuporttips",
+  );
+  for (const expression of [
+    buildChatMessageMetadataExpression(),
+    buildBridgeStartupViewExpression(),
+  ]) {
+    assert.match(expression, /MessageItemUnsuportunsupport \.MessageItemUnsuporttips/u);
+    assert.match(expression, /isKnownPlatformSystemCard \? 'system'/u);
+    assert.match(expression, /\['unknown', side, source/u);
+  }
 });
 
 test("reads an exact bounded incoming text batch by full fingerprints", () => {

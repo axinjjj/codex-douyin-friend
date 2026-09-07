@@ -457,7 +457,7 @@ export class DouyinSupervisor extends EventEmitter {
         appServer: "ready",
         audio: event.audioEnabled ? "ready" : "unavailable",
         edge: "ready",
-        phase: "listening",
+        phase: String(event.phase || "listening"),
         restartAttempt: 0,
         model: String(event.model || this.config.model),
         effort: String(event.effort || this.config.effort),

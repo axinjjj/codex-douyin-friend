@@ -14,6 +14,7 @@ import {
   DouyinRecoverySafetyError,
   findAppendedMessages,
   loadBridgeState,
+  planDegradedBridgeObservation,
   rebindPendingMessages,
   recoverBridgeStateForFreshThread,
   recoverBridgeStateForStartup,
@@ -21,6 +22,10 @@ import {
   resolveBridgeStatePath,
   saveBridgeState,
 } from "../src/douyin-bridge-state.mjs";
+import {
+  DOUYIN_OUTBOUND_DEGRADED_REASON,
+  reconcileDouyinOutboundActivity,
+} from "../src/douyin-outbound-ledger.mjs";
 
 const chatKey = "c".repeat(64);
 const fingerprint = (value) => createHash("sha256").update(value, "utf8").digest("hex");
@@ -169,6 +174,87 @@ test("recovers a damaged primary checkpoint from its atomic recovery copy", asyn
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
+});
+
+test("persists an unknown-outgoing degradation and automatically recovers after stability", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "codex-douyin-degraded-"));
+  const before = snapshot(1, [message("before")]);
+  const unknownOutgoing = message("unknown-outgoing", "right", "unknown");
+  const degradedSnapshot = snapshot(2, [...before.messages, unknownOutgoing]);
+  try {
+    const outbound = reconcileDouyinOutboundActivity(
+      findAppendedMessages(before, degradedSnapshot),
+    );
+    assert.equal(outbound.degraded, true);
+    const degraded = createBridgeState({
+      chatKey,
+      threadId: "thread-1",
+      model: "gpt-5.6-sol",
+      effort: "xhigh",
+      snapshot: degradedSnapshot,
+      phase: "degraded",
+      blockedReason: DOUYIN_OUTBOUND_DEGRADED_REASON,
+    });
+    await saveBridgeState(projectRoot, degraded);
+    const loaded = await loadBridgeState(projectRoot, chatKey);
+    assert.equal(loaded.state.checkpoint.phase, "degraded");
+
+    const observation = planDegradedBridgeObservation(loaded.state, degradedSnapshot);
+    assert.equal(observation.stable, true);
+    assert.equal(observation.phase, "ready");
+    const recovered = recoverBridgeStateForStartup(loaded.state, degradedSnapshot);
+    assert.equal(recovered.recoveredDegradation, true);
+    assert.equal(recovered.degradedOutgoing, false);
+    assert.equal(recovered.state.checkpoint.phase, "ready");
+    assert.equal(recovered.state.checkpoint.blockedReason, null);
+    assert.deepEqual(recovered.state.checkpoint.snapshot, degradedSnapshot);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("queues incoming activity while degraded and blocks only accountable outgoing conflict", () => {
+  const unknownOutgoing = message("unknown-outgoing", "right", "unknown");
+  const degradedSnapshot = snapshot(1, [unknownOutgoing]);
+  const degraded = createBridgeState({
+    chatKey,
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
+    snapshot: degradedSnapshot,
+    phase: "degraded",
+    blockedReason: DOUYIN_OUTBOUND_DEGRADED_REASON,
+  });
+  const incoming = message("incoming");
+  const withIncoming = snapshot(2, [unknownOutgoing, incoming]);
+  const continued = planDegradedBridgeObservation(degraded, withIncoming);
+  assert.equal(continued.ok, true);
+  assert.equal(continued.stable, false);
+  assert.equal(continued.phase, "degraded");
+  assert.deepEqual(continued.pending, [{ ...incoming, ordinalFromEnd: 1 }]);
+
+  const persisted = createBridgeState({
+    chatKey,
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
+    snapshot: continued.current,
+    phase: "degraded",
+    pending: continued.pending,
+    blockedReason: DOUYIN_OUTBOUND_DEGRADED_REASON,
+  });
+  const stable = planDegradedBridgeObservation(persisted, withIncoming);
+  assert.equal(stable.stable, true);
+  assert.equal(stable.phase, "queued");
+  assert.deepEqual(stable.pending, [{ ...incoming, ordinalFromEnd: 1 }]);
+
+  const accountable = message("manual-outgoing", "right", "text");
+  const conflict = planDegradedBridgeObservation(
+    persisted,
+    snapshot(3, [...withIncoming.messages, accountable]),
+  );
+  assert.equal(conflict.ok, false);
+  assert.equal(conflict.blockedReason, "concurrent-outgoing-ambiguous");
 });
 
 test("fails closed when both checkpoint copies are damaged", async () => {
@@ -353,7 +439,7 @@ test("migrates only an explicitly aliased legacy outgoing quote checkpoint", () 
   }])), /no longer matches/u);
 });
 
-test("limits legacy aliases to outgoing quoted text and incoming media migrations", () => {
+test("limits legacy aliases to explicit quote, media, and system-card migrations", () => {
   const legacyFingerprint = "a".repeat(64);
   assert.doesNotThrow(() => readyState(snapshot(1, [{
     fingerprint: "b".repeat(64),
@@ -361,12 +447,50 @@ test("limits legacy aliases to outgoing quoted text and incoming media migration
     side: "left",
     legacyFingerprint,
   }])));
+  assert.doesNotThrow(() => readyState(snapshot(1, [{
+    fingerprint: "b".repeat(64),
+    kind: "system",
+    side: "right",
+    legacyFingerprint,
+  }])));
   for (const invalid of [
     { fingerprint: "b".repeat(64), kind: "text", side: "left", legacyFingerprint },
     { fingerprint: "b".repeat(64), kind: "media", side: "right", legacyFingerprint },
+    { fingerprint: "b".repeat(64), kind: "system", side: "left", legacyFingerprint },
   ]) {
     assert.throws(() => readyState(snapshot(1, [invalid])), /invalid legacy message fingerprint/u);
   }
+});
+
+test("recovers only an exact legacy false block reclassified as a known system card", () => {
+  const legacyUnknown = message("legacy-system-card", "right", "unknown");
+  const blocked = createBridgeState({
+    chatKey,
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
+    snapshot: snapshot(1, [legacyUnknown]),
+    phase: "blocked",
+    blockedReason: "verified-outbound-missing",
+  });
+  const reclassified = {
+    fingerprint: fingerprint("known-system-card"),
+    kind: "system",
+    side: "right",
+    legacyFingerprint: legacyUnknown.fingerprint,
+  };
+  const recovered = recoverBridgeStateForStartup(blocked, snapshot(1, [reclassified]));
+  assert.equal(recovered.recoveredLegacySystemBlock, true);
+  assert.equal(recovered.state.checkpoint.phase, "ready");
+  assert.deepEqual(recovered.state.checkpoint.snapshot, snapshot(1, [reclassified]));
+
+  assert.throws(
+    () => recoverBridgeStateForStartup(blocked, snapshot(1, [{
+      ...reclassified,
+      legacyFingerprint: fingerprint("different-legacy"),
+    }])),
+    /incomplete|refusing automatic recovery/u,
+  );
 });
 
 test("refuses a fixed-size DOM replacement without a reliable overlap boundary", () => {
@@ -425,6 +549,38 @@ test("recovers a sending checkpoint only when the expected outbound appears afte
     () => recoverBridgeStateForStartup(sending, beforeSend),
     /cannot be verified/u,
   );
+});
+
+test("recovers a verified send into degradation when an unknown right item accompanies it", () => {
+  const inbound = message("inbound");
+  const beforeSend = snapshot(1, [inbound]);
+  const outboundFingerprint = computeTextMessageFingerprint("reply");
+  const sending = createBridgeState({
+    chatKey,
+    threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
+    snapshot: beforeSend,
+    phase: "sending",
+    pending: [inbound],
+    outboundFingerprint,
+  });
+  const expected = { fingerprint: outboundFingerprint, kind: "text", side: "right" };
+  const unknown = message("unknown-right", "right", "unknown");
+  const afterSend = snapshot(3, [inbound, expected, unknown]);
+  const recovered = recoverBridgeStateForStartup(sending, afterSend);
+  assert.equal(recovered.recoveredVerifiedSend, true);
+  assert.equal(recovered.degradedOutgoing, true);
+  assert.equal(recovered.state.checkpoint.phase, "degraded");
+  assert.equal(
+    recovered.state.checkpoint.blockedReason,
+    DOUYIN_OUTBOUND_DEGRADED_REASON,
+  );
+  assert.deepEqual(recovered.state.checkpoint.pending, []);
+
+  const stable = recoverBridgeStateForStartup(recovered.state, afterSend);
+  assert.equal(stable.recoveredDegradation, true);
+  assert.equal(stable.state.checkpoint.phase, "ready");
 });
 
 test("recovers only the unfinished tail after a verified queued send", () => {

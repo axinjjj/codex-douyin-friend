@@ -48,11 +48,14 @@ export function findExpectedNewOutgoingMessage(
     }
   }
 
-  return newOutgoing.length === 1
-    && newOutgoing[0].fingerprint === expectedFingerprint
+  const accountableOutgoing = newOutgoing.filter((message) => (
+    message.kind === "text" || message.kind === "media" || message.kind === undefined
+  ));
+  return accountableOutgoing.length === 1
+    && accountableOutgoing[0].fingerprint === expectedFingerprint
     && (expectedQuoteTargetFingerprint === null
-      || newOutgoing[0].quoteTargetFingerprint === expectedQuoteTargetFingerprint)
-    ? newOutgoing[0]
+      || accountableOutgoing[0].quoteTargetFingerprint === expectedQuoteTargetFingerprint)
+    ? accountableOutgoing[0]
     : null;
 }
 

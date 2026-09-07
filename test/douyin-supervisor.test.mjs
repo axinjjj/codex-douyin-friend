@@ -129,6 +129,28 @@ test("starts a supervised hidden bridge and exposes sanitized live status", asyn
   assert.match(command, /"command":"compact"/u);
 });
 
+test("reports degraded listening without treating unknown outgoing content as a stop", async (t) => {
+  const root = await temporaryRoot(t);
+  const child = new FakeChild();
+  const supervisor = await createDouyinSupervisor({
+    projectRoot: root,
+    nodePath: process.execPath,
+    fetchFn: readyFetch,
+    spawnProcess: () => child,
+  });
+  await supervisor.start();
+  child.stdout.write('{"event":"bridge-ready","phase":"degraded","audioEnabled":true}\n');
+  child.stdout.write('{"event":"unknown-outgoing-degraded","unknownOutgoingCount":1}\n');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(supervisor.getStatus().phase, "degraded");
+  assert.equal(supervisor.getStatus().bridge, "running");
+
+  child.stdout.write('{"event":"bridge-status","phase":"listening"}\n');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(supervisor.getStatus().phase, "listening");
+  assert.equal(supervisor.getStatus().actionPermissions.compact, true);
+});
+
 test("enables sending only from a live verified binding and revokes it on authority loss", async (t) => {
   const root = await temporaryRoot(t);
   const configPath = path.join(root, ".runtime", "supervisor", "config.json");

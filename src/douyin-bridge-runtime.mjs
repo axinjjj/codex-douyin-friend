@@ -165,7 +165,8 @@ export async function preparePersistentBridgeSession({
   pendingMessages = [],
 }) {
   const reliableState = (storedState?.checkpoint?.phase === "ready"
-      || storedState?.checkpoint?.phase === "queued")
+      || storedState?.checkpoint?.phase === "queued"
+      || storedState?.checkpoint?.phase === "degraded")
     ? storedState
     : null;
   const resumeState = allowStoredThreadResume
