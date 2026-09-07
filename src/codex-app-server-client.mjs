@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
+import path from "node:path";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_TURN_TIMEOUT_MS = 30 * 60_000;
@@ -88,6 +89,33 @@ export function instructionSourcesContain(instructionSources, expectedPath) {
       candidate.replaceAll("\\", "/").toLowerCase() === normalizedExpected
     );
   });
+}
+
+function normalizeInstructionSource(source, platform) {
+  const candidate = typeof source === "string" ? source : source?.path;
+  if (typeof candidate !== "string") return null;
+  const pathApi = platform === "win32" ? path.win32 : path.posix;
+  if (!pathApi.isAbsolute(candidate)) return null;
+  const normalized = pathApi.normalize(candidate).replace(/[\\/]+$/u, "");
+  return platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+export function instructionSourcesExactlyMatch(
+  instructionSources,
+  expectedPaths,
+  { platform = process.platform } = {},
+) {
+  if (!Array.isArray(instructionSources) || !Array.isArray(expectedPaths)
+      || instructionSources.length !== expectedPaths.length) return false;
+  const actual = instructionSources.map((source) => normalizeInstructionSource(source, platform));
+  const expected = expectedPaths.map((source) => normalizeInstructionSource(source, platform));
+  if (actual.some((source) => source === null) || expected.some((source) => source === null)) {
+    return false;
+  }
+  if (new Set(actual).size !== actual.length || new Set(expected).size !== expected.length) {
+    return false;
+  }
+  return actual.every((source, index) => source === expected[index]);
 }
 
 export class CodexAppServerClient extends EventEmitter {

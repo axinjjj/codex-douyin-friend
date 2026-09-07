@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexAppServerClient } from "../src/codex-app-server-client.mjs";
+import { ensureDouyinCompanionCwd } from "../src/douyin-companion-runtime.mjs";
 import {
   CodexContextCompactionManager,
   CodexContextRecoveryError,
@@ -60,6 +61,7 @@ import {
 } from "../src/douyin-image-runtime.mjs";
 import { acquireDouyinMedia } from "../src/douyin-media-pipeline.mjs";
 import { likeIncomingDouyinMediaMessage } from "../src/douyin-media-reaction.mjs";
+import { runDouyinCleanupSteps } from "../src/douyin-runtime-cleanup.mjs";
 import {
   cleanupRecoveredDouyinMediaQuote,
   shouldQuoteDouyinMediaReply,
@@ -84,6 +86,8 @@ import {
   computeDouyinReplyDigest,
   computeDouyinTurnPromptDigest,
   createDouyinAction,
+  invalidateDouyinReaction,
+  rebaseDouyinReactionTarget,
   rollbackDouyinActionBeforeEnter,
   transitionDouyinAction,
 } from "../src/douyin-action-journal.mjs";
@@ -104,6 +108,7 @@ const supervised = process.env.DOUYIN_SUPERVISED === "true";
 const forceFreshThread = process.env.DOUYIN_FORCE_FRESH_THREAD === "true";
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const compactionPolicy = resolveContextCompactionPolicy();
+const companionCwd = await ensureDouyinCompanionCwd({ projectRoot });
 let stopRequested = false;
 class DouyinUnsupportedIncomingError extends Error {
   constructor(reason = "unsupported-media-type") {
@@ -302,7 +307,7 @@ try {
 
   const session = await preparePersistentBridgeSession({
     codex,
-    cwd: projectRoot,
+    cwd: companionCwd,
     expectedPersonaPath,
     model,
     effort,
@@ -1063,6 +1068,17 @@ try {
                 || expectedQuoteTargetFingerprint !== currentAction.quoteTargetFingerprint) {
               throw new Error("The prepared Douyin outbound fingerprint changed before Enter.");
             }
+            if (currentAction.reactionDecision === "yes" && incomingBatch.mediaMessage) {
+              try {
+                currentAction = rebaseDouyinReactionTarget(
+                  currentAction,
+                  incomingBatch.mediaMessage,
+                );
+              } catch {
+                currentAction = invalidateDouyinReaction(currentAction);
+                mediaShouldLike = false;
+              }
+            }
             currentAction = transitionDouyinAction(currentAction, "send-attempted");
             activeState = createBridgeState({
               chatKey: lockedChat.fingerprint,
@@ -1145,7 +1161,8 @@ try {
       const { outgoing, afterSend } = sendResult;
       console.log(JSON.stringify({
         ok: Boolean(outgoing),
-        event: outgoing ? `${replyKind}-reply-sent` : "send-unverified-bridge-stopped",
+        event: outgoing ? `${replyKind}-reply-bubble-observed` : "send-unverified-bridge-stopped",
+        deliveryEvidence: outgoing ? "local-dom-observed" : "unverified",
         replyLength: reply.length,
         frameCount: media?.framePaths?.length,
         imageCount: media?.imagePaths?.length,
@@ -1165,7 +1182,7 @@ try {
         break;
       }
       if (afterSend.chatFingerprint !== lockedChat.fingerprint) {
-        throw new Error("The Douyin chat changed while verifying a sent reply.");
+        throw new Error("The Douyin chat changed while verifying the local outgoing bubble.");
       }
       const afterSendSnapshot = normalizeBridgeSnapshot({
         messageCount: afterSend.messageCount,
@@ -1372,14 +1389,13 @@ try {
   }
   throw error;
 } finally {
-  controlChannel?.close();
-  contextManager?.close();
-  try {
-    await codex.close();
-  } finally {
-    cdp.close();
-    await bridgeLock?.release();
-  }
-  process.removeListener("SIGINT", requestStop);
-  process.removeListener("SIGTERM", requestStop);
+  await runDouyinCleanupSteps([
+    () => controlChannel?.close(),
+    () => contextManager?.close(),
+    () => codex.close(),
+    () => cdp.close(),
+    () => bridgeLock?.release(),
+    () => process.removeListener("SIGINT", requestStop),
+    () => process.removeListener("SIGTERM", requestStop),
+  ]);
 }
