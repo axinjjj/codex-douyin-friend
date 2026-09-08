@@ -1,6 +1,7 @@
 import { CodexContextCompactionManager } from "./codex-context-compaction.mjs";
 import {
   buildBridgeStartupViewExpression,
+  containsUnreadyDouyinDirectImage,
   normalizeOutboundText,
 } from "./douyin-chat-page.mjs";
 import {
@@ -29,6 +30,7 @@ export const douyinBridgeStartupDependencies = Object.freeze({
   CodexContextCompactionManager,
   DOUYIN_OUTBOUND_DEGRADED_REASON,
   buildBridgeStartupViewExpression,
+  containsUnreadyDouyinDirectImage,
   cleanupRecoveredDouyinMediaQuote,
   computeDouyinReplyDigest,
   createBridgeState,
@@ -70,6 +72,7 @@ export async function recoverBridgeStartup({
     CodexContextCompactionManager: ContextCompactionManager,
     DOUYIN_OUTBOUND_DEGRADED_REASON: outboundDegradedReason,
     buildBridgeStartupViewExpression,
+    containsUnreadyDouyinDirectImage,
     cleanupRecoveredDouyinMediaQuote,
     computeDouyinReplyDigest,
     createBridgeState,
@@ -91,6 +94,9 @@ export async function recoverBridgeStartup({
   if (!startupView?.ok) throw new Error("The Douyin message list is unavailable.");
   if (startupView.chatFingerprint !== lockedChat.fingerprint) {
     throw new Error("The Douyin chat changed during startup; refusing to seed the wrong conversation.");
+  }
+  if (containsUnreadyDouyinDirectImage(startupView.snapshot.messages)) {
+    throw new Error("A direct Douyin image is still loading; retrying startup later.");
   }
   const startupSnapshot = normalizeBridgeSnapshot(startupView.snapshot);
   const loadedState = await loadBridgeState(projectRoot, lockedChat.fingerprint);

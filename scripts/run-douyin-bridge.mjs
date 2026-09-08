@@ -23,6 +23,7 @@ import {
   buildReadIncomingCommentShareExpression,
   buildReadIncomingMediaTextExpression,
   buildReadIncomingTextBatchExpression,
+  containsUnreadyDouyinDirectImage,
   isDouyinChatTarget,
 } from "../src/douyin-chat-page.mjs";
 import {
@@ -361,6 +362,14 @@ try {
       process.exitCode = 4;
       break;
     }
+    const observedAppendCount = currentMetadata.messageCount - previous.messageCount;
+    if (observedAppendCount > 0
+        && observedAppendCount <= currentMetadata.messages.length
+        && containsUnreadyDouyinDirectImage(
+          currentMetadata.messages.slice(-observedAppendCount),
+        )) {
+      continue;
+    }
 
     let current = normalizeBridgeSnapshot({
       messageCount: currentMetadata.messageCount,
@@ -379,6 +388,14 @@ try {
           setBridgePhase("blocked");
           chatChangedDuringSettle = true;
           break;
+        }
+        const observedAdditionalCount = settledMetadata.messageCount - current.messageCount;
+        if (observedAdditionalCount > 0
+            && observedAdditionalCount <= settledMetadata.messages.length
+            && containsUnreadyDouyinDirectImage(
+              settledMetadata.messages.slice(-observedAdditionalCount),
+            )) {
+          continue;
         }
         const settled = normalizeBridgeSnapshot({
           messageCount: settledMetadata.messageCount,

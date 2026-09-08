@@ -40,6 +40,7 @@ import {
   DOUYIN_CHAT_INPUT_SELECTOR,
   DOUYIN_PLATFORM_SYSTEM_CARD_SELECTOR,
   DOUYIN_SHARED_WORK_VARIANTS,
+  containsUnreadyDouyinDirectImage,
   isDouyinChatTarget,
   normalizeOutboundText,
   resolveDouyinSharedWorkManifest,
@@ -389,6 +390,21 @@ test("direct-image operations classify and capture only visible incoming content
   assert.doesNotMatch(sourceReader, /OffscreenCanvas|toDataURL|convertToBlob/u);
   assert.doesNotMatch(sourceReader, /document\.cookie|localStorage|sessionStorage/u);
   assert.match(locator, /clip/u);
+  for (const expression of [
+    buildChatMessageMetadataExpression(),
+    buildBridgeStartupViewExpression(),
+  ]) {
+    assert.match(expression, /directImageReady/u);
+    assert.match(expression, /image\.naturalWidth > 0/u);
+  }
+  assert.equal(containsUnreadyDouyinDirectImage([
+    { directImageReady: true },
+    { directImageReady: false },
+  ]), true);
+  assert.equal(containsUnreadyDouyinDirectImage([
+    { directImageReady: true },
+    {},
+  ]), false);
   for (const expression of [classification, locator]) {
     assert.match(expression, /messageMessageBoxisFromMe/u);
     assert.match(expression, /side !== 'left'/u);
@@ -404,13 +420,15 @@ test("direct-image operations classify and capture only visible incoming content
     kind: "media",
     side: "left",
   };
-  for (const expression of [
+  const exactExpressions = [
     buildClassifyLatestIncomingMediaExpression(exactMessage),
     buildLocateLatestIncomingChatImageExpression(exactMessage),
     buildReadLatestIncomingChatImageSourceExpression(exactMessage),
-  ]) {
+  ];
+  for (const expression of exactExpressions) {
     assert.match(expression, /ordinalFromEnd":4/u);
     assert.match(expression, /incoming-media-identity-changed/u);
+    assert.doesNotThrow(() => new Function(`return ${expression};`));
   }
   assert.throws(
     () => buildClassifyLatestIncomingMediaExpression({ ...exactMessage, side: "right" }),
