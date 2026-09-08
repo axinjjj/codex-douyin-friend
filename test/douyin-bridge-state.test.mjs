@@ -503,6 +503,18 @@ test("refuses a fixed-size DOM replacement without a reliable overlap boundary",
   );
 });
 
+test("keeps a fixed-size append boundary across dynamic system-card content", () => {
+  const retainedText = message("retained-text");
+  const previousSystemCard = message("system-card-before", "right", "system");
+  const currentSystemCard = message("system-card-after", "right", "system");
+  const incoming = message("new-incoming");
+  const appended = findAppendedMessages(
+    snapshot(3, [message("expired-text"), retainedText, previousSystemCard]),
+    snapshot(3, [retainedText, currentSystemCard, incoming]),
+  );
+  assert.deepEqual(appended, [{ ...incoming, ordinalFromEnd: 1 }]);
+});
+
 test("fails closed when the append boundary is missing or exceeds the visible window", () => {
   assert.throws(
     () => findAppendedMessages(snapshot(20, [message("a")]), snapshot(19, [message("a")])),
