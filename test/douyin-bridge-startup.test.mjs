@@ -9,6 +9,7 @@ function createHarness({
   recovery = null,
   recoveredTurn = null,
   resumed = false,
+  startupHasUnreadyDirectImage = false,
 } = {}) {
   const calls = [];
   const savedStates = [];
@@ -38,6 +39,10 @@ function createHarness({
     buildBridgeStartupViewExpression() {
       calls.push("startup-expression-built");
       return "startup-expression";
+    },
+    containsUnreadyDouyinDirectImage() {
+      calls.push("direct-image-readiness-checked");
+      return startupHasUnreadyDirectImage;
     },
     async cleanupRecoveredDouyinMediaQuote() {
       calls.push("quote-cleaned");
@@ -187,6 +192,18 @@ test("starts normally without stored state and persists one ready checkpoint", a
     harness.calls.indexOf("context-manager-set")
       < harness.calls.indexOf("state-saved:ready"),
   );
+});
+
+test("waits for visible direct images to load before checkpoint recovery", async () => {
+  const harness = createHarness({ startupHasUnreadyDirectImage: true });
+
+  await assert.rejects(
+    recoverBridgeStartup(harness.args),
+    /direct Douyin image is still loading/u,
+  );
+  assert.ok(harness.calls.includes("direct-image-readiness-checked"));
+  assert.equal(harness.calls.includes("state-loaded"), false);
+  assert.equal(harness.calls.includes("session-prepared"), false);
 });
 
 test("recovers a pending action and reuses its completed Codex turn", async () => {

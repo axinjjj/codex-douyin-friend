@@ -24,6 +24,11 @@ const DOUYIN_MEDIA_CONTENT_SELECTOR =
   `${DOUYIN_SHARED_WORK_SELECTOR}, .MessageItemImageImageBox, ${DOUYIN_NATIVE_STICKER_IMAGE_SELECTOR}, video, canvas, [class*="Video"], [class*="Aweme"], [class*="Card"]`;
 const DOUYIN_QUOTE_BINDING_KEY = "__codexDouyinMediaQuoteBindingV1";
 
+export function containsUnreadyDouyinDirectImage(messages) {
+  if (!Array.isArray(messages)) throw new Error("Douyin message metadata is required.");
+  return messages.some((message) => message?.directImageReady === false);
+}
+
 export function resolveDouyinSharedWorkManifest({ detail = null, parsedContent = null } = {}) {
   const MAX_VISITED_OBJECTS = 1_200;
   const MAX_DEPTH = 8;
@@ -634,6 +639,12 @@ export function buildChatMessageMetadataExpression() {
       const hasNativeSticker = Boolean(message.querySelector(
         ${JSON.stringify(DOUYIN_NATIVE_STICKER_IMAGE_SELECTOR)}
       ));
+      const directImages = Array.from(message.querySelectorAll(
+        '.MessageItemImageImage, .MessageItemImageImageBox img'
+      )).slice(0, 4);
+      const directImageReady = directImages.every((image) => Boolean(
+        (image.currentSrc || image.src) && image.naturalWidth > 0 && image.naturalHeight > 0
+      ));
       const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
       const stableMediaFingerprintSource = hasMedia
         ? resolveStableMediaFingerprintSource(message, textBubble, stableContent)
@@ -672,6 +683,7 @@ export function buildChatMessageMetadataExpression() {
         structuralKey,
         outgoingQuoteIdentitySource,
         legacyStructuralKey,
+        directImageReady,
       };
     });
     const messages = [];
@@ -689,6 +701,7 @@ export function buildChatMessageMetadataExpression() {
         side: message.side,
         textLength: message.textLength,
         fingerprint: await digest(message.structuralKey),
+        directImageReady: message.directImageReady,
         ...(quoteTargetFingerprint ? { quoteTargetFingerprint } : {}),
         ...(legacyFingerprint ? { legacyFingerprint } : {}),
       });
@@ -780,6 +793,12 @@ export function buildBridgeStartupViewExpression(limit = 12) {
         const hasNativeSticker = Boolean(message.querySelector(
           ${JSON.stringify(DOUYIN_NATIVE_STICKER_IMAGE_SELECTOR)}
         ));
+        const directImages = Array.from(message.querySelectorAll(
+          '.MessageItemImageImage, .MessageItemImageImageBox img'
+        )).slice(0, 4);
+        const directImageReady = directImages.every((image) => Boolean(
+          (image.currentSrc || image.src) && image.naturalWidth > 0 && image.naturalHeight > 0
+        ));
         const hasMedia = Boolean(message.querySelector(${JSON.stringify(DOUYIN_MEDIA_CONTENT_SELECTOR)}));
         const stableMediaFingerprintSource = hasMedia
           ? resolveStableMediaFingerprintSource(message, bubble, stableContent)
@@ -818,6 +837,7 @@ export function buildBridgeStartupViewExpression(limit = 12) {
           structuralKey,
           outgoingQuoteIdentitySource,
           legacyStructuralKey,
+          directImageReady,
           role: side === 'left' ? 'user' : side === 'right' ? 'assistant' : null,
         };
       });
@@ -837,6 +857,7 @@ export function buildBridgeStartupViewExpression(limit = 12) {
         kind: message.kind,
         side: message.side,
         fingerprint: await digest(message.structuralKey),
+        directImageReady: message.directImageReady,
         ...(quoteTargetFingerprint ? { quoteTargetFingerprint } : {}),
         ...(legacyFingerprint ? { legacyFingerprint } : {}),
       });
@@ -1086,12 +1107,12 @@ export function buildReadLatestIncomingChatImageSourceExpression(mediaMessage = 
           style.display !== 'none' && style.visibility !== 'hidden';
       });
     if (!image) return { ok: false, reason: 'chat-image-not-found' };
-    const source = image.currentSrc || image.src || '';
-    if (!source) return { ok: false, reason: 'chat-image-source-not-found' };
-    if (/^data:image\\/webp;base64,/u.test(source)) {
+    const imageSource = image.currentSrc || image.src || '';
+    if (!imageSource) return { ok: false, reason: 'chat-image-source-not-found' };
+    if (/^data:image\\/webp;base64,/u.test(imageSource)) {
       return { ok: false, reason: 'chat-image-webp-requires-screenshot' };
     }
-    return { ok: true, source };
+    return { ok: true, source: imageSource };
   })()`;
 }
 
