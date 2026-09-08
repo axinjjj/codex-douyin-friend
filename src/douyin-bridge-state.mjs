@@ -390,6 +390,7 @@ export async function saveBridgeState(projectRoot, state) {
 
 function sameMessage(left, right) {
   if (left.side !== right.side) return false;
+  if (left.kind === "system" && right.kind === "system") return true;
   const directIdentity = left.fingerprint === right.fingerprint && left.kind === right.kind;
   const legacyIdentity = left.legacyFingerprint === right.fingerprint
     || right.legacyFingerprint === left.fingerprint;
